@@ -455,6 +455,136 @@ def _sanitize_error(text: str) -> str:
     return _CREDENTIAL_PATTERN.sub("[REDACTED]", text)
 
 
+_SEARCH_LIKE_TOOL_NAME_HINTS = ("search", "find", "query")
+_SEARCH_RESULT_LINE_RE = re.compile(
+    r"^(Title|URL|Published|Author|Highlights):\s*(.*)$"
+)
+_SEARCH_RESULT_SEPARATOR_RE = re.compile(r"^\s*-{3,}\s*$")
+_SEARCH_RESULT_ELLIPSIS_RE = re.compile(r"^\s*\.\.\.\s*$")
+_EMPTY_SEARCH_METADATA_VALUES = frozenset({
+    "",
+    "n/a",
+    "n.a.",
+    "na",
+    "none",
+    "null",
+    "unknown",
+})
+
+
+def _normalize_mcp_text_result(tool_name: str, text: str) -> str:
+    """Trim noisy metadata from search-like MCP text payloads.
+
+    Some search MCP servers return plain text in a repeated metadata layout:
+    ``Title/URL/Published/Author/Highlights`` separated by ``---`` lines.
+    The model and the UI pay for every repeated placeholder, so compact only
+    the clearly search-shaped case: drop placeholder ``Published``/``Author``
+    values, remove separator/ellipsis lines, and keep the substantive fields
+    intact.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return text
+
+    lowered_tool_name = (tool_name or "").lower()
+    if not any(hint in lowered_tool_name for hint in _SEARCH_LIKE_TOOL_NAME_HINTS):
+        return text
+
+    normalized = text.replace("\r\n", "\n")
+    labels: set[str] = set()
+    has_separator = False
+    for raw_line in normalized.split("\n"):
+        stripped = raw_line.strip()
+        if _SEARCH_RESULT_SEPARATOR_RE.match(stripped):
+            has_separator = True
+            continue
+        match = _SEARCH_RESULT_LINE_RE.match(stripped)
+        if match:
+            labels.add(match.group(1))
+
+    if not {"Title", "URL"}.issubset(labels):
+        return text
+    if not (has_separator or {"Published", "Author", "Highlights"} & labels):
+        return text
+
+    entries: List[str] = []
+    current_lines: List[str] = []
+
+    def _flush_entry() -> None:
+        if not current_lines:
+            return
+        cleaned_lines: List[str] = []
+        title_value = ""
+        i = 0
+        while i < len(current_lines):
+            raw_line = current_lines[i]
+            stripped = raw_line.strip()
+            if not stripped:
+                i += 1
+                continue
+            if _SEARCH_RESULT_ELLIPSIS_RE.match(stripped):
+                i += 1
+                continue
+            match = _SEARCH_RESULT_LINE_RE.match(stripped)
+            if not match:
+                cleaned_lines.append(stripped)
+                i += 1
+                continue
+            label, value = match.group(1), match.group(2).strip()
+            if label == "Title":
+                title_value = value
+            if label == "Highlights" and not value:
+                continuation: List[str] = []
+                j = i + 1
+                while j < len(current_lines):
+                    next_line = current_lines[j].strip()
+                    if not next_line:
+                        j += 1
+                        continue
+                    if _SEARCH_RESULT_ELLIPSIS_RE.match(next_line):
+                        j += 1
+                        continue
+                    continuation.append(next_line)
+                    j += 1
+                if continuation and title_value:
+                    lead = continuation[0].lstrip("# ").strip()
+                    if lead == title_value:
+                        continuation = continuation[1:]
+                if continuation:
+                    cleaned_lines.append("Highlights:")
+                    cleaned_lines.extend(continuation)
+                    i = j
+                    continue
+            if (
+                label in {"Published", "Author", "Highlights"}
+                and value.lower() in _EMPTY_SEARCH_METADATA_VALUES
+            ):
+                i += 1
+                continue
+            cleaned_lines.append(f"{label}: {value}" if value else f"{label}:")
+            i += 1
+        current_lines.clear()
+        if cleaned_lines:
+            entries.append("\n".join(cleaned_lines))
+
+    for raw_line in normalized.split("\n"):
+        stripped = raw_line.strip()
+        if _SEARCH_RESULT_SEPARATOR_RE.match(stripped):
+            _flush_entry()
+            continue
+        if (
+            stripped.startswith("Title:")
+            and any(line.strip().startswith("URL:") for line in current_lines)
+        ):
+            _flush_entry()
+        current_lines.append(raw_line)
+    _flush_entry()
+
+    compacted = "\n\n".join(entries).strip()
+    if not compacted or compacted == normalized.strip():
+        return text
+    return compacted
+
+
 def _exc_str(exc: BaseException) -> str:
     """Return a non-empty human-readable string for *exc*.
 
@@ -4174,6 +4304,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                         server_name, block_type,
                     )
             text_result = "\n".join(parts) if parts else ""
+            text_result = _normalize_mcp_text_result(tool_name, text_result)
 
             # Combine content + structuredContent when both are present.
             # MCP spec: content is model-oriented (text), structuredContent
