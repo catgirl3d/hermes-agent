@@ -46,6 +46,17 @@ Restart Hermes Agent. On startup it will:
 
 You can then use the tools naturally -- just ask the agent to get the current time.
 
+## Catalog Install
+
+List catalog servers with `hermes mcp catalog`, then install one with:
+
+```bash
+hermes mcp install <name>
+```
+
+The installer prompts for required credentials and lets you choose which tools
+to enable.
+
 ## Configuration Reference
 
 Each entry under `mcp_servers` is a server name mapped to its config. There are two transport types: **stdio** (command-based) and **HTTP** (url-based).
