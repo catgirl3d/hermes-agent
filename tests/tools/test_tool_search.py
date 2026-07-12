@@ -270,6 +270,20 @@ class TestCompactSignatures:
         assert sanitized_sig.safe_for_direct_call is True
         assert sanitized_sig.text == "lookup_user(name?: string)"
 
+    def test_nullable_type_array_form_remains_safe(self):
+        from tools.tool_search import compact_signature
+
+        sig = compact_signature(_td(
+            "lookup_user",
+            properties={
+                "name": {"type": ["string", "null"]},
+                "limit": {"type": ["integer", "null"], "minimum": 1, "maximum": 10},
+            },
+        ))
+
+        assert sig.safe_for_direct_call is True
+        assert sig.text == "lookup_user(name?: string, limit?: integer[1..10])"
+
     def test_freeform_objects_and_typed_maps_render_but_structured_objects_describe(self):
         from tools.tool_search import compact_signature
 
@@ -328,6 +342,26 @@ class TestCompactSignatures:
         assert patterned.safe_for_direct_call is False
         assert object_array.text == "bulk_create(describe first)"
         assert object_array.safe_for_direct_call is False
+
+    def test_non_structural_scalar_and_array_hints_do_not_force_describe(self):
+        from tools.tool_search import compact_signature
+
+        sig = compact_signature(_td(
+            "fetch_feed",
+            properties={
+                "url": {"type": "string", "format": "uri", "minLength": 1, "maxLength": 2048},
+                "timestamps": {
+                    "type": "array",
+                    "items": {"type": "string", "format": "date-time"},
+                    "minItems": 1,
+                    "maxItems": 10,
+                },
+            },
+            required=["url"],
+        ))
+
+        assert sig.safe_for_direct_call is True
+        assert sig.text == "fetch_feed(url: string, timestamps?: string[])"
 
 
 # ---------------------------------------------------------------------------
