@@ -2818,8 +2818,8 @@ DEFAULT_CONFIG = {
     # in the model-facing tools array with three bridge tools —
     # tool_search / tool_describe / tool_call — and surfaced on demand.
     #
-    # Core Hermes tools (terminal, read_file, write_file, patch,
-    # search_files, todo, memory, browser_*, etc.) are NEVER deferred.
+    # By default only MCP / non-core tools defer. When defer_core_tools is
+    # enabled, core tools outside always_visible_tools may defer too.
     # See tools/tool_search.py for full design notes and the
     # openclaw-tool-search-report PDF in this PR for the rationale.
     "tools": {
@@ -2832,6 +2832,20 @@ DEFAULT_CONFIG = {
             #   token reduction unconditionally.
             # "off" — disable entirely. Tools-array assembly is a pass-through.
             "enabled": "auto",
+            # When true, registered core tools may also defer. Tools listed in
+            # always_visible_tools remain directly callable.
+            "defer_core_tools": False,
+            # Bootstrap tools that stay visible even when defer_core_tools is
+            # enabled. Bridge tools are always visible regardless.
+            "always_visible_tools": [
+                "terminal",
+                "process",
+                "read_file",
+                "write_file",
+                "patch",
+                "search_files",
+                "clarify",
+            ],
             # Percentage of context length at which "auto" mode kicks in.
             # 10 matches the Claude Code default. Range 0..100.
             "threshold_pct": 10,

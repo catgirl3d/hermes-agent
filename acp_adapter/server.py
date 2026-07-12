@@ -840,6 +840,7 @@ class HermesACPAgent(acp.Agent):
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
                 quiet_mode=True,
+                tool_search_policy=getattr(state.agent, "_tool_search_policy", None),
             )
             state.agent.valid_tool_names = {
                 tool["function"]["name"] for tool in state.agent.tools or []
