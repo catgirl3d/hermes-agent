@@ -70,6 +70,39 @@ DEFAULT_ALWAYS_VISIBLE_TOOLS = frozenset({
 # underestimating, which is the safer default.
 CHARS_PER_TOKEN = 4.0
 
+# Compact signature budgets. Keep these tight because the manifest is paid on
+# every request, even when a turn only uses bootstrap tools.
+MAX_INLINE_ENUM_VALUES = 8
+MAX_INLINE_ENUM_CHARS = 96
+MAX_INLINE_DEFAULT_CHARS = 48
+MAX_SIGNATURE_CHARS = 320
+MAX_MANIFEST_BODY_CHARS = 2048
+MAX_BRIDGE_DESCRIPTION_CHARS = 4096
+
+_SAFE_NAME_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:/+-]+$")
+_UNSUPPORTED_COMPACT_KEYS = frozenset({
+    "const",
+    "contains",
+    "contentEncoding",
+    "contentMediaType",
+    "dependentRequired",
+    "dependentSchemas",
+    "format",
+    "maxItems",
+    "maxLength",
+    "maxProperties",
+    "minItems",
+    "minLength",
+    "minProperties",
+    "not",
+    "pattern",
+    "patternProperties",
+    "propertyNames",
+    "unevaluatedItems",
+    "unevaluatedProperties",
+    "uniqueItems",
+})
+
 
 # ---------------------------------------------------------------------------
 # Configuration plumbing
@@ -145,6 +178,14 @@ class ToolSearchConfig:
         )
 
 
+@dataclass(frozen=True)
+class CompactSignature:
+    """Compact, schema-derived tool signature for deferred-tool hints."""
+
+    text: str
+    safe_for_direct_call: bool
+
+
 def _safe_int(value: Any, fallback: int) -> int:
     try:
         return int(value)
@@ -184,6 +225,221 @@ def _normalize_tool_names(value: Any, *, fallback: frozenset[str]) -> frozenset[
         if name:
             names.append(name)
     return frozenset(names)
+
+
+def _describe_first_signature(name: str) -> CompactSignature:
+    return CompactSignature(text=f"{name}(describe first)", safe_for_direct_call=False)
+
+
+def _render_scalar_literal(value: Any) -> Optional[str]:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            rendered = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return None
+        return rendered
+    if isinstance(value, str):
+        if _SAFE_NAME_TOKEN_RE.match(value):
+            return value
+        try:
+            return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _render_inline_enum(values: Any) -> Optional[str]:
+    if not isinstance(values, list) or not values or len(values) > MAX_INLINE_ENUM_VALUES:
+        return None
+    rendered: List[str] = []
+    for value in values:
+        literal = _render_scalar_literal(value)
+        if literal is None:
+            return None
+        rendered.append(literal)
+    text = "|".join(rendered)
+    if len(text) > MAX_INLINE_ENUM_CHARS:
+        return None
+    return text
+
+
+def _render_default_suffix(schema: Dict[str, Any]) -> Tuple[str, bool]:
+    if "default" not in schema:
+        return "", False
+    rendered = _render_scalar_literal(schema.get("default"))
+    if rendered is None or len(rendered) > MAX_INLINE_DEFAULT_CHARS:
+        return "", True
+    return f"={rendered}", False
+
+
+def _render_numeric_text(value: Any) -> Optional[str]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _render_numeric_bounds(type_name: str, schema: Dict[str, Any]) -> Optional[str]:
+    minimum = schema.get("minimum")
+    maximum = schema.get("maximum")
+    exclusive_minimum = schema.get("exclusiveMinimum")
+    exclusive_maximum = schema.get("exclusiveMaximum")
+
+    lower_value = None
+    lower_inclusive = True
+    upper_value = None
+    upper_inclusive = True
+
+    if exclusive_minimum is not None:
+        lower_value = exclusive_minimum
+        lower_inclusive = False
+    elif minimum is not None:
+        lower_value = minimum
+
+    if exclusive_maximum is not None:
+        upper_value = exclusive_maximum
+        upper_inclusive = False
+    elif maximum is not None:
+        upper_value = maximum
+
+    if lower_value is None and upper_value is None:
+        return type_name
+
+    lower_text = _render_numeric_text(lower_value) if lower_value is not None else None
+    upper_text = _render_numeric_text(upper_value) if upper_value is not None else None
+    if (lower_value is not None and lower_text is None) or (upper_value is not None and upper_text is None):
+        return None
+
+    if lower_text is not None and upper_text is not None:
+        left = "[" if lower_inclusive else "("
+        right = "]" if upper_inclusive else ")"
+        return f"{type_name}{left}{lower_text}..{upper_text}{right}"
+    if lower_text is not None:
+        op = ">=" if lower_inclusive else ">"
+        return f"{type_name}{op}{lower_text}"
+    op = "<=" if upper_inclusive else "<"
+    return f"{type_name}{op}{upper_text}"
+
+
+def _compact_scalar_schema_text(schema: Dict[str, Any]) -> Optional[str]:
+    schema_type = schema.get("type")
+    if "enum" in schema:
+        if schema_type is not None and schema_type not in {"string", "integer", "number", "boolean", "null"}:
+            return None
+        return _render_inline_enum(schema.get("enum"))
+    if schema_type in {"string", "boolean", "null"}:
+        return str(schema_type)
+    if schema_type in {"integer", "number"}:
+        return _render_numeric_bounds(str(schema_type), schema)
+    return None
+
+
+def _compact_nullable_scalar_union_text(schema: Dict[str, Any]) -> Optional[str]:
+    for key in ("anyOf", "oneOf"):
+        variants = schema.get(key)
+        if not isinstance(variants, list):
+            continue
+        non_null = []
+        saw_null = False
+        for variant in variants:
+            if isinstance(variant, dict) and variant.get("type") == "null":
+                saw_null = True
+            else:
+                non_null.append(variant)
+        if saw_null and len(non_null) == 1 and isinstance(non_null[0], dict):
+            return _compact_scalar_schema_text(non_null[0])
+    return None
+
+
+def _compact_type_text(
+    schema: Dict[str, Any],
+    *,
+    allow_object: bool = True,
+    in_array_item: bool = False,
+) -> Optional[str]:
+    if not isinstance(schema, dict):
+        return None
+    if "$ref" in schema or "allOf" in schema:
+        return None
+    if any(key in schema for key in _UNSUPPORTED_COMPACT_KEYS):
+        return None
+
+    union_text = _compact_nullable_scalar_union_text(schema)
+    if union_text is not None:
+        return union_text
+    if "anyOf" in schema or "oneOf" in schema:
+        return None
+
+    scalar_text = _compact_scalar_schema_text(schema)
+    if scalar_text is not None:
+        return scalar_text
+
+    schema_type = schema.get("type")
+    if schema_type == "array":
+        items = schema.get("items")
+        item_text = _compact_type_text(items, allow_object=False, in_array_item=True) if isinstance(items, dict) else None
+        if item_text is None:
+            return None
+        if "|" in item_text:
+            item_text = f"({item_text})"
+        return f"{item_text}[]"
+    if schema_type == "object":
+        if not allow_object or in_array_item:
+            return None
+        properties = schema.get("properties")
+        if isinstance(properties, dict) and properties:
+            return None
+        additional_properties = schema.get("additionalProperties")
+        if isinstance(additional_properties, dict):
+            value_text = _compact_type_text(additional_properties, allow_object=False)
+            if value_text is None:
+                return None
+            return f"map<string, {value_text}>"
+        if additional_properties is False:
+            return None
+        return "object"
+    return None
+
+
+def compact_signature(tool_def: Dict[str, Any]) -> CompactSignature:
+    """Return a compact signature derived from the sanitized tool schema."""
+
+    fn = tool_def.get("function") or {}
+    name = str(fn.get("name") or "").strip() or "tool"
+    parameters = fn.get("parameters")
+    if not isinstance(parameters, dict):
+        return _describe_first_signature(name)
+
+    properties = parameters.get("properties")
+    if not isinstance(properties, dict):
+        return _describe_first_signature(name)
+
+    required = parameters.get("required")
+    required_names = {item for item in required if isinstance(item, str)} if isinstance(required, list) else set()
+
+    pieces: List[str] = []
+    for param_name, schema in properties.items():
+        if not isinstance(param_name, str) or not isinstance(schema, dict):
+            return _describe_first_signature(name)
+        type_text = _compact_type_text(schema)
+        if type_text is None:
+            return _describe_first_signature(name)
+        default_suffix, default_failed = _render_default_suffix(schema)
+        if default_failed:
+            return _describe_first_signature(name)
+        optional = "" if param_name in required_names else "?"
+        pieces.append(f"{param_name}{optional}: {type_text}{default_suffix}")
+
+    text = f"{name}({', '.join(pieces)})"
+    if len(text) > MAX_SIGNATURE_CHARS:
+        return _describe_first_signature(name)
+    return CompactSignature(text=text, safe_for_direct_call=True)
 
 
 def load_config() -> ToolSearchConfig:
@@ -489,34 +745,95 @@ def search_catalog(catalog: List[CatalogEntry], query: str, limit: int = 5) -> L
     return [e for _, e in scored[:limit]]
 
 
+def _manifest_source_priority(name: str) -> Tuple[int, str]:
+    source, _ = _classify_source(name)
+    if source == "core":
+        return 0, name
+    if source == "mcp":
+        return 2, name
+    return 1, name
+
+
+def _tool_call_description(deferrable_tool_defs: List[Dict[str, Any]]) -> str:
+    base = (
+        "Invoke a deferred tool by name with the given arguments. The names below are "
+        f"values for `{TOOL_CALL_NAME}.name`. Do not invoke them as native tools. "
+        f"Call `{TOOL_CALL_NAME}` directly when a signature is shown and you know the "
+        f"arguments. Use `{TOOL_SEARCH_NAME}` when the needed tool is not listed or "
+        f"uncertain. Use `{TOOL_DESCRIBE_NAME}` for entries marked \"describe first\", "
+        "unknown parameters, or recovery after argument validation failure."
+    )
+    footer = (
+        f"Use `{TOOL_SEARCH_NAME}` for deferred tools not listed here or when uncertain. "
+        f"If a search result has `describe_required: true`, call `{TOOL_DESCRIBE_NAME}` "
+        f"before `{TOOL_CALL_NAME}`."
+    )
+
+    manifest_entries: List[str] = []
+    for td in sorted(deferrable_tool_defs, key=lambda item: _manifest_source_priority((item.get("function") or {}).get("name", ""))):
+        signature = compact_signature(td)
+        if signature.safe_for_direct_call:
+            manifest_entries.append(f"- {signature.text}")
+
+    if not manifest_entries:
+        text = f"{base}\n\n{footer}"
+        return text[:MAX_BRIDGE_DESCRIPTION_CHARS]
+
+    header = "Direct-call signatures:\n"
+    reserved = len(base) + 2 + len(header) + len(footer) + 2
+    available = min(MAX_MANIFEST_BODY_CHARS, MAX_BRIDGE_DESCRIPTION_CHARS - reserved)
+    if available <= 0:
+        text = f"{base}\n\n{footer}"
+        return text[:MAX_BRIDGE_DESCRIPTION_CHARS]
+
+    included: List[str] = []
+    body_len = 0
+    for line in manifest_entries:
+        add_len = len(line) if not included else len(line) + 1
+        if body_len + add_len > available:
+            break
+        included.append(line)
+        body_len += add_len
+
+    if not included:
+        text = f"{base}\n\n{footer}"
+        return text[:MAX_BRIDGE_DESCRIPTION_CHARS]
+
+    body = "\n".join(included)
+    text = f"{base}\n\n{header}{body}\n\n{footer}"
+    if len(text) > MAX_BRIDGE_DESCRIPTION_CHARS:
+        text = text[:MAX_BRIDGE_DESCRIPTION_CHARS]
+    return text
+
+
 # ---------------------------------------------------------------------------
 # Bridge tool schemas
 # ---------------------------------------------------------------------------
 
 
-def bridge_tool_schemas(deferred_count: int) -> List[Dict[str, Any]]:
+def bridge_tool_schemas(deferrable_tool_defs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Build the bridge tool schemas to inject in place of deferred tools.
 
     The schemas are intentionally short — every byte added here is a byte
     the user pays on every turn. Descriptions are tuned to be unambiguous
     about the call sequence the model should follow.
     """
+    deferred_count = len(deferrable_tool_defs)
     desc_search = (
         f"Search {deferred_count} additional tools that are loaded on demand. "
-        "Returns up to ``limit`` matches with name and description. Follow "
-        f"with `{TOOL_DESCRIBE_NAME}` to load a tool's full parameter schema, "
-        f"then `{TOOL_CALL_NAME}` to invoke it. Tools listed at the top of this "
-        "system prompt are already available and do not need to be searched."
+        "Returns up to ``limit`` matches with name, description, signature, and "
+        "``describe_required``. Call ``tool_call`` directly when a match has "
+        "``describe_required: false`` and you know the arguments. Use "
+        f"`{TOOL_DESCRIBE_NAME}` only when ``describe_required: true``, "
+        "arguments are uncertain, or after argument validation failure. "
+        "Tools listed directly in the tools array do not need to be searched."
     )
     desc_describe = (
         f"Load the full JSON schema for one tool returned by `{TOOL_SEARCH_NAME}`. "
-        f"Required before `{TOOL_CALL_NAME}` if the tool's parameters are unknown."
+        f"Use this when `{TOOL_SEARCH_NAME}` says ``describe_required: true`` or "
+        f"the tool's parameters are still unclear before `{TOOL_CALL_NAME}`."
     )
-    desc_call = (
-        "Invoke a deferred tool by name with the given arguments. Argument shape "
-        f"matches the tool's schema (see `{TOOL_DESCRIBE_NAME}`). Policy, hooks, "
-        "and approvals run exactly as for any directly-listed tool."
-    )
+    desc_call = _tool_call_description(deferrable_tool_defs)
 
     return [
         {
@@ -637,7 +954,7 @@ def assemble_tool_defs(
             threshold_tokens=int((context_length or 0) * (config.threshold_pct / 100.0)),
         )
 
-    bridge = bridge_tool_schemas(len(deferrable))
+    bridge = bridge_tool_schemas(deferrable)
     result = visible + bridge
     threshold_tokens = int((context_length or 0) * (config.threshold_pct / 100.0))
 
@@ -665,12 +982,15 @@ def is_bridge_tool(name: str) -> bool:
 
 
 def _format_search_hit(entry: CatalogEntry) -> Dict[str, Any]:
+    signature = compact_signature(entry.schema)
     return {
         "name": entry.name,
         "source": entry.source,
         "source_name": entry.source_name,
         # Cap description so a chatty MCP server doesn't blow up the result.
         "description": (entry.description or "")[:400],
+        "signature": signature.text,
+        "describe_required": not signature.safe_for_direct_call,
     }
 
 
@@ -802,8 +1122,10 @@ __all__ = [
     "BRIDGE_TOOL_NAMES",
     "DEFAULT_ALWAYS_VISIBLE_TOOLS",
     "ToolSearchConfig",
+    "CompactSignature",
     "CatalogEntry",
     "AssemblyResult",
+    "compact_signature",
     "load_config",
     "is_deferrable_tool_name",
     "classify_tools",
