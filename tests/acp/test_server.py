@@ -1476,6 +1476,38 @@ class TestSlashCommands:
         assert "/tools" in result
         assert "/reset" in result
 
+    def test_tools_uses_frozen_tool_search_policy(self, agent, mock_manager, monkeypatch):
+        from tools.tool_search import ToolSearchConfig
+
+        state = self._make_state(mock_manager)
+        state.agent.enabled_toolsets = ["hermes-acp"]
+        state.agent.disabled_toolsets = ["safe"]
+        state.agent._tool_search_policy = ToolSearchConfig.from_raw({
+            "enabled": "on",
+            "defer_core_tools": True,
+        })
+        seen = {}
+
+        def _capture(**kw):
+            seen.update(kw)
+            return [{
+                "type": "function",
+                "function": {
+                    "name": "terminal",
+                    "description": "Run shell commands",
+                    "parameters": {},
+                },
+            }]
+
+        monkeypatch.setattr("model_tools.get_tool_definitions", _capture)
+        monkeypatch.setattr("agent.memory_manager.inject_memory_provider_tools", lambda tool_view: None)
+
+        result = agent._handle_slash_command("/tools", state)
+
+        assert "Available tools (1):" in result
+        assert seen["disabled_toolsets"] == ["safe"]
+        assert seen["tool_search_policy"] == state.agent._tool_search_policy
+
     def test_model_shows_current(self, agent, mock_manager):
         state = self._make_state(mock_manager)
         result = agent._handle_slash_command("/model", state)

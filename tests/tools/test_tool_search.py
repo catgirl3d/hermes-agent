@@ -20,16 +20,24 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 
-def _td(name: str, description: str = "", properties: Dict[str, Any] | None = None) -> Dict[str, Any]:
+def _td(
+    name: str,
+    description: str = "",
+    properties: Dict[str, Any] | None = None,
+    required: List[str] | None = None,
+) -> Dict[str, Any]:
+    parameters: Dict[str, Any] = {
+        "type": "object",
+        "properties": properties or {},
+    }
+    if required:
+        parameters["required"] = required
     return {
         "type": "function",
         "function": {
             "name": name,
             "description": description,
-            "parameters": {
-                "type": "object",
-                "properties": properties or {},
-            },
+            "parameters": parameters,
         },
     }
 
@@ -218,6 +226,111 @@ class TestThresholdGate:
 
 
 # ---------------------------------------------------------------------------
+# Compact signatures
+# ---------------------------------------------------------------------------
+
+
+class TestCompactSignatures:
+    def test_renders_required_optional_scalar_enum_and_range(self):
+        from tools.tool_search import CompactSignature, compact_signature
+
+        sig = compact_signature(_td(
+            "session_search",
+            properties={
+                "query": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 10},
+                "sort": {"type": "string", "enum": ["newest", "oldest"]},
+            },
+            required=["query"],
+        ))
+
+        assert sig == CompactSignature(
+            text="session_search(query: string, limit?: integer[1..10], sort?: newest|oldest)",
+            safe_for_direct_call=True,
+        )
+
+    def test_nullable_scalar_forms_remain_safe(self):
+        from tools.tool_search import compact_signature
+
+        union_sig = compact_signature(_td(
+            "lookup_user",
+            properties={
+                "name": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            },
+        ))
+        sanitized_sig = compact_signature(_td(
+            "lookup_user",
+            properties={
+                "name": {"type": "string", "nullable": True},
+            },
+        ))
+
+        assert union_sig.safe_for_direct_call is True
+        assert union_sig.text == "lookup_user(name?: string)"
+        assert sanitized_sig.safe_for_direct_call is True
+        assert sanitized_sig.text == "lookup_user(name?: string)"
+
+    def test_freeform_objects_and_typed_maps_render_but_structured_objects_describe(self):
+        from tools.tool_search import compact_signature
+
+        freeform = compact_signature(_td(
+            "write_blob",
+            properties={
+                "payload": {"type": "object", "additionalProperties": True},
+            },
+        ))
+        typed_map = compact_signature(_td(
+            "set_scores",
+            properties={
+                "scores": {
+                    "type": "object",
+                    "additionalProperties": {"type": "integer"},
+                },
+            },
+        ))
+        structured = compact_signature(_td(
+            "create_issue",
+            properties={
+                "payload": {
+                    "type": "object",
+                    "properties": {"title": {"type": "string"}},
+                },
+            },
+        ))
+
+        assert freeform.text == "write_blob(payload?: object)"
+        assert freeform.safe_for_direct_call is True
+        assert typed_map.text == "set_scores(scores?: map<string, integer>)"
+        assert typed_map.safe_for_direct_call is True
+        assert structured.text == "create_issue(describe first)"
+        assert structured.safe_for_direct_call is False
+
+    def test_unhandled_constraints_and_object_arrays_require_describe(self):
+        from tools.tool_search import compact_signature
+
+        patterned = compact_signature(_td(
+            "validate_tag",
+            properties={
+                "tag": {"type": "string", "pattern": "^[a-z]+$"},
+            },
+        ))
+        object_array = compact_signature(_td(
+            "bulk_create",
+            properties={
+                "items": {
+                    "type": "array",
+                    "items": {"type": "object", "properties": {"id": {"type": "string"}}},
+                },
+            },
+        ))
+
+        assert patterned.text == "validate_tag(describe first)"
+        assert patterned.safe_for_direct_call is False
+        assert object_array.text == "bulk_create(describe first)"
+        assert object_array.safe_for_direct_call is False
+
+
+# ---------------------------------------------------------------------------
 # Retrieval (BM25 + substring fallback)
 # ---------------------------------------------------------------------------
 
@@ -335,6 +448,53 @@ class TestAssembly:
         assert "session_search" not in names
         assert BRIDGE_TOOL_NAMES <= names
 
+    def test_bridge_tool_call_description_indexes_safe_signatures_only(self, monkeypatch):
+        from tools import tool_search as ts
+
+        defs = [
+            _td("core_lookup", properties={"query": {"type": "string"}}, required=["query"]),
+            _td("plugin_safe", properties={"limit": {"type": "integer", "minimum": 1, "maximum": 5}}),
+            _td("mcp_complex", properties={"payload": {"type": "object", "properties": {"x": {"type": "string"}}}}),
+        ]
+
+        monkeypatch.setattr(
+            ts,
+            "_classify_source",
+            lambda name: (
+                ("core", "core") if name == "core_lookup" else
+                ("plugin", "plugin") if name == "plugin_safe" else
+                ("mcp", "mcp-test")
+            ),
+        )
+
+        desc = ts.bridge_tool_schemas(defs)[2]["function"]["description"]
+
+        core_idx = desc.index("- core_lookup(query: string)")
+        plugin_idx = desc.index("- plugin_safe(limit?: integer[1..5])")
+        assert core_idx < plugin_idx
+        assert "mcp_complex" not in desc
+        assert "values for `tool_call.name`" in desc
+        assert "Do not invoke them as native tools." in desc
+
+    def test_bridge_manifest_truncates_at_entry_boundaries(self, monkeypatch):
+        from tools import tool_search as ts
+
+        defs = [
+            _td("alpha_tool_with_long_name", properties={"query": {"type": "string"}}, required=["query"]),
+            _td("beta_tool_with_long_name", properties={"query": {"type": "string"}}, required=["query"]),
+            _td("gamma_tool_with_long_name", properties={"query": {"type": "string"}}, required=["query"]),
+        ]
+
+        monkeypatch.setattr(ts, "MAX_MANIFEST_BODY_CHARS", 55)
+        monkeypatch.setattr(ts, "MAX_BRIDGE_DESCRIPTION_CHARS", 4096)
+        monkeypatch.setattr(ts, "_classify_source", lambda name: ("plugin", "plugin"))
+
+        desc = ts.bridge_tool_schemas(defs)[2]["function"]["description"]
+
+        assert "- alpha_tool_with_long_name(query: string)" in desc
+        assert "- beta_tool_with_long_name(query: string)" not in desc
+        assert "Use `tool_search` for deferred tools not listed here" in desc
+
 
 # ---------------------------------------------------------------------------
 # Bridge dispatch
@@ -342,6 +502,40 @@ class TestAssembly:
 
 
 class TestBridgeDispatch:
+    def test_search_hits_include_signature_and_describe_required(self):
+        from tools.tool_search import CatalogEntry, _format_search_hit
+
+        safe_hit = _format_search_hit(CatalogEntry(
+            name="session_search",
+            description="Search prior sessions",
+            schema=_td(
+                "session_search",
+                properties={
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 10},
+                },
+            ),
+            source="core",
+            source_name="session_search",
+        ))
+        complex_hit = _format_search_hit(CatalogEntry(
+            name="skill_manage",
+            description="Manage skills",
+            schema=_td(
+                "skill_manage",
+                properties={
+                    "payload": {"type": "object", "properties": {"name": {"type": "string"}}},
+                },
+            ),
+            source="plugin",
+            source_name="skills",
+        ))
+
+        assert safe_hit["signature"] == "session_search(query?: string, limit?: integer[1..10])"
+        assert safe_hit["describe_required"] is False
+        assert complex_hit["signature"] == "skill_manage(describe first)"
+        assert complex_hit["describe_required"] is True
+
     def test_tool_search_requires_query(self):
         from tools.tool_search import dispatch_tool_search
         result = dispatch_tool_search({}, current_tool_defs=[])
@@ -376,6 +570,24 @@ class TestBridgeDispatch:
 
         parsed = json.loads(result)
         assert parsed["name"] == "session_search"
+
+    def test_tool_search_results_surface_signature_and_describe_required(self):
+        from tools.tool_search import ToolSearchConfig, dispatch_tool_search
+
+        defs = _core_tool_defs()
+        result = dispatch_tool_search(
+            {"query": "session search", "limit": 5},
+            current_tool_defs=defs,
+            config=ToolSearchConfig.from_raw({
+                "enabled": "on",
+                "defer_core_tools": True,
+            }),
+        )
+
+        parsed = json.loads(result)
+        session_hit = next(match for match in parsed["matches"] if match["name"] == "session_search")
+        assert session_hit["describe_required"] is False
+        assert session_hit["signature"].startswith("session_search(")
 
     def test_resolve_underlying_call_parses_object_args(self):
         from tools.tool_search import resolve_underlying_call
