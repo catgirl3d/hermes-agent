@@ -121,6 +121,14 @@ _ENDPOINT_MODEL_CACHE_TTL = 300
 _ENDPOINT_PROBE_TTL_SECONDS = 3600.0
 _endpoint_probe_path_cache: Dict[str, tuple] = {}
 
+# Narrow local hotfix: this proxy address is a plain relay, not a local model
+# server. Keep the exception exact-match so it cannot accidentally widen to
+# unrelated loopback endpoints.
+_PROBE_EXEMPT_BASE_URLS = frozenset({
+    "http://127.0.0.1:3456",
+    "http://127.0.0.1:3456/v1",
+})
+
 
 def _get_model_metadata_cache_path() -> Path:
     """Return path to the OpenRouter model metadata disk cache."""
@@ -680,6 +688,11 @@ def _localhost_to_ipv4(url: str) -> str:
     )
 
 
+def _is_probe_exempt_base_url(base_url: str) -> bool:
+    normalized = _localhost_to_ipv4(_normalize_base_url(base_url))
+    return normalized in _PROBE_EXEMPT_BASE_URLS
+
+
 def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
     """Detect which local server is running at base_url by probing known endpoints.
 
@@ -697,6 +710,8 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
     # Applied to ``normalized`` before deriving server/LM Studio URLs AND
     # before the cache lookup, so localhost and 127.0.0.1 share a cache entry.
     normalized = _localhost_to_ipv4(normalized)
+    if _is_probe_exempt_base_url(normalized):
+        return None
 
     server_url = normalized
     if server_url.endswith("/v1"):
@@ -936,6 +951,8 @@ def fetch_endpoint_model_metadata(
     """
     normalized = _normalize_base_url(base_url)
     if not normalized or _is_openrouter_base_url(normalized):
+        return {}
+    if _is_probe_exempt_base_url(normalized):
         return {}
 
     if not force_refresh:
@@ -1466,6 +1483,9 @@ def query_ollama_num_ctx(model: str, base_url: str, api_key: str = "") -> Option
     """
     import httpx
 
+    if _is_probe_exempt_base_url(base_url):
+        return None
+
     bare_model = _strip_provider_prefix(model)
     server_url = _localhost_to_ipv4(base_url.rstrip("/"))
     if server_url.endswith("/v1"):
@@ -1520,6 +1540,8 @@ def query_ollama_supports_vision(model: str, base_url: str, api_key: str = "") -
 
     bare_model = _strip_provider_prefix(model)
     if not bare_model or not base_url:
+        return None
+    if _is_probe_exempt_base_url(base_url):
         return None
 
     try:
@@ -1585,6 +1607,9 @@ def _query_ollama_api_show(model: str, base_url: str, api_key: str = "") -> Opti
     control ``num_ctx`` themselves; hosted users can't.
     """
     import time as _time
+
+    if _is_probe_exempt_base_url(base_url):
+        return None
 
     # Namespaced cache key: shares the TTL store with
     # _query_local_context_length but never collides with its (model, url)
@@ -1696,6 +1721,9 @@ def _query_local_context_length(model: str, base_url: str, api_key: str = "") ->
     the reconcile logic, which probes again once the TTL expires).
     """
     import time as _time
+
+    if _is_probe_exempt_base_url(base_url):
+        return None
 
     cache_key = (_strip_provider_prefix(model), base_url.rstrip("/"))
     now = _time.monotonic()
