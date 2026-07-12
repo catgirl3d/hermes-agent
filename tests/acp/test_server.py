@@ -1790,10 +1790,15 @@ class TestRegisterSessionMcpServers:
     async def test_refreshes_agent_tool_surface(self, agent, mock_manager):
         """After MCP registration, agent.tools and valid_tool_names are refreshed."""
         from acp.schema import McpServerStdio
+        from tools.tool_search import ToolSearchConfig
 
         state = mock_manager.create_session(cwd="/tmp")
         state.agent.enabled_toolsets = ["hermes-acp"]
         state.agent.disabled_toolsets = None
+        state.agent._tool_search_policy = ToolSearchConfig.from_raw({
+            "enabled": "on",
+            "defer_core_tools": True,
+        })
         state.agent.tools = []
         state.agent.valid_tool_names = set()
         state.agent._cached_system_prompt = "old prompt"
@@ -1824,6 +1829,7 @@ class TestRegisterSessionMcpServers:
             enabled_toolsets=["hermes-acp", "mcp-srv"],
             disabled_toolsets=None,
             quiet_mode=True,
+            tool_search_policy=state.agent._tool_search_policy,
         )
         assert state.agent.enabled_toolsets == ["hermes-acp", "mcp-srv"]
         assert state.agent.tools is fake_tools
