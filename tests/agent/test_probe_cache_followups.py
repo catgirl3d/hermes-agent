@@ -176,6 +176,14 @@ class TestDetectLocalServerTypeCache:
         with patch("httpx.Client", return_value=swap_client):
             assert detect_local_server_type("http://127.0.0.1:11434") == "lm-studio"
 
+    def test_exact_exempt_proxy_address_is_never_probed(self):
+        from agent.model_metadata import detect_local_server_type
+
+        with patch("httpx.Client") as client_cls:
+            assert detect_local_server_type("http://127.0.0.1:3456/v1") is None
+
+        client_cls.assert_not_called()
+
 
 class TestLocalhostIPv4SiblingSites:
     """#37595 widened: every probe helper rewrites localhost→127.0.0.1,
