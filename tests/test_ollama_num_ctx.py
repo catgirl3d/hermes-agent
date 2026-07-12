@@ -31,6 +31,17 @@ def _mock_httpx_client(show_response_data, status_code=200):
 class TestQueryOllamaNumCtx:
     """Test the Ollama /api/show context length query."""
 
+    def test_exempt_proxy_address_skips_detection_and_http(self):
+        import httpx
+
+        with patch("agent.model_metadata.detect_local_server_type") as detect, \
+             patch.object(httpx, "Client") as client_cls:
+            result = query_ollama_num_ctx("model", "http://127.0.0.1:3456/v1")
+
+        assert result is None
+        detect.assert_not_called()
+        client_cls.assert_not_called()
+
     def test_returns_context_from_model_info(self):
         """Should extract context_length from GGUF model_info metadata."""
         show_data = {

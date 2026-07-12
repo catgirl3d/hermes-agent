@@ -886,3 +886,32 @@ class TestLocalContextProbeTTLCache:
         assert first is None
         assert second is None
         assert detect.call_count == 2, "None result was wrongly cached; retry did not re-probe"
+
+
+class TestProbeExemptBaseUrl:
+    def test_fetch_endpoint_model_metadata_skips_exact_proxy_address(self):
+        from agent.model_metadata import fetch_endpoint_model_metadata
+
+        with patch("requests.get") as mock_requests:
+            result = fetch_endpoint_model_metadata("http://127.0.0.1:3456/v1")
+
+        assert result == {}
+        mock_requests.assert_not_called()
+
+    def test_get_model_context_length_skips_all_http_for_exact_proxy_address(self):
+        from agent.model_metadata import CONTEXT_PROBE_TIERS, get_model_context_length
+
+        with patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             patch("agent.model_metadata.fetch_model_metadata", return_value={}), \
+             patch("agent.models_dev.lookup_models_dev_context", return_value=None), \
+             patch("requests.get") as mock_requests, \
+             patch("httpx.Client") as mock_httpx:
+            result = get_model_context_length(
+                "proxy-only-model",
+                "http://127.0.0.1:3456/v1",
+                provider="custom",
+            )
+
+        assert result == CONTEXT_PROBE_TIERS[0]
+        mock_requests.assert_not_called()
+        mock_httpx.assert_not_called()
