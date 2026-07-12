@@ -1178,6 +1178,26 @@ def init_agent(
             print(f"🔄 Fallback chain ({len(agent._fallback_chain)} providers): " +
                   " → ".join(f"{f['model']} ({f['provider']})" for f in agent._fallback_chain))
 
+    # Load config once up front so the session can freeze its Tool Search
+    # policy before the initial tool snapshot is built. Later config edits
+    # affect only newly-created agents/sessions.
+    try:
+        from hermes_cli.config import load_config as _load_agent_config
+        _agent_cfg = _load_agent_config()
+    except Exception:
+        _agent_cfg = {}
+    if not isinstance(_agent_cfg, dict):
+        _agent_cfg = {}
+
+    try:
+        from tools.tool_search import ToolSearchConfig
+
+        _tool_search_root = _agent_cfg.get("tools") if isinstance(_agent_cfg.get("tools"), dict) else {}
+        agent._tool_search_policy = ToolSearchConfig.from_raw(_tool_search_root.get("tool_search"))
+    except Exception as _tool_search_policy_err:
+        agent._tool_search_policy = None
+        logger.debug("Tool Search policy snapshot unavailable: %s", _tool_search_policy_err)
+
     # Get available tools with filtering. Capture the registry generation this
     # snapshot is derived from FIRST, so a later concurrent refresh can tell
     # whether it holds a newer or staler view (see refresh_agent_mcp_tools).
@@ -1190,6 +1210,7 @@ def init_agent(
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
+        tool_search_policy=getattr(agent, "_tool_search_policy", None),
     )
     
     # Show tool configuration and store valid tool names for validation
@@ -1334,12 +1355,8 @@ def init_agent(
     from tools.todo_tool import TodoStore
     agent._todo_store = TodoStore()
     
-    # Load config once for memory, skills, and compression sections
-    try:
-        from hermes_cli.config import load_config as _load_agent_config
-        _agent_cfg = _load_agent_config()
-    except Exception:
-        _agent_cfg = {}
+    # Reuse the single config snapshot loaded above for memory, skills, and
+    # compression sections.
     try:
         agent._tool_guardrails = ToolCallGuardrailController(
             ToolCallGuardrailConfig.from_mapping(
