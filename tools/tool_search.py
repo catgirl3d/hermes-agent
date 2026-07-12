@@ -80,19 +80,14 @@ MAX_MANIFEST_BODY_CHARS = 2048
 MAX_BRIDGE_DESCRIPTION_CHARS = 4096
 
 _SAFE_NAME_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:/+-]+$")
-_UNSUPPORTED_COMPACT_KEYS = frozenset({
+_COMPACT_BLOCKING_KEYS = frozenset({
     "const",
     "contains",
     "contentEncoding",
     "contentMediaType",
     "dependentRequired",
     "dependentSchemas",
-    "format",
-    "maxItems",
-    "maxLength",
     "maxProperties",
-    "minItems",
-    "minLength",
     "minProperties",
     "not",
     "pattern",
@@ -341,6 +336,15 @@ def _compact_scalar_schema_text(schema: Dict[str, Any]) -> Optional[str]:
 
 
 def _compact_nullable_scalar_union_text(schema: Dict[str, Any]) -> Optional[str]:
+    schema_type = schema.get("type")
+    if isinstance(schema_type, list):
+        non_null = [item for item in schema_type if isinstance(item, str) and item != "null"]
+        saw_null = any(item == "null" for item in schema_type)
+        if saw_null and len(non_null) == 1 and len(non_null) == len(schema_type) - 1:
+            scalar_schema = dict(schema)
+            scalar_schema["type"] = non_null[0]
+            return _compact_scalar_schema_text(scalar_schema)
+
     for key in ("anyOf", "oneOf"):
         variants = schema.get(key)
         if not isinstance(variants, list):
@@ -367,7 +371,7 @@ def _compact_type_text(
         return None
     if "$ref" in schema or "allOf" in schema:
         return None
-    if any(key in schema for key in _UNSUPPORTED_COMPACT_KEYS):
+    if any(key in schema for key in _COMPACT_BLOCKING_KEYS):
         return None
 
     union_text = _compact_nullable_scalar_union_text(schema)
@@ -822,7 +826,7 @@ def bridge_tool_schemas(deferrable_tool_defs: List[Dict[str, Any]]) -> List[Dict
     desc_search = (
         f"Search {deferred_count} additional tools that are loaded on demand. "
         "Returns up to ``limit`` matches with name, description, signature, and "
-        "``describe_required``. Call ``tool_call`` directly when a match has "
+        f"``describe_required``. Call `{TOOL_CALL_NAME}` directly when a match has "
         "``describe_required: false`` and you know the arguments. Use "
         f"`{TOOL_DESCRIBE_NAME}` only when ``describe_required: true``, "
         "arguments are uncertain, or after argument validation failure. "
