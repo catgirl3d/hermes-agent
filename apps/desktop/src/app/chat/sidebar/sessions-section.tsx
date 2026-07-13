@@ -84,8 +84,6 @@ interface SidebarSessionsSectionProps {
   open: boolean
   onToggle: () => void
   sessions: SessionInfo[]
-  activeSessionId: null | string
-  workingSessionIdSet: Set<string>
   onResumeSession: (sessionId: string) => void
   onDeleteSession: (sessionId: string) => void
   onArchiveSession: (sessionId: string) => void
@@ -93,6 +91,7 @@ interface SidebarSessionsSectionProps {
   onTogglePin: (sessionId: string) => void
   onNewSessionInWorkspace?: (path: null | string) => void
   pinned: boolean
+  showSelection?: boolean
   rootClassName?: string
   contentClassName?: string
   emptyState: React.ReactNode
@@ -142,8 +141,6 @@ export function SidebarSessionsSection({
   open,
   onToggle,
   sessions,
-  activeSessionId,
-  workingSessionIdSet,
   onResumeSession,
   onDeleteSession,
   onArchiveSession,
@@ -151,6 +148,7 @@ export function SidebarSessionsSection({
   onTogglePin,
   onNewSessionInWorkspace,
   pinned,
+  showSelection = true,
   rootClassName,
   contentClassName,
   emptyState,
@@ -195,8 +193,7 @@ export function SidebarSessionsSection({
     const rowProps = {
       branchStem,
       isPinned: pinned,
-      isSelected: session.id === activeSessionId,
-      isWorking: workingSessionIdSet.has(session.id),
+      showSelection,
       onArchive: () => onArchiveSession(session.id),
       onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
       onDelete: () => onDeleteSession(session.id),
@@ -302,7 +299,6 @@ export function SidebarSessionsSection({
   } else if (flatVirtualized) {
     const virtual = (
       <VirtualSessionList
-        activeSessionId={activeSessionId}
         className={contentClassName}
         entries={displayEntries}
         onArchiveSession={onArchiveSession}
@@ -311,8 +307,8 @@ export function SidebarSessionsSection({
         onResumeSession={onResumeSession}
         onTogglePin={onTogglePin}
         pinned={pinned}
+        showSelection={showSelection}
         sortable={sessionsDraggable}
-        workingSessionIdSet={workingSessionIdSet}
       />
     )
 
@@ -362,9 +358,9 @@ export function SidebarSessionsSection({
 interface SortableSessionRowProps {
   session: SessionInfo
   isPinned: boolean
-  isSelected: boolean
-  isWorking: boolean
+  showSelection: boolean
   onArchive: () => void
+  onBranch?: () => void
   onDelete: () => void
   onPin: () => void
   onResume: () => void
