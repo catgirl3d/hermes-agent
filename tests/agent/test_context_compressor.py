@@ -1,5 +1,6 @@
 """Tests for agent/context_compressor.py — compression logic, thresholds, truncation fallback."""
 
+import json
 import pytest
 import time
 from unittest.mock import patch, MagicMock
@@ -9,6 +10,9 @@ from agent.context_compressor import (
     HISTORICAL_TASK_HEADING,
     SUMMARY_PREFIX,
     COMPRESSED_SUMMARY_METADATA_KEY,
+    _default_tool_prune_selected,
+    _terminal_result_excerpt,
+    _tool_compact_kind,
 )
 from hermes_state import SessionDB
 
@@ -2655,6 +2659,291 @@ class TestTokenBudgetTailProtection:
         # Tool at index 2 is outside the protected tail (last 3 = indices 2,3,4)
         # so it might or might not be pruned depending on boundary
         assert isinstance(pruned, int)
+
+    def test_manual_tool_prune_preserves_recent_turns_and_shrinks_history(self, budget_compressor):
+        c = budget_compressor
+        messages = []
+        duplicate = "same old output\n" * 400
+        for turn in range(7):
+            call_id = f"call-{turn}"
+            messages.extend(
+                [
+                    {"role": "user", "content": f"request {turn}"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": "terminal",
+                                    "arguments": f'{{"command":"task {turn}"}}',
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": duplicate if turn < 2 else (f"output {turn}\n" * 500),
+                    },
+                ]
+            )
+
+        # Seven exchanges total: protect everything from the fifth-most-recent
+        # user turn onward, leaving exactly the first two exchanges eligible.
+        protected_tail = messages[6:]
+        result, stats = c.prune_tool_results(
+            messages,
+            protect_tail_count=len(protected_tail),
+        )
+
+        assert result[6:] == protected_tail
+        assert [m for m in result if m.get("role") == "user"] == [
+            m for m in messages if m.get("role") == "user"
+        ]
+        assert stats["pruned_results"] == 2
+        assert stats["duplicate_results"] == 1
+        assert stats["excerpted_results"] == 1
+        assert stats["saved_bytes"] > 0
+        assert stats["after_bytes"] < stats["before_bytes"]
+        assert "[output head]" not in result[5]["content"]
+        assert "[output tail]" in result[5]["content"]
+
+    def test_manual_tool_prune_is_noop_when_everything_is_protected(self, budget_compressor):
+        messages = [
+            {"role": "tool", "tool_call_id": "old", "content": "x" * 10_000},
+            {"role": "user", "content": "latest"},
+        ]
+
+        result, stats = budget_compressor.prune_tool_results(
+            messages,
+            protect_tail_count=len(messages),
+        )
+
+        assert result == messages
+        assert stats["changed"] is False
+        assert stats["pruned_results"] == 0
+        assert stats["saved_bytes"] == 0
+
+    def test_manual_tool_prune_runs_the_compaction_pipeline_once(self, budget_compressor):
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "old",
+                        "function": {
+                            "name": "terminal",
+                            "arguments": '{"command":"test"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "old", "content": "output\n" * 500},
+            {"role": "user", "content": "recent"},
+        ]
+
+        with patch.object(
+            ContextCompressor,
+            "_prune_old_tool_results",
+            wraps=ContextCompressor._prune_old_tool_results,
+        ) as prune:
+            budget_compressor.prune_tool_results(
+                messages,
+                protect_tail_count=1,
+                tool_names={"terminal"},
+            )
+
+        assert prune.call_count == 1
+
+    def test_manual_tool_prune_defaults_to_noise_and_preserves_file_context(self, budget_compressor):
+        read_content = "\n".join(
+            [
+                "1|from pathlib import Path",
+                "2|class SessionStore:",
+                "3|    def load(self):",
+                "4|        return important_runtime_value",
+                *(f"body line {index}" for index in range(300)),
+            ]
+        )
+        terminal_content = json.dumps(
+            {
+                "output": "\n".join([*(f"noise {index}" for index in range(100)), "final diagnostic"]),
+                "stderr": "ERROR tests failed",
+                "exit_code": 1,
+            }
+        )
+        read_args = json.dumps({"path": "store.py", "context": "x" * 1_000})
+        messages = [
+            {"role": "user", "content": "inspect and test"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "read-old",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": read_args},
+                    },
+                    {
+                        "id": "terminal-old",
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": '{"command":"pytest"}'},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "read-old", "content": read_content},
+            {"role": "tool", "tool_call_id": "terminal-old", "content": terminal_content},
+        ]
+        for turn in range(5):
+            messages.extend(
+                [
+                    {"role": "user", "content": f"recent request {turn}"},
+                    {"role": "assistant", "content": f"recent answer {turn}"},
+                ]
+            )
+
+        protected_tail = messages[4:]
+        default_result, default_stats = budget_compressor.prune_tool_results(
+            messages,
+            protect_tail_count=len(protected_tail),
+        )
+
+        assert default_stats["selected_tool_names"] == ["terminal"]
+        assert default_result[2]["content"] == read_content
+        assert default_result[1]["tool_calls"][0]["function"]["arguments"] == read_args
+        assert "[structured errors]" in default_result[3]["content"]
+        assert "ERROR tests failed" in default_result[3]["content"]
+        assert "final diagnostic" in default_result[3]["content"]
+        assert "noise 0" not in default_result[3]["content"]
+        assert default_result[4:] == protected_tail
+        tools = {tool["name"]: tool for tool in default_stats["tools"]}
+        assert tools["terminal"]["default_selected"] is True
+        assert tools["read_file"]["default_selected"] is False
+        assert tools["read_file"]["argument_count"] == 1
+
+        file_result, file_stats = budget_compressor.prune_tool_results(
+            messages,
+            protect_tail_count=len(protected_tail),
+            tool_names={"read_file"},
+        )
+
+        assert file_stats["selected_tool_names"] == ["read_file"]
+        assert file_stats["excerpted_results"] == 1
+        assert "[file structure" in file_result[2]["content"]
+        assert "class SessionStore" in file_result[2]["content"]
+        assert "def load" in file_result[2]["content"]
+        assert "body line 299" not in file_result[2]["content"]
+        assert file_result[3]["content"] == terminal_content
+        assert file_result[1]["tool_calls"][0]["function"]["arguments"] != read_args
+
+    def test_manual_web_prune_keeps_top_result_fields(self, budget_compressor):
+        web_content = json.dumps(
+            {
+                "results": [
+                    {
+                        "title": f"Result {index}",
+                        "url": f"https://example.test/{index}",
+                        "snippet": f"Snippet {index}",
+                        "raw": "noise" * 2_000,
+                    }
+                    for index in range(1, 8)
+                ]
+            }
+        )
+        messages = [
+            {"role": "user", "content": "search"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "web-old",
+                        "type": "function",
+                        "function": {"name": "mcp__brave__search", "arguments": '{"query":"pruning"}'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "web-old", "content": web_content},
+        ]
+        for turn in range(5):
+            messages.extend(
+                [
+                    {"role": "user", "content": f"recent {turn}"},
+                    {"role": "assistant", "content": "ok"},
+                ]
+            )
+
+        result, stats = budget_compressor.prune_tool_results(
+            messages,
+            protect_tail_count=10,
+        )
+
+        assert stats["selected_tool_names"] == ["mcp__brave__search"]
+        assert stats["excerpted_results"] == 1
+        assert "[top 5 web results]" in result[2]["content"]
+        assert "Result 1" in result[2]["content"]
+        assert "https://example.test/5" in result[2]["content"]
+        assert "Result 6" not in result[2]["content"]
+        assert "noisenoise" not in result[2]["content"]
+
+    @pytest.mark.parametrize(
+        ("tool_name", "selected"),
+        [
+            ("exa_web_search_exa", True),
+            ("mcp__brave__search", True),
+            ("tavily_search", True),
+            ("google_web_search", True),
+            ("regex_helper", False),
+            ("read_file", False),
+        ],
+    )
+    def test_manual_web_prune_classification_uses_name_tokens(self, tool_name, selected):
+        assert _default_tool_prune_selected(tool_name) is selected
+        if selected:
+            assert _tool_compact_kind(tool_name) == "web_fields"
+
+    def test_terminal_excerpt_does_not_guess_errors_from_output_keywords(self):
+        excerpt = _terminal_result_excerpt(
+            json.dumps(
+                {
+                    "output": "error_handler.py\n0 errors\nstderr_parser.py\nfinal line",
+                    "exit_code": 0,
+                }
+            )
+        )
+
+        assert "[structured errors]" not in excerpt
+        assert "[output tail]" in excerpt
+        assert "0 errors" in excerpt
+
+    def test_terminal_plain_text_keeps_error_text_when_it_is_in_the_tail(self):
+        excerpt = _terminal_result_excerpt(
+            "\n".join([*(f"line {index}" for index in range(20)), "ERROR tests failed"])
+        )
+
+        assert "[structured errors]" not in excerpt
+        assert "[output tail]" in excerpt
+        assert "ERROR tests failed" in excerpt
+
+    def test_dedup_never_mutates_protected_tail(self, budget_compressor):
+        content = "duplicate output" * 500
+        messages = [
+            {"role": "tool", "tool_call_id": "old", "content": content},
+            {"role": "user", "content": "recent"},
+            {"role": "tool", "tool_call_id": "newer-a", "content": content},
+            {"role": "tool", "tool_call_id": "newer-b", "content": content},
+        ]
+
+        result, _ = budget_compressor._prune_old_tool_results(
+            messages,
+            protect_tail_count=3,
+        )
+
+        assert result[1:] == messages[1:]
+        assert result[0]["content"].startswith("[Duplicate tool output")
 
     def test_multimodal_message_accumulates_text_chars_not_block_count(self, budget_compressor):
         """_find_tail_cut_by_tokens must use text char count, not list length,

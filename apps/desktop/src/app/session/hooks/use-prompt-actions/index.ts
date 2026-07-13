@@ -5,7 +5,14 @@ import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 import { PROMPT_SUBMIT_REQUEST_TIMEOUT_MS, transcribeAudio } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { stripAnsi } from '@/lib/ansi'
-import { branchGroupForUser, type ChatMessage, chatMessageText, textPart } from '@/lib/chat-messages'
+import {
+  branchGroupForUser,
+  type ChatMessage,
+  chatMessageText,
+  reconcilePrunedChatMessages,
+  textPart,
+  toChatMessages
+} from '@/lib/chat-messages'
 import { pathLabel, SLASH_COMMAND_RE } from '@/lib/chat-runtime'
 import { triggerHaptic } from '@/lib/haptics'
 import { setMutableRef } from '@/lib/mutable-ref'
@@ -40,7 +47,8 @@ import type {
   HandoffRequestResponse,
   HandoffStateResponse,
   ImageAttachResponse,
-  SessionSteerResponse
+  SessionSteerResponse,
+  ToolResultPruneResponse
 } from '../../../types'
 
 import { useSlashCommand } from './slash'
@@ -230,7 +238,8 @@ export function usePromptActions({
             {
               id: `${role}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
               role,
-              parts: [textPart(body)]
+              parts: [textPart(body)],
+              rendererOwned: true
             }
           ]
         }),
@@ -829,6 +838,61 @@ export function usePromptActions({
     [activeSessionId, activeSessionIdRef, busyRef, submitRewindPrompt, updateSessionState]
   )
 
+  const previewToolResultPrune = useCallback(async (toolNames?: string[]) => {
+    const sessionId = activeSessionIdRef.current || activeSessionId
+
+    if (!sessionId) {
+      throw new Error(copy.sessionUnavailable)
+    }
+
+    return requestGateway<ToolResultPruneResponse>('session.prune_tool_results', {
+      session_id: sessionId,
+      ...(toolNames !== undefined ? { tool_names: toolNames } : {})
+    })
+  }, [activeSessionId, activeSessionIdRef, copy.sessionUnavailable, requestGateway])
+
+  const applyToolResultPrune = useCallback(
+    async (preview: ToolResultPruneResponse) => {
+      if (!preview.session_id || activeSessionIdRef.current !== preview.session_id) {
+        throw new Error(copy.sessionUnavailable)
+      }
+
+      const result = await requestGateway<ToolResultPruneResponse>('session.prune_tool_results', {
+        session_id: preview.session_id,
+        confirm: true,
+        history_version: preview.history_version,
+        selection_hash: preview.selection_hash,
+        tool_names: preview.selected_tool_names
+      })
+
+      // The mutation belongs to the original runtime. If the user switched
+      // while it was in flight, a later resume will hydrate backend truth;
+      // never publish it into the new foreground session or rebind identities.
+      if (activeSessionIdRef.current !== preview.session_id) {
+        return result
+      }
+
+      if (result.applied && Array.isArray(result.messages)) {
+        const backendMessages = toChatMessages(result.messages)
+        updateSessionState(
+          preview.session_id,
+          state => ({
+            ...state,
+            messages: reconcilePrunedChatMessages(
+              backendMessages,
+              state.messages,
+              new Set(result.selected_tool_names)
+            )
+          }),
+          selectedStoredSessionIdRef.current
+        )
+      }
+
+      return result
+    },
+    [activeSessionIdRef, copy.sessionUnavailable, requestGateway, selectedStoredSessionIdRef, updateSessionState]
+  )
+
   const editMessage = useCallback(
     async (edited: AppendMessage) => {
       const sessionId = activeSessionId || activeSessionIdRef.current
@@ -950,12 +1014,14 @@ export function usePromptActions({
   )
 
   return {
+    applyToolResultPrune,
     cancelRun,
     editMessage,
     handleThreadMessagesChange,
     handoffSession,
     reloadFromMessage,
     restoreToMessage,
+    previewToolResultPrune,
     steerPrompt,
     submitText,
     transcribeVoiceAudio

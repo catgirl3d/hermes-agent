@@ -13,6 +13,7 @@ import {
 } from '@/components/ui/dialog'
 import { useI18n } from '@/i18n'
 import { AlertTriangle } from '@/lib/icons'
+import { cn } from '@/lib/utils'
 
 interface ConfirmDialogProps {
   open: boolean
@@ -20,8 +21,12 @@ interface ConfirmDialogProps {
   // Does the work. Throw to surface an inline error and keep the dialog open.
   onConfirm: () => Promise<void> | void
   title: ReactNode
+  children?: ReactNode
+  contentClassName?: string
   description?: ReactNode
   confirmLabel?: string
+  confirmDisabled?: boolean
+  confirmFromDialogKeyDown?: boolean
   busyLabel?: string
   doneLabel?: string
   cancelLabel?: string
@@ -38,8 +43,12 @@ export function ConfirmDialog({
   onClose,
   onConfirm,
   title,
+  children,
+  contentClassName,
   description,
   confirmLabel,
+  confirmDisabled = false,
+  confirmFromDialogKeyDown = true,
   busyLabel,
   doneLabel,
   cancelLabel,
@@ -50,6 +59,7 @@ export function ConfirmDialog({
   const [status, setStatus] = useState<'done' | 'idle' | 'saving'>('idle')
   const [error, setError] = useState<null | string>(null)
   const busy = status === 'saving' || status === 'done'
+  const confirmBlocked = busy || confirmDisabled
   const resolvedConfirmLabel = confirmLabel ?? t.common.confirm
   const resolvedBusyLabel = busyLabel ?? t.common.loading
   const resolvedDoneLabel = doneLabel ?? t.common.done
@@ -63,7 +73,7 @@ export function ConfirmDialog({
   }, [open])
 
   async function run() {
-    if (busy) {
+    if (confirmBlocked) {
       return
     }
 
@@ -95,11 +105,15 @@ export function ConfirmDialog({
   return (
     <Dialog onOpenChange={value => !value && !busy && onClose()} open={open}>
       <DialogContent
-        className="max-w-md"
+        className={cn('max-w-md', contentClassName)}
         onKeyDown={event => {
           // Enter/Space confirm regardless of which button holds focus
           // (preventDefault stops a focused Cancel from swallowing it).
-          if ((event.key === 'Enter' || event.key === ' ') && !busy) {
+          if (
+            confirmFromDialogKeyDown &&
+            (event.key === 'Enter' || event.key === ' ') &&
+            !confirmBlocked
+          ) {
             event.preventDefault()
             void run()
           }
@@ -109,6 +123,8 @@ export function ConfirmDialog({
           <DialogTitle>{title}</DialogTitle>
           {description ? <DialogDescription>{description}</DialogDescription> : null}
         </DialogHeader>
+
+        {children}
 
         {error && (
           <div className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
@@ -121,7 +137,11 @@ export function ConfirmDialog({
           <Button disabled={busy} onClick={onClose} type="button" variant="ghost">
             {resolvedCancelLabel}
           </Button>
-          <Button disabled={busy} onClick={() => void run()} variant={destructive ? 'destructive' : 'default'}>
+          <Button
+            disabled={confirmBlocked}
+            onClick={() => void run()}
+            variant={destructive ? 'destructive' : 'default'}
+          >
             <ActionStatus
               busy={resolvedBusyLabel}
               done={resolvedDoneLabel}

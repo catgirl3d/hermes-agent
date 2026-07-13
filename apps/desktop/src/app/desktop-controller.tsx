@@ -773,10 +773,12 @@ export function DesktopController() {
   const handleSkinCommand = useSkinCommand()
 
   const {
+    applyToolResultPrune,
     cancelRun,
     editMessage,
     handleThreadMessagesChange,
     reloadFromMessage,
+    previewToolResultPrune,
     restoreToMessage,
     steerPrompt,
     submitText,
@@ -1115,6 +1117,7 @@ export function DesktopController() {
       modelMenuContent={modelMenuContent}
       onAddContextRef={composer.addContextRefAttachment}
       onAddUrl={url => composer.addContextRefAttachment(`@url:${formatRefValue(url)}`, url)}
+      onApplyToolResultPrune={applyToolResultPrune}
       onAttachDroppedItems={composer.attachDroppedItems}
       onAttachImageBlob={composer.attachImageBlob}
       onBranchInNewChat={branchInNewChat}
@@ -1130,6 +1133,7 @@ export function DesktopController() {
       onPickFiles={() => void composer.pickContextPaths('file')}
       onPickFolders={() => void composer.pickContextPaths('folder')}
       onPickImages={() => void composer.pickImages()}
+      onPreviewToolResultPrune={previewToolResultPrune}
       onReload={reloadFromMessage}
       onRemoveAttachment={id => void composer.removeAttachment(id)}
       onRestoreToMessage={restoreToMessage}
