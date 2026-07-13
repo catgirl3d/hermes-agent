@@ -2,9 +2,20 @@ import { describe, expect, it } from 'vitest'
 
 import type { SessionInfo } from '@/hermes'
 
-import { sameCronSignature } from './desktop-controller-utils'
+import { runtimeMatchesStoredSession, sameCronSignature } from './desktop-controller-utils'
 
 const session = (id: string, title: string | null): SessionInfo => ({ id, title }) as SessionInfo
+
+describe('runtimeMatchesStoredSession', () => {
+  it('rejects a poll targeting a stored session not owned by the active runtime', () => {
+    expect(runtimeMatchesStoredSession('stored-A', 'stored-B')).toBe(false)
+    expect(runtimeMatchesStoredSession(undefined, 'stored-A')).toBe(false)
+  })
+
+  it('accepts the runtime currently bound to the selected stored session', () => {
+    expect(runtimeMatchesStoredSession('stored-A', 'stored-A')).toBe(true)
+  })
+})
 
 describe('sameCronSignature', () => {
   it('is false when the lengths differ', () => {

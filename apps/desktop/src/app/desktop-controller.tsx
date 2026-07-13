@@ -86,6 +86,7 @@ import {
 } from './chat/right-rail'
 import { ChatSidebar } from './chat/sidebar'
 import { CommandPalette } from './command-palette'
+import { runtimeMatchesStoredSession } from './desktop-controller-utils'
 import { useGatewayBoot } from './gateway/hooks/use-gateway-boot'
 import { useGatewayRequest } from './gateway/hooks/use-gateway-request'
 import { useKeybinds } from './hooks/use-keybinds'
@@ -559,6 +560,16 @@ export function DesktopController() {
       return
     }
 
+    const activeRuntimeState = sessionStateByRuntimeIdRef.current.get(runtimeSessionId)
+
+    // Route selection changes before cold resume has rebound activeSessionId.
+    // Never poll the newly selected transcript into the previous runtime during
+    // that handoff; a completed resume will own the matching runtime and poll on
+    // its next tick.
+    if (!runtimeMatchesStoredSession(activeRuntimeState?.storedSessionId, storedSessionId)) {
+      return
+    }
+
     try {
       const latest = await getSessionMessages(storedSessionId, stored.profile)
       const signatureKey = `${stored.profile ?? 'default'}:${storedSessionId}`
@@ -579,7 +590,7 @@ export function DesktopController() {
     } catch {
       // Non-fatal: next poll or manual refresh can hydrate.
     }
-  }, [activeSessionIdRef, busyRef, selectedStoredSessionIdRef, updateSessionState])
+  }, [activeSessionIdRef, busyRef, selectedStoredSessionIdRef, sessionStateByRuntimeIdRef, updateSessionState])
 
   const { handleGatewayEvent } = useMessageStream({
     activeSessionIdRef,
