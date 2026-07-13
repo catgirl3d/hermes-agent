@@ -1,5 +1,12 @@
 import type { SessionInfo } from '@/hermes'
 
+export function runtimeMatchesStoredSession(
+  runtimeStoredSessionId: null | string | undefined,
+  selectedStoredSessionId: null | string
+): boolean {
+  return Boolean(selectedStoredSessionId) && runtimeStoredSessionId === selectedStoredSessionId
+}
+
 // Cheap signature compare so a poll only swaps the atom (and re-renders the
 // sidebar) when the visible rows actually changed.
 export function sameCronSignature(a: SessionInfo[], b: SessionInfo[]): boolean {
