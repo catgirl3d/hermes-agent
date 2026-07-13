@@ -1008,15 +1008,14 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch):
         def reopen_session(self, target):
             captured["reopened"] = target
 
-        def get_messages_as_conversation(self, target, include_ancestors=False):
-            captured.setdefault("history_calls", []).append((target, include_ancestors))
+        def get_resume_messages(self, target):
+            captured.setdefault("history_calls", []).append(target)
             return (
+                [{"role": "user", "content": "tip prompt"}],
                 [
                     {"role": "user", "content": "root prompt"},
                     {"role": "assistant", "content": "root answer"},
-                ]
-                if include_ancestors
-                else [{"role": "user", "content": "tip prompt"}]
+                ],
             )
 
     monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
@@ -1053,7 +1052,7 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch):
         {"role": "user", "text": "root prompt"},
         {"role": "assistant", "text": "root answer"},
     ]
-    assert captured["history_calls"] == [("tip", False), ("tip", True)]
+    assert captured["history_calls"] == ["tip"]
 
 
 def test_session_resume_follows_compression_tip(monkeypatch, tmp_path):
