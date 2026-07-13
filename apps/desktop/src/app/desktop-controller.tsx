@@ -1,6 +1,6 @@
 import { useStore } from '@nanostores/react'
 import { useQueryClient } from '@tanstack/react-query'
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef } from 'react'
+import { lazy, Profiler, Suspense, type ProfilerOnRenderCallback, useCallback, useEffect, useLayoutEffect, useMemo, useRef } from 'react'
 import { Navigate, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom'
 
 import { BootFailureOverlay } from '@/components/boot-failure-overlay'
@@ -18,6 +18,7 @@ import { formatRefValue } from '../components/assistant-ui/directive-text'
 import { getSessionMessages, type SessionMessage, triggerCronJob } from '../hermes'
 import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '../lib/chat-messages'
 import { storedSessionIdForNotification } from '../lib/session-ids'
+import { markActiveSessionSwitchTrace } from '../lib/session-switch-trace'
 import { isMessagingSource } from '../lib/session-source'
 import { latestSessionTodos } from '../lib/todos'
 import { setCronFocusJobId } from '../store/cron'
@@ -202,16 +203,38 @@ export function DesktopController() {
   const previewPaneOpen = useStore($paneOpen(PREVIEW_PANE_ID))
   const panesFlipped = useStore($panesFlipped)
   const profileScope = useStore($profileScope)
+
   // Below SIDEBAR_COLLAPSE_BREAKPOINT_PX there's no room for a docked rail —
   // collapse both sidebars (without touching their stored open state) so the
   // hover-reveal overlay becomes the way in. Restores once it's wide again.
   const narrowViewport = useMediaQuery(SIDEBAR_COLLAPSE_MEDIA_QUERY)
 
   const routedSessionId = routeSessionId(location.pathname)
+  const routeSessionMatch = !routedSessionId || routedSessionId === selectedStoredSessionId
   const routeToken = `${location.pathname}:${location.search}:${location.hash}`
   const routeTokenRef = useRef(routeToken)
   routeTokenRef.current = routeToken
   const getRouteToken = useCallback(() => routeTokenRef.current, [])
+
+  const onDesktopRender = useCallback<ProfilerOnRenderCallback>(
+    (_id, phase, actualDuration, baseDuration) => {
+      markActiveSessionSwitchTrace(selectedStoredSessionId, 'desktop-react-commit', {
+        actualDurationMs: Math.round(actualDuration * 10) / 10,
+        baseDurationMs: Math.round(baseDuration * 10) / 10,
+        phase,
+        routeSessionMatch,
+        routedSession: Boolean(routedSessionId)
+      })
+    },
+    [routeSessionMatch, routedSessionId, selectedStoredSessionId]
+  )
+
+  useLayoutEffect(() => {
+    markActiveSessionSwitchTrace(selectedStoredSessionId, 'desktop-layout-commit', {
+      routeSessionMatch,
+      routedSession: Boolean(routedSessionId)
+    })
+  }, [routeSessionMatch, routedSessionId, selectedStoredSessionId])
 
   const {
     agentsOpen,
@@ -1293,81 +1316,83 @@ export function DesktopController() {
   )
 
   return (
-    <AppShell
-      leftStatusbarItems={leftStatusbarItems}
-      leftTitlebarTools={titlebarToolGroups.flat.left}
-      mainOverlays={mainOverlays}
-      onOpenSettings={openSettings}
-      overlays={overlays}
-      previewPaneOpen={chatOpen && Boolean(previewTarget || filePreviewTarget)}
-      statusbarItems={statusbarItems}
-      terminalPaneOpen={terminalSidebarOpen}
-      titlebarTools={titlebarToolGroups.flat.right}
-    >
-      {!isSecondaryWindow() && (
-        <Pane
-          forceCollapsed={narrowViewport}
-          hoverReveal
-          id="chat-sidebar"
-          maxWidth={SIDEBAR_MAX_WIDTH}
-          minWidth={SIDEBAR_DEFAULT_WIDTH}
-          onOverlayActiveChange={setSidebarOverlayMounted}
-          resizable
-          side={sidebarSide}
-          width={`${SIDEBAR_DEFAULT_WIDTH}px`}
-        >
-          {sidebar}
-        </Pane>
-      )}
-      <PaneMain>
-        <Routes>
-          <Route element={chatView} index />
-          <Route element={chatView} path=":sessionId" />
-          <Route
-            element={
-              <Suspense fallback={null}>
-                <SkillsView setStatusbarItemGroup={setStatusbarItemGroup} />
-              </Suspense>
-            }
-            path="skills"
-          />
-          <Route
-            element={
-              <Suspense fallback={null}>
-                <MessagingView setStatusbarItemGroup={setStatusbarItemGroup} />
-              </Suspense>
-            }
-            path="messaging"
-          />
-          <Route
-            element={
-              <Suspense fallback={null}>
-                <ArtifactsView setStatusbarItemGroup={setStatusbarItemGroup} />
-              </Suspense>
-            }
-            path="artifacts"
-          />
-          <Route element={null} path="cron" />
-          <Route element={null} path="profiles" />
-          <Route element={null} path="settings" />
-          <Route element={null} path="command-center" />
-          <Route element={null} path="agents" />
-          <Route element={<Navigate replace to={NEW_CHAT_ROUTE} />} path="new" />
-          <Route element={<LegacySessionRedirect />} path="sessions/:sessionId" />
-          <Route element={<Navigate replace to={NEW_CHAT_ROUTE} />} path="*" />
-        </Routes>
-      </PaneMain>
-      {/*
-        Order within a side maps to column order. Default (rail on the right):
-        main | terminal | preview | file-browser. Flipped (rail on the left):
-        mirror to file-browser | preview | terminal | main so terminal stays
-        adjacent to the chat.
-      */}
-      {panesFlipped ? fileBrowserPane : terminalPane}
-      {previewPane}
-      {reviewPane}
-      {panesFlipped ? terminalPane : fileBrowserPane}
-    </AppShell>
+    <Profiler id="desktop-shell" onRender={onDesktopRender}>
+      <AppShell
+        leftStatusbarItems={leftStatusbarItems}
+        leftTitlebarTools={titlebarToolGroups.flat.left}
+        mainOverlays={mainOverlays}
+        onOpenSettings={openSettings}
+        overlays={overlays}
+        previewPaneOpen={chatOpen && Boolean(previewTarget || filePreviewTarget)}
+        statusbarItems={statusbarItems}
+        terminalPaneOpen={terminalSidebarOpen}
+        titlebarTools={titlebarToolGroups.flat.right}
+      >
+        {!isSecondaryWindow() && (
+          <Pane
+            forceCollapsed={narrowViewport}
+            hoverReveal
+            id="chat-sidebar"
+            maxWidth={SIDEBAR_MAX_WIDTH}
+            minWidth={SIDEBAR_DEFAULT_WIDTH}
+            onOverlayActiveChange={setSidebarOverlayMounted}
+            resizable
+            side={sidebarSide}
+            width={`${SIDEBAR_DEFAULT_WIDTH}px`}
+          >
+            {sidebar}
+          </Pane>
+        )}
+        <PaneMain>
+          <Routes>
+            <Route element={chatView} index />
+            <Route element={chatView} path=":sessionId" />
+            <Route
+              element={
+                <Suspense fallback={null}>
+                  <SkillsView setStatusbarItemGroup={setStatusbarItemGroup} />
+                </Suspense>
+              }
+              path="skills"
+            />
+            <Route
+              element={
+                <Suspense fallback={null}>
+                  <MessagingView setStatusbarItemGroup={setStatusbarItemGroup} />
+                </Suspense>
+              }
+              path="messaging"
+            />
+            <Route
+              element={
+                <Suspense fallback={null}>
+                  <ArtifactsView setStatusbarItemGroup={setStatusbarItemGroup} />
+                </Suspense>
+              }
+              path="artifacts"
+            />
+            <Route element={null} path="cron" />
+            <Route element={null} path="profiles" />
+            <Route element={null} path="settings" />
+            <Route element={null} path="command-center" />
+            <Route element={null} path="agents" />
+            <Route element={<Navigate replace to={NEW_CHAT_ROUTE} />} path="new" />
+            <Route element={<LegacySessionRedirect />} path="sessions/:sessionId" />
+            <Route element={<Navigate replace to={NEW_CHAT_ROUTE} />} path="*" />
+          </Routes>
+        </PaneMain>
+        {/*
+          Order within a side maps to column order. Default (rail on the right):
+          main | terminal | preview | file-browser. Flipped (rail on the left):
+          mirror to file-browser | preview | terminal | main so terminal stays
+          adjacent to the chat.
+        */}
+        {panesFlipped ? fileBrowserPane : terminalPane}
+        {previewPane}
+        {reviewPane}
+        {panesFlipped ? terminalPane : fileBrowserPane}
+      </AppShell>
+    </Profiler>
   )
 }
 

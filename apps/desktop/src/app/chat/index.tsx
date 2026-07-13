@@ -7,7 +7,7 @@ import {
 import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
 import type * as React from 'react'
-import { Suspense, useCallback, useMemo, useRef } from 'react'
+import { Profiler, Suspense, useCallback, useMemo, useRef } from 'react'
 import { useLocation } from 'react-router-dom'
 
 import { Thread } from '@/components/assistant-ui/thread'
@@ -28,6 +28,7 @@ import {
   toRuntimeMessage
 } from '@/lib/chat-runtime'
 import { useIncrementalExternalStoreRuntime } from '@/lib/incremental-external-store-runtime'
+import { markActiveSessionSwitchTrace, measureActiveSessionSwitchTrace } from '@/lib/session-switch-trace'
 import { cn } from '@/lib/utils'
 import type { ComposerAttachment } from '@/store/composer'
 import { $pinnedSessionIds } from '@/store/layout'
@@ -192,6 +193,7 @@ interface ChatRuntimeBoundaryProps {
   onEdit: (message: AppendMessage) => Promise<void>
   onReload: (parentId: string | null) => Promise<void>
   onThreadMessagesChange: (messages: readonly ThreadMessage[]) => void
+  traceSessionId: null | string
   /** Route points at an unloaded session — render empty until resume swaps in
    *  the new transcript, so the previous session's messages don't linger. */
   suppressMessages: boolean
@@ -216,6 +218,7 @@ function ChatRuntimeBoundary({
   onEdit,
   onReload,
   onThreadMessagesChange,
+  traceSessionId,
   suppressMessages
 }: ChatRuntimeBoundaryProps) {
   const storeMessages = useStore($messages)
@@ -224,39 +227,61 @@ function ChatRuntimeBoundary({
   const toolMergeCacheRef = useRef(createToolMergeCache())
 
   const runtimeMessageRepository = useMemo(() => {
-    const items: { message: ThreadMessage; parentId: string | null }[] = []
-    const branchParentByGroup = new Map<string, string | null>()
-    let visibleParentId: string | null = null
-    let headId: string | null = null
+    let coalescedCount = 0
+    let visibleMessageCount = 0
+    let headIdPresent = false
 
-    for (const message of coalesceToolOnlyAssistants(messages, toolMergeCacheRef.current)) {
-      let parentId = visibleParentId
+    return measureActiveSessionSwitchTrace(
+      traceSessionId,
+      'runtime-message-repository-built',
+      () => {
+        const items: { message: ThreadMessage; parentId: string | null }[] = []
+        const branchParentByGroup = new Map<string, string | null>()
+        let visibleParentId: string | null = null
+        let headId: string | null = null
+        const coalescedMessages = Array.from(coalesceToolOnlyAssistants(messages, toolMergeCacheRef.current))
 
-      if (message.role === 'assistant' && message.branchGroupId) {
-        if (!branchParentByGroup.has(message.branchGroupId)) {
-          branchParentByGroup.set(message.branchGroupId, visibleParentId)
+        coalescedCount = coalescedMessages.length
+
+        for (const message of coalescedMessages) {
+          let parentId = visibleParentId
+
+          if (message.role === 'assistant' && message.branchGroupId) {
+            if (!branchParentByGroup.has(message.branchGroupId)) {
+              branchParentByGroup.set(message.branchGroupId, visibleParentId)
+            }
+
+            parentId = branchParentByGroup.get(message.branchGroupId) ?? null
+          }
+
+          const cachedMessage = runtimeMessageCacheRef.current.get(message)
+          const runtimeMessage = cachedMessage ?? toRuntimeMessage(message)
+
+          if (!cachedMessage) {
+            runtimeMessageCacheRef.current.set(message, runtimeMessage)
+          }
+
+          items.push({ message: runtimeMessage, parentId })
+
+          if (!message.hidden) {
+            visibleParentId = message.id
+            headId = message.id
+            visibleMessageCount += 1
+          }
         }
 
-        parentId = branchParentByGroup.get(message.branchGroupId) ?? null
-      }
+        headIdPresent = headId !== null
 
-      const cachedMessage = runtimeMessageCacheRef.current.get(message)
-      const runtimeMessage = cachedMessage ?? toRuntimeMessage(message)
-
-      if (!cachedMessage) {
-        runtimeMessageCacheRef.current.set(message, runtimeMessage)
-      }
-
-      items.push({ message: runtimeMessage, parentId })
-
-      if (!message.hidden) {
-        visibleParentId = message.id
-        headId = message.id
-      }
-    }
-
-    return ExportedMessageRepository.fromBranchableArray(items, { headId })
-  }, [messages])
+        return ExportedMessageRepository.fromBranchableArray(items, { headId })
+      },
+      () => ({
+        coalescedCount,
+        headIdPresent,
+        messageCount: messages.length,
+        visibleMessageCount
+      })
+    )
+  }, [messages, traceSessionId])
 
   const runtime = useIncrementalExternalStoreRuntime<ThreadMessage>({
     messageRepository: runtimeMessageRepository,
@@ -373,6 +398,38 @@ export function ChatView({
   // subagent run driven elsewhere — no composer, transcript is read-only.
   const showChatBar = !loadingSession && !resumeExhausted && !isWatchWindow()
   const threadKey = selectedSessionId || activeSessionId || (isRoutedSessionView ? location.pathname : 'new')
+  const traceSessionIdRef = useRef<null | string>(selectedSessionId)
+  traceSessionIdRef.current = selectedSessionId
+
+  const onThreadRender = useCallback<React.ProfilerOnRenderCallback>(
+    (_id, phase, actualDuration, baseDuration) => {
+      markActiveSessionSwitchTrace(traceSessionIdRef.current, 'thread-react-commit', {
+        actualDurationMs: Math.round(actualDuration * 10) / 10,
+        baseDurationMs: Math.round(baseDuration * 10) / 10,
+        busy,
+        loadingSession,
+        messagesEmpty,
+        phase,
+        routeSessionMismatch
+      })
+    },
+    [busy, loadingSession, messagesEmpty, routeSessionMismatch]
+  )
+
+  const onRuntimeBoundaryRender = useCallback<React.ProfilerOnRenderCallback>(
+    (_id, phase, actualDuration, baseDuration) => {
+      markActiveSessionSwitchTrace(traceSessionIdRef.current, 'runtime-react-commit', {
+        actualDurationMs: Math.round(actualDuration * 10) / 10,
+        baseDurationMs: Math.round(baseDuration * 10) / 10,
+        busy,
+        loadingSession,
+        messagesEmpty,
+        phase,
+        routeSessionMismatch
+      })
+    },
+    [busy, loadingSession, messagesEmpty, routeSessionMismatch]
+  )
 
   const modelOptionsQuery = useQuery<ModelOptionsResponse>({
     queryKey: ['model-options', activeSessionId || 'global'],
@@ -472,100 +529,106 @@ export function ChatView({
 
       <PromptOverlays />
 
-      <ChatRuntimeBoundary
-        busy={busy}
-        onCancel={onCancel}
-        onEdit={onEdit}
-        onReload={onReload}
-        onThreadMessagesChange={onThreadMessagesChange}
-        suppressMessages={routeSessionMismatch}
-      >
-        <div
-          className="relative min-h-0 max-w-full flex-1 overflow-hidden bg-(--ui-chat-surface-background) contain-[layout_paint]"
-          data-slot="composer-bounds"
-          {...dropHandlers}
+      <Profiler id="chat-runtime-boundary" onRender={onRuntimeBoundaryRender}>
+        <ChatRuntimeBoundary
+          busy={busy}
+          onCancel={onCancel}
+          onEdit={onEdit}
+          onReload={onReload}
+          onThreadMessagesChange={onThreadMessagesChange}
+          traceSessionId={selectedSessionId}
+          suppressMessages={routeSessionMismatch}
         >
-          <Thread
-            clampToComposer={showChatBar}
-            cwd={currentCwd}
-            gateway={gateway}
-            intro={showIntro ? { personality: introPersonality, seed: introSeed } : undefined}
-            loading={threadLoading}
-            onBranchInNewChat={onBranchInNewChat}
-            onCancel={onCancel}
-            onDismissError={onDismissError}
-            onRestoreToMessage={onRestoreToMessage}
-            sessionId={activeSessionId}
-            sessionKey={threadKey}
-          />
-          {resumeExhausted && routedSessionId && (
-            <div className="absolute inset-0 z-10 grid place-items-center bg-(--ui-chat-surface-background) px-8 py-10">
-              <ErrorState
-                className="max-w-sm"
-                description={t.desktop.resumeStrandedBody}
-                title={t.desktop.resumeStrandedTitle}
-              >
-                <div className="grid justify-items-center">
-                  <Button onClick={() => onRetryResume(routedSessionId)} size="sm" variant="outline">
-                    {t.desktop.resumeRetry}
-                  </Button>
-                </div>
-              </ErrorState>
-            </div>
-          )}
-          {showChatBar && <ScrollToBottomButton />}
-          {/* Vibe hearts rise from the composer only when no pet is out (else
-              they play on the pet). Fired by the core `reaction` event. */}
-          {!petPresent && (
-            <HeartField
-              className="absolute inset-x-0 z-30"
-              config={COMPOSER_HEART_CONFIG}
-              style={{
-                top: 0,
-                bottom: 'calc(var(--composer-measured-height) + var(--status-stack-measured-height) + 0.25rem)'
-              }}
-            />
-          )}
-          <ChatDropOverlay kind={dragKind} />
-          <ChatSwapOverlay profile={gatewaySwapTarget} />
-        </div>
-        {/* Composer renders OUTSIDE the contain:[layout paint] wrapper above:
-            that wrapper is a containing block for — and clips — position:fixed
-            descendants, so the popped-out (fixed) composer would anchor to the
-            chat column (which shifts/resizes with the sidebars) and get clipped
-            off-screen instead of floating against the viewport. As a sibling it
-            anchors to the outer relative container instead: docked is absolute
-            (identical placement), floating resolves against the viewport. Both
-            states stay mounted here, so dock⇄float never remounts the editor. */}
-        {showChatBar && (
-          <Suspense fallback={<ChatBarFallback />}>
-            <ChatBar
-              busy={busy}
-              cwd={currentCwd}
-              disabled={!gatewayOpen}
-              focusKey={activeSessionId}
-              gateway={gateway}
-              maxRecordingSeconds={maxVoiceRecordingSeconds}
-              onAddContextRef={onAddContextRef}
-              onAddUrl={onAddUrl}
-              onAttachDroppedItems={onAttachDroppedItems}
-              onAttachImageBlob={onAttachImageBlob}
-              onCancel={onCancel}
-              onPasteClipboardImage={onPasteClipboardImage}
-              onPickFiles={onPickFiles}
-              onPickFolders={onPickFolders}
-              onPickImages={onPickImages}
-              onRemoveAttachment={onRemoveAttachment}
-              onSteer={onSteer}
-              onSubmit={onSubmit}
-              onTranscribeAudio={onTranscribeAudio}
-              queueSessionKey={selectedSessionId}
+          <div
+            className="relative min-h-0 max-w-full flex-1 overflow-hidden bg-(--ui-chat-surface-background) contain-[layout_paint]"
+            data-slot="composer-bounds"
+            {...dropHandlers}
+          >
+            <Profiler id="session-thread" onRender={onThreadRender}>
+              <Thread
+                clampToComposer={showChatBar}
+                cwd={currentCwd}
+                gateway={gateway}
+                intro={showIntro ? { personality: introPersonality, seed: introSeed } : undefined}
+                loading={threadLoading}
+                onBranchInNewChat={onBranchInNewChat}
+                onCancel={onCancel}
+              onDismissError={onDismissError}
+              onRestoreToMessage={onRestoreToMessage}
               sessionId={activeSessionId}
-              state={chatBarState}
+              sessionKey={threadKey}
+              traceSessionId={selectedSessionId}
             />
-          </Suspense>
-        )}
-      </ChatRuntimeBoundary>
+            </Profiler>
+            {resumeExhausted && routedSessionId && (
+              <div className="absolute inset-0 z-10 grid place-items-center bg-(--ui-chat-surface-background) px-8 py-10">
+                <ErrorState
+                  className="max-w-sm"
+                  description={t.desktop.resumeStrandedBody}
+                  title={t.desktop.resumeStrandedTitle}
+                >
+                  <div className="grid justify-items-center">
+                    <Button onClick={() => onRetryResume(routedSessionId)} size="sm" variant="outline">
+                      {t.desktop.resumeRetry}
+                    </Button>
+                  </div>
+                </ErrorState>
+              </div>
+            )}
+            {showChatBar && <ScrollToBottomButton />}
+            {/* Vibe hearts rise from the composer only when no pet is out (else
+                they play on the pet). Fired by the core `reaction` event. */}
+            {!petPresent && (
+              <HeartField
+                className="absolute inset-x-0 z-30"
+                config={COMPOSER_HEART_CONFIG}
+                style={{
+                  top: 0,
+                  bottom: 'calc(var(--composer-measured-height) + var(--status-stack-measured-height) + 0.25rem)'
+                }}
+              />
+            )}
+            <ChatDropOverlay kind={dragKind} />
+            <ChatSwapOverlay profile={gatewaySwapTarget} />
+          </div>
+          {/* Composer renders OUTSIDE the contain:[layout paint] wrapper above:
+              that wrapper is a containing block for — and clips — position:fixed
+              descendants, so the popped-out (fixed) composer would anchor to the
+              chat column (which shifts/resizes with the sidebars) and get clipped
+              off-screen instead of floating against the viewport. As a sibling it
+              anchors to the outer relative container instead: docked is absolute
+              (identical placement), floating resolves against the viewport. Both
+              states stay mounted here, so dock⇄float never remounts the editor. */}
+          {showChatBar && (
+            <Suspense fallback={<ChatBarFallback />}>
+              <ChatBar
+                busy={busy}
+                cwd={currentCwd}
+                disabled={!gatewayOpen}
+                focusKey={activeSessionId}
+                gateway={gateway}
+                maxRecordingSeconds={maxVoiceRecordingSeconds}
+                onAddContextRef={onAddContextRef}
+                onAddUrl={onAddUrl}
+                onAttachDroppedItems={onAttachDroppedItems}
+                onAttachImageBlob={onAttachImageBlob}
+                onCancel={onCancel}
+                onPasteClipboardImage={onPasteClipboardImage}
+                onPickFiles={onPickFiles}
+                onPickFolders={onPickFolders}
+                onPickImages={onPickImages}
+                onRemoveAttachment={onRemoveAttachment}
+                onSteer={onSteer}
+                onSubmit={onSubmit}
+                onTranscribeAudio={onTranscribeAudio}
+                queueSessionKey={selectedSessionId}
+                sessionId={activeSessionId}
+                state={chatBarState}
+              />
+            </Suspense>
+          )}
+        </ChatRuntimeBoundary>
+      </Profiler>
     </div>
   )
 }

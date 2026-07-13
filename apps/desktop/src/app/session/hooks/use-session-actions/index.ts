@@ -5,6 +5,7 @@ import type { NavigateFunction } from 'react-router-dom'
 import { deleteSession, getSessionMessages, setSessionArchived } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
+import { createSessionSwitchTrace } from '@/lib/session-switch-trace'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { clearQueuedPrompts } from '@/store/composer-queue'
 import { $pinnedSessionIds } from '@/store/layout'
@@ -343,6 +344,20 @@ export function useSessionActions({
       usageProbeAbortRef.current?.abort()
       usageProbeAbortRef.current = null
       const requestId = resumeRequestRef.current + 1
+      const trace = createSessionSwitchTrace({ requestId, storedSessionId })
+      const completeAfterNextPaint = (...args: Parameters<typeof trace.complete>) => {
+        const complete = () => trace.complete(...args)
+
+        if (typeof window === 'undefined' || typeof window.requestAnimationFrame !== 'function') {
+          setTimeout(complete, 0)
+
+          return
+        }
+
+        window.requestAnimationFrame(() => {
+          window.requestAnimationFrame(complete)
+        })
+      }
       resumeRequestRef.current = requestId
 
       const isCurrentResume = () =>
@@ -397,6 +412,8 @@ export function useSessionActions({
         return { runtimeId, state }
       }
 
+      trace.mark('initial-cache', { warm: takeWarmCache() !== null })
+
       if (!takeWarmCache()) {
         setActiveSessionId(null)
         activeSessionIdRef.current = null
@@ -407,14 +424,27 @@ export function useSessionActions({
       // gateway call (no-op when it's already on that profile / single-profile).
       // resolveStoredSession finds the row by id (cheap), so an uncached pasted
       // id loads as fast as a sidebar click instead of hanging on a list scan.
+      const sessionWasInSidebar = $sessions.get().some(session => sessionMatchesStoredId(session, storedSessionId))
+      trace.mark('profile-resolve-start', { sessionWasInSidebar })
       const storedForProfile = await resolveStoredSession(storedSessionId)
       const sessionProfile = storedForProfile?.profile
+      trace.mark('profile-resolve-finished', {
+        profileResolved: Boolean(storedForProfile),
+        sessionWasInSidebar
+      })
 
       if (resumeRequestRef.current !== requestId) {
+        trace.complete('superseded', { phase: 'profile-resolve' })
+
         return
       }
 
+      const profileSwitch =
+        Boolean(sessionProfile?.trim()) &&
+        normalizeProfileKey(sessionProfile) !== normalizeProfileKey($activeGatewayProfile.get())
+      trace.mark('gateway-profile-start', { profileSwitch })
       await ensureGatewayProfile(sessionProfile)
+      trace.mark('gateway-profile-finished', { profileSwitch })
 
       // Re-check after the profile-resolve / gateway-swap awaits above: the
       // cache may have changed, and takeWarmCache re-validates belongs-to and
@@ -451,6 +481,8 @@ export function useSessionActions({
           setActiveSessionId(cachedRuntimeId)
           activeSessionIdRef.current = cachedRuntimeId
           syncSessionStateToView(cachedRuntimeId, cachedViewState)
+          trace.mark('warm-view-published', { messageCount: cachedViewState.messages.length })
+          completeAfterNextPaint('warm-restored', { messageCount: cachedViewState.messages.length, profileSwitch })
           setCurrentCwd(cachedViewState.cwd)
           setCurrentBranch(cachedViewState.branch)
           setSessionStartedAt(Date.now())
@@ -537,6 +569,7 @@ export function useSessionActions({
         // session.resume returns the display transcript and binds the runtime id.
         // It is the single successful resume read; REST remains a failure-only
         // fallback so normal session switches do not contend on SQLite.
+        trace.mark('resume-rpc-start')
         const resumed = await requestGateway<SessionResumeResponse>('session.resume', {
           session_id: storedSessionId,
           cols: 96,
@@ -549,23 +582,32 @@ export function useSessionActions({
           ...(watchWindow ? { lazy: true } : {}),
           ...(sessionProfile ? { profile: sessionProfile } : {})
         })
+        trace.mark('resume-rpc-finished', { messageCount: resumed.messages.length })
 
         if (!isCurrentResume()) {
+          trace.complete('superseded', { phase: 'resume-rpc' })
+
           return
         }
 
         const currentMessages = $messages.get()
 
+        const transcriptTransformStartedAt = performance.now()
         const resumedMessages = preserveLocalAssistantErrors(
           reconcileResumeMessages(toChatMessages(resumed.messages), currentMessages),
           currentMessages
         )
+        trace.mark('transcript-transformed', {
+          durationMs: Math.round((performance.now() - transcriptTransformStartedAt) * 10) / 10,
+          messageCount: resumedMessages.length
+        })
 
         if (sessionShouldHaveTranscript(stored) && resumedMessages.length === 0) {
           setActiveSessionId(null)
           activeSessionIdRef.current = null
           setResumeFailedSessionId(storedSessionId)
           resumedRunning = false
+          completeAfterNextPaint('failed', { emptyTranscript: true, profileSwitch })
 
           return
         }
@@ -589,10 +631,16 @@ export function useSessionActions({
           }),
           storedSessionId
         )
+        trace.mark('cold-view-published', { messageCount: resumedMessages.length })
+        completeAfterNextPaint('cold-resumed', { messageCount: resumedMessages.length, profileSwitch })
       } catch (err) {
         if (!isCurrentResume()) {
+          trace.complete('superseded', { phase: 'resume-rpc' })
+
           return
         }
+
+        trace.mark('resume-rpc-failed')
 
         // The gateway resume RPC failed. Try the REST transcript as a fallback
         // so the window at least shows history. CRITICAL: this fallback must be
@@ -603,6 +651,7 @@ export function useSessionActions({
         // forever (messagesEmpty && !activeSessionId) with no recovery path —
         // the "open in new window stays stuck loading, even after a nap" bug.
         let fallbackError: unknown = null
+        let fallbackPainted = false
 
         try {
           const fallback = await getSessionMessages(storedSessionId, sessionProfile)
@@ -612,15 +661,19 @@ export function useSessionActions({
           }
 
           setMessages(preserveLocalAssistantErrors(toChatMessages(fallback.messages), $messages.get()))
+          fallbackPainted = true
         } catch (e) {
           // Fallback also failed: nothing to paint. Leave whatever messages are
           // already shown and fall through to arm the resume-failure latch so
           // use-route-resume re-attempts the resume on the next render / window
           // focus / gateway reconnect instead of stranding the loader.
           fallbackError = e
+          trace.mark('fallback-rest-failed')
         }
 
         if (!isCurrentResume()) {
+          trace.complete('superseded', { phase: 'fallback-rest' })
+
           return
         }
 
@@ -631,6 +684,7 @@ export function useSessionActions({
         // permanently-dead id. (Booting straight into a no-longer-existent
         // last-session id is the common trigger.)
         if ($messages.get().length === 0 && isSessionGoneError(fallbackError)) {
+          completeAfterNextPaint('failed', { profileSwitch, sessionGone: true })
           startFreshSessionDraft(true)
 
           return
@@ -649,6 +703,7 @@ export function useSessionActions({
         }
 
         notifyError(err, copy.resumeFailed)
+        completeAfterNextPaint('failed', { fallbackPainted, profileSwitch })
       } finally {
         if (isCurrentResume()) {
           busyRef.current = resumedRunning
