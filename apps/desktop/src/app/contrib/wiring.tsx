@@ -488,12 +488,14 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const handleSkinCommand = useSkinCommand()
 
   const {
+    applyToolResultPrune,
     cancelRun,
     editMessage,
     executeSlashCommand,
     handleThreadMessagesChange,
     reloadFromMessage,
     restoreToMessage,
+    previewToolResultPrune,
     steerPrompt,
     submitText,
     transcribeVoiceAudio
@@ -684,6 +686,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const nextActions: WiringActions = {
     onAddContextRef: composer.addContextRefAttachment,
     onAddUrl: url => composer.addContextRefAttachment(`@url:${formatRefValue(url)}`, url),
+    onApplyToolResultPrune: applyToolResultPrune,
     onArchiveSession: sessionId => void archiveSession(sessionId),
     onAttachDroppedItems: composer.attachDroppedItems,
     onAttachImageBlob: composer.attachImageBlob,
@@ -714,6 +717,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     onPickFiles: () => void composer.pickContextPaths('file'),
     onPickFolders: () => void composer.pickContextPaths('folder'),
     onPickImages: () => void composer.pickImages(),
+    onPreviewToolResultPrune: previewToolResultPrune,
     onReload: reloadFromMessage,
     onRemoveAttachment: id => void composer.removeAttachment(id),
     onRestoreToMessage: restoreToMessage,
