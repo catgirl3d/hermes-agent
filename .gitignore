@@ -150,3 +150,5 @@ infographic/
 .history/*
 apps/desktop/pnpm-lock.yaml
 pnpm-lock.yaml
+.kilo/*
+temp/*
