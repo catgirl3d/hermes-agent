@@ -4343,11 +4343,47 @@ class SessionDB:
         if include_ancestors:
             session_ids = self._session_lineage_root_to_tip(session_id)
 
+        rows = self._get_conversation_rows(session_ids, include_inactive=include_inactive)
+        return self._conversation_from_rows(rows, include_ancestors=include_ancestors)
+
+    def get_resume_messages(self, session_id: str) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Load model and display histories for a resume in one database query.
+
+        The model replays only the resumed session's rows, while the UI displays
+        its lineage. Keeping both projections on one SQL snapshot avoids a second
+        full messages-table scan and prevents a turn written between separate
+        reads from producing mismatched histories.
+        """
+        session_ids = self._session_lineage_root_to_tip(session_id)
+        rows = self._get_conversation_rows(session_ids, include_inactive=False)
+        model_history: List[Dict[str, Any]] = []
+        display_history: List[Dict[str, Any]] = []
+        display_replay_user_contents: set[str] = set()
+
+        for row in rows:
+            message = self._conversation_message_from_row(row)
+            if row["session_id"] == session_id:
+                model_history.append(message)
+            if self._is_duplicate_replayed_user_message(
+                display_history,
+                message,
+                replay_user_contents=display_replay_user_contents,
+            ):
+                continue
+            display_history.append(message)
+            self._update_replay_user_dedup_state(display_replay_user_contents, message)
+
+        return (
+            _strip_background_review_harness(model_history),
+            _strip_background_review_harness(display_history),
+        )
+
+    def _get_conversation_rows(self, session_ids: List[str], *, include_inactive: bool) -> list:
         active_clause = "" if include_inactive else " AND active = 1"
         with self._lock:
             placeholders = ",".join("?" for _ in session_ids)
-            rows = self._conn.execute(
-                "SELECT role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
+            return self._conn.execute(
+                "SELECT session_id, role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
                 "finish_reason, reasoning, reasoning_content, reasoning_details, "
                 "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp "
                 f"FROM messages WHERE session_id IN ({placeholders})"
@@ -4363,66 +4399,20 @@ class SessionDB:
                 tuple(session_ids),
             ).fetchall()
 
+    def _conversation_from_rows(self, rows: list, *, include_ancestors: bool) -> List[Dict[str, Any]]:
         messages = []
+        replay_user_contents: set[str] = set()
         for row in rows:
-            content = self._decode_content(row["content"])
-            if row["role"] in {"user", "assistant"} and isinstance(content, str):
-                content = sanitize_context(content).strip()
-            msg = {"role": row["role"], "content": content}
-            if row["timestamp"]:
-                msg["timestamp"] = row["timestamp"]
-            if row["tool_call_id"]:
-                msg["tool_call_id"] = row["tool_call_id"]
-            if row["tool_name"]:
-                msg["tool_name"] = row["tool_name"]
-            if row["effect_disposition"]:
-                msg["effect_disposition"] = row["effect_disposition"]
-            if row["tool_calls"]:
-                try:
-                    msg["tool_calls"] = json.loads(row["tool_calls"])
-                except (json.JSONDecodeError, TypeError):
-                    logger.warning("Failed to deserialize tool_calls in conversation replay, falling back to []")
-                    msg["tool_calls"] = []
-            # Surface the platform-side message id (e.g. yuanbao msg_id,
-            # telegram update_id) so platform-specific flows like recall
-            # can match by external identifier instead of having to fall
-            # back to content-match heuristics.  Exposed as ``message_id``
-            # for backward compatibility with the JSONL transcript shape.
-            if row["platform_message_id"]:
-                msg["message_id"] = row["platform_message_id"]
-            if row["observed"]:
-                msg["observed"] = True
-            # Restore reasoning fields on assistant messages so providers
-            # that replay reasoning (OpenRouter, OpenAI, Nous) receive
-            # coherent multi-turn reasoning context.
-            if row["role"] == "assistant":
-                if row["finish_reason"]:
-                    msg["finish_reason"] = row["finish_reason"]
-                if row["reasoning"]:
-                    msg["reasoning"] = row["reasoning"]
-                if row["reasoning_content"] is not None:
-                    msg["reasoning_content"] = row["reasoning_content"]
-                if row["reasoning_details"]:
-                    try:
-                        msg["reasoning_details"] = json.loads(row["reasoning_details"])
-                    except (json.JSONDecodeError, TypeError):
-                        logger.warning("Failed to deserialize reasoning_details, falling back to None")
-                        msg["reasoning_details"] = None
-                if row["codex_reasoning_items"]:
-                    try:
-                        msg["codex_reasoning_items"] = json.loads(row["codex_reasoning_items"])
-                    except (json.JSONDecodeError, TypeError):
-                        logger.warning("Failed to deserialize codex_reasoning_items, falling back to None")
-                        msg["codex_reasoning_items"] = None
-                if row["codex_message_items"]:
-                    try:
-                        msg["codex_message_items"] = json.loads(row["codex_message_items"])
-                    except (json.JSONDecodeError, TypeError):
-                        logger.warning("Failed to deserialize codex_message_items, falling back to None")
-                        msg["codex_message_items"] = None
-            if include_ancestors and self._is_duplicate_replayed_user_message(messages, msg):
+            msg = self._conversation_message_from_row(row)
+            if include_ancestors and self._is_duplicate_replayed_user_message(
+                messages,
+                msg,
+                replay_user_contents=replay_user_contents,
+            ):
                 continue
             messages.append(msg)
+            if include_ancestors:
+                self._update_replay_user_dedup_state(replay_user_contents, msg)
         # DEFENSE-IN-DEPTH against background-review session pollution: a forked
         # skill/memory review that (in older builds, before the _persist_disabled
         # fix) shared the parent's session_id wrote its harness turn into this
@@ -4435,6 +4425,65 @@ class SessionDB:
         # resumes clean even if stray rows exist.
         messages = _strip_background_review_harness(messages)
         return messages
+
+    def _conversation_message_from_row(self, row) -> Dict[str, Any]:
+        """Decode one persisted message into its reusable conversation form."""
+        content = self._decode_content(row["content"])
+        if row["role"] in {"user", "assistant"} and isinstance(content, str):
+            content = sanitize_context(content).strip()
+        msg = {"role": row["role"], "content": content}
+        if row["timestamp"]:
+            msg["timestamp"] = row["timestamp"]
+        if row["tool_call_id"]:
+            msg["tool_call_id"] = row["tool_call_id"]
+        if row["tool_name"]:
+            msg["tool_name"] = row["tool_name"]
+        if row["effect_disposition"]:
+            msg["effect_disposition"] = row["effect_disposition"]
+        if row["tool_calls"]:
+            try:
+                msg["tool_calls"] = json.loads(row["tool_calls"])
+            except (json.JSONDecodeError, TypeError):
+                logger.warning("Failed to deserialize tool_calls in conversation replay, falling back to []")
+                msg["tool_calls"] = []
+        # Surface the platform-side message id (e.g. yuanbao msg_id,
+        # telegram update_id) so platform-specific flows like recall
+        # can match by external identifier instead of having to fall
+        # back to content-match heuristics.  Exposed as ``message_id``
+        # for backward compatibility with the JSONL transcript shape.
+        if row["platform_message_id"]:
+            msg["message_id"] = row["platform_message_id"]
+        if row["observed"]:
+            msg["observed"] = True
+        # Restore reasoning fields on assistant messages so providers
+        # that replay reasoning (OpenRouter, OpenAI, Nous) receive
+        # coherent multi-turn reasoning context.
+        if row["role"] == "assistant":
+            if row["finish_reason"]:
+                msg["finish_reason"] = row["finish_reason"]
+            if row["reasoning"]:
+                msg["reasoning"] = row["reasoning"]
+            if row["reasoning_content"] is not None:
+                msg["reasoning_content"] = row["reasoning_content"]
+            if row["reasoning_details"]:
+                try:
+                    msg["reasoning_details"] = json.loads(row["reasoning_details"])
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning("Failed to deserialize reasoning_details, falling back to None")
+                    msg["reasoning_details"] = None
+            if row["codex_reasoning_items"]:
+                try:
+                    msg["codex_reasoning_items"] = json.loads(row["codex_reasoning_items"])
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning("Failed to deserialize codex_reasoning_items, falling back to None")
+                    msg["codex_reasoning_items"] = None
+            if row["codex_message_items"]:
+                try:
+                    msg["codex_message_items"] = json.loads(row["codex_message_items"])
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning("Failed to deserialize codex_message_items, falling back to None")
+                    msg["codex_message_items"] = None
+        return msg
 
     def _session_lineage_root_to_tip(self, session_id: str) -> List[str]:
         if not session_id:
@@ -4459,16 +4508,49 @@ class SessionDB:
         return list(reversed(chain)) or [session_id]
 
     @staticmethod
-    def _is_duplicate_replayed_user_message(messages: List[Dict[str, Any]], msg: Dict[str, Any]) -> bool:
+    def _replayed_user_message_content(msg: Dict[str, Any]) -> Optional[str]:
         if msg.get("role") != "user":
-            return False
+            return None
         content = msg.get("content")
         if not isinstance(content, str) or not content:
+            return None
+        return content
+
+    @staticmethod
+    def _assistant_resets_replay_user_dedup(msg: Dict[str, Any]) -> bool:
+        return msg.get("role") == "assistant" and bool(
+            msg.get("content") or msg.get("tool_calls")
+        )
+
+    @classmethod
+    def _update_replay_user_dedup_state(
+        cls,
+        replay_user_contents: set[str],
+        msg: Dict[str, Any],
+    ) -> None:
+        if cls._assistant_resets_replay_user_dedup(msg):
+            replay_user_contents.clear()
+            return
+        content = cls._replayed_user_message_content(msg)
+        if content is not None:
+            replay_user_contents.add(content)
+
+    @classmethod
+    def _is_duplicate_replayed_user_message(
+        cls,
+        messages: List[Dict[str, Any]],
+        msg: Dict[str, Any],
+        replay_user_contents: Optional[set[str]] = None,
+    ) -> bool:
+        content = cls._replayed_user_message_content(msg)
+        if content is None:
             return False
+        if replay_user_contents is not None:
+            return content in replay_user_contents
         for prev in reversed(messages):
             if prev.get("role") == "user" and prev.get("content") == content:
                 return True
-            if prev.get("role") == "assistant" and (prev.get("content") or prev.get("tool_calls")):
+            if cls._assistant_resets_replay_user_dedup(prev):
                 return False
         return False
 
