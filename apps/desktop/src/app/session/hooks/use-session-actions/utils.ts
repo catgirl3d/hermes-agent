@@ -57,6 +57,7 @@ function chatMessagesEquivalent(a: ChatMessage, b: ChatMessage): boolean {
     a.pending !== b.pending ||
     a.error !== b.error ||
     a.hidden !== b.hidden ||
+    a.rendererOwned !== b.rendererOwned ||
     a.branchGroupId !== b.branchGroupId
   ) {
     return false
@@ -132,7 +133,10 @@ export interface BranchMessage {
 export const toBranchMessages = (messages: ChatMessage[]): BranchMessage[] =>
   messages
     .map(message => ({ content: chatMessageText(message), role: message.role, source: message }))
-    .filter(({ content, role }) => content.trim() && (role === 'assistant' || role === 'user'))
+    .filter(
+      ({ content, role, source }) =>
+        !source.rendererOwned && content.trim() && (role === 'assistant' || role === 'user')
+    )
 
 export function upsertOptimisticSession(
   created: SessionCreateResponse,

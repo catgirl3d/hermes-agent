@@ -17,6 +17,8 @@ export type ChatMessage = {
   error?: string
   branchGroupId?: string
   hidden?: boolean
+  /** Ephemeral transcript annotation owned by this renderer, never by the backend. */
+  rendererOwned?: boolean
   /** Composer attachment ref strings (`@file:...`, `@image:...`) sent with this user message. */
   attachmentRefs?: string[]
 }
@@ -853,6 +855,181 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
   )
 }
 
+function mergePrunedMessage(
+  next: ChatMessage,
+  previous: ChatMessage,
+  selectedToolNames?: ReadonlySet<string>
+): ChatMessage {
+  const previousTools = new Map(
+    previous.parts
+      .filter((part): part is Extract<ChatMessagePart, { type: 'tool-call' }> => part.type === 'tool-call')
+      .map(part => [part.toolCallId, part])
+  )
+
+  const parts = next.parts.map((part, index) => {
+    const previousPart = previous.parts[index]
+
+    if (part.type !== 'tool-call') {
+      if (
+        part.type === 'text' &&
+        previousPart?.type === 'text' &&
+        previousPart.text === part.text
+      ) {
+        return previousPart
+      }
+
+      if (
+        part.type === 'reasoning' &&
+        previousPart?.type === 'reasoning' &&
+        previousPart.text === part.text
+      ) {
+        return previousPart
+      }
+
+      return part
+    }
+
+    const local = previousTools.get(part.toolCallId)
+
+    if (local && selectedToolNames && !selectedToolNames.has(part.toolName)) {
+      return local
+    }
+
+    return local ? { ...local, ...part } : part
+  })
+
+  const merged: ChatMessage = {
+    ...next,
+    id: previous.id,
+    parts,
+    timestamp: next.timestamp ?? previous.timestamp,
+    ...(previous.pending !== undefined ? { pending: previous.pending } : {}),
+    ...(previous.error !== undefined ? { error: previous.error } : {}),
+    ...(previous.branchGroupId !== undefined ? { branchGroupId: previous.branchGroupId } : {}),
+    ...(previous.hidden !== undefined ? { hidden: previous.hidden } : {}),
+    ...(previous.attachmentRefs !== undefined ? { attachmentRefs: previous.attachmentRefs } : {})
+  }
+
+  if (
+    merged.role === previous.role &&
+    merged.timestamp === previous.timestamp &&
+    merged.parts.length === previous.parts.length &&
+    merged.parts.every((part, index) => part === previous.parts[index])
+  ) {
+    return previous
+  }
+
+  return merged
+}
+
+/** Merge prune backend truth without discarding renderer-owned message state. */
+export function reconcilePrunedChatMessages(
+  nextMessages: ChatMessage[],
+  currentMessages: ChatMessage[],
+  selectedToolNames?: ReadonlySet<string>
+): ChatMessage[] {
+  if (!currentMessages.length) {
+    return nextMessages
+  }
+
+  const visibleById = new Map(
+    currentMessages
+      .filter(message => !message.hidden && !message.rendererOwned)
+      .map(message => [message.id, message])
+  )
+
+  const visibleByRoleOrdinal = new Map<string, ChatMessage>()
+  const currentRoleCounts = new Map<string, number>()
+
+  for (const message of currentMessages) {
+    if (message.hidden || message.rendererOwned) {
+      continue
+    }
+
+    const ordinal = currentRoleCounts.get(message.role) ?? 0
+    currentRoleCounts.set(message.role, ordinal + 1)
+    visibleByRoleOrdinal.set(`${message.role}:${ordinal}`, message)
+  }
+
+  const nextRoleCounts = new Map<string, number>()
+  const replacements = new Map<ChatMessage, ChatMessage>()
+  const additions: ChatMessage[] = []
+
+  for (const message of nextMessages) {
+    const ordinal = nextRoleCounts.get(message.role) ?? 0
+    nextRoleCounts.set(message.role, ordinal + 1)
+
+    const previous =
+      visibleById.get(message.id) ?? visibleByRoleOrdinal.get(`${message.role}:${ordinal}`)
+
+    if (previous && !replacements.has(previous)) {
+      replacements.set(previous, mergePrunedMessage(message, previous, selectedToolNames))
+    } else {
+      additions.push(message)
+    }
+  }
+
+  const reconciled = currentMessages.flatMap(message => {
+    const replacement = replacements.get(message)
+
+    if (replacement) {
+      return [replacement]
+    }
+
+    return message.rendererOwned ||
+      message.hidden ||
+      message.pending ||
+      message.error ||
+      message.branchGroupId ||
+      message.attachmentRefs
+      ? [message]
+      : []
+  })
+
+  return [...reconciled, ...additions]
+}
+
+function preserveRendererOwnedMessages(
+  nextMessages: ChatMessage[],
+  currentMessages: ChatMessage[]
+): ChatMessage[] {
+  const nextById = new Map(nextMessages.map(message => [message.id, message]))
+
+  const missingOwned = currentMessages.filter(
+    message => message.rendererOwned && !nextById.has(message.id)
+  )
+
+  if (!missingOwned.length) {
+    return nextMessages
+  }
+
+  const emitted = new Set<string>()
+  const merged: ChatMessage[] = []
+
+  for (const current of currentMessages) {
+    if (current.rendererOwned && !nextById.has(current.id)) {
+      merged.push(current)
+
+      continue
+    }
+
+    const next = nextById.get(current.id)
+
+    if (next) {
+      merged.push(next)
+      emitted.add(next.id)
+    }
+  }
+
+  for (const next of nextMessages) {
+    if (!emitted.has(next.id)) {
+      merged.push(next)
+    }
+  }
+
+  return merged
+}
+
 export function preserveLocalAssistantErrors(
   nextMessages: ChatMessage[],
   currentMessages: ChatMessage[]
@@ -914,14 +1091,14 @@ export function preserveLocalAssistantErrors(
   }
 
   if (preserveIds.size === 0) {
-    return mergedNextMessages
+    return preserveRendererOwnedMessages(mergedNextMessages, currentMessages)
   }
 
   const preserved = currentMessages
     .filter(message => preserveIds.has(message.id))
     .map(message => ({ ...message, pending: false }))
 
-  return [...mergedNextMessages, ...preserved]
+  return preserveRendererOwnedMessages([...mergedNextMessages, ...preserved], currentMessages)
 }
 
 export function branchGroupForUser(userMessage: ChatMessage): string {

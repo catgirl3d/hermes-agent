@@ -48,6 +48,7 @@ describe('toBranchMessages', () => {
       msg('u', 'user', 'hi'),
       msg('blank', 'assistant', '   '),
       msg('sys', 'system', 'ignored'),
+      msg('local', 'assistant', 'renderer note', { rendererOwned: true }),
       msg('a', 'assistant', 'hello')
     ])
 

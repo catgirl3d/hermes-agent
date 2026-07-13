@@ -44,7 +44,9 @@ function sessionInfo(overrides: Partial<SessionInfo> = {}): SessionInfo {
 }
 
 interface HarnessHandle {
+  applyToolResultPrune: ReturnType<typeof usePromptActions>['applyToolResultPrune']
   cancelRun: () => Promise<void>
+  previewToolResultPrune: ReturnType<typeof usePromptActions>['previewToolResultPrune']
   restoreToMessage: (messageId: string, target?: { text?: string; userOrdinal?: number | null }) => Promise<void>
   steerPrompt: (text: string) => Promise<boolean>
   submitText: (text: string, options?: { attachments?: ComposerAttachment[]; fromQueue?: boolean }) => Promise<boolean>
@@ -125,12 +127,22 @@ function Harness({
 
   useEffect(() => {
     onReady({
+      applyToolResultPrune: actions.applyToolResultPrune,
       cancelRun: actions.cancelRun,
+      previewToolResultPrune: actions.previewToolResultPrune,
       restoreToMessage: actions.restoreToMessage,
       steerPrompt: actions.steerPrompt,
       submitText: actions.submitText
     })
-  }, [actions.cancelRun, actions.restoreToMessage, actions.steerPrompt, actions.submitText, onReady])
+  }, [
+    actions.applyToolResultPrune,
+    actions.cancelRun,
+    actions.previewToolResultPrune,
+    actions.restoreToMessage,
+    actions.steerPrompt,
+    actions.submitText,
+    onReady
+  ])
 
   return null
 }
@@ -225,6 +237,156 @@ describe('usePromptActions /title', () => {
     )
     expect(refreshSessions).not.toHaveBeenCalled()
     expect($sessions.get()[0]?.title).toBe('Old title')
+  })
+})
+
+describe('usePromptActions targeted tool-result pruning', () => {
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+  })
+
+  it('previews first, confirms with the preview version, and refreshes the live transcript', async () => {
+    const preview = {
+      after_bytes: 400,
+      after_tokens: 100,
+      applied: false,
+      before_bytes: 1_000,
+      before_tokens: 250,
+      changed: true,
+      duplicate_results: 1,
+      excerpted_results: 1,
+      history_version: 7,
+      protected_messages: 10,
+      protected_turns: 5,
+      pruned_results: 2,
+      saved_bytes: 600,
+      saved_tokens: 150,
+      selected_tool_names: ['terminal'],
+      selection_hash: 'terminal-hash',
+      session_id: RUNTIME_SESSION_ID,
+      status: 'preview' as const,
+      tools: [
+        {
+          argument_count: 0,
+          compact_kind: 'terminal_tail' as const,
+          default_selected: true,
+          estimated_saved_tokens: 150,
+          name: 'terminal',
+          result_count: 2,
+          selected: true
+        }
+      ],
+      truncated_tool_calls: 0
+    }
+
+    const applied = {
+      ...preview,
+      applied: true,
+      history_version: 8,
+      messages: [
+        { role: 'user' as const, content: 'keep this instruction' },
+        { role: 'assistant' as const, content: 'kept reply' }
+      ],
+      status: 'pruned' as const
+    }
+
+    const requestGateway = vi.fn(async (_method: string, params?: Record<string, unknown>) =>
+      (params?.confirm ? applied : preview) as never
+    )
+
+    let latestMessages: unknown[] = []
+    let handle: HarnessHandle | null = null
+
+    render(
+      <Harness
+        onReady={value => (handle = value)}
+        onSeedState={state => {
+          latestMessages = (state.messages as unknown[]) ?? []
+        }}
+        refreshSessions={vi.fn(async () => undefined)}
+        requestGateway={requestGateway}
+        storedSessionId="stored-1"
+      />
+    )
+
+    const previewResult = await handle!.previewToolResultPrune()
+    await handle!.applyToolResultPrune(previewResult)
+
+    expect(requestGateway).toHaveBeenNthCalledWith(1, 'session.prune_tool_results', {
+      session_id: RUNTIME_SESSION_ID
+    })
+    expect(requestGateway).toHaveBeenNthCalledWith(2, 'session.prune_tool_results', {
+      session_id: RUNTIME_SESSION_ID,
+      confirm: true,
+      history_version: 7,
+      selection_hash: 'terminal-hash',
+      tool_names: ['terminal']
+    })
+    expect(latestMessages).toHaveLength(2)
+  })
+
+  it('does not publish an old prune result after the user switches sessions', async () => {
+    const preview = {
+      after_bytes: 400,
+      after_tokens: 100,
+      applied: false,
+      before_bytes: 1_000,
+      before_tokens: 250,
+      changed: true,
+      duplicate_results: 0,
+      excerpted_results: 1,
+      history_version: 7,
+      protected_messages: 10,
+      protected_turns: 5,
+      pruned_results: 1,
+      saved_bytes: 600,
+      saved_tokens: 150,
+      selected_tool_names: ['terminal'],
+      selection_hash: 'terminal-hash',
+      session_id: RUNTIME_SESSION_ID,
+      status: 'preview' as const,
+      tools: [],
+      truncated_tool_calls: 0
+    }
+
+    let resolveRequest: (value: unknown) => void = () => undefined
+
+    const requestGateway = vi.fn(
+      () =>
+        new Promise(resolve => {
+          resolveRequest = resolve
+        }) as never
+    )
+
+    const activeSessionIdRef: MutableRefObject<string | null> = { current: RUNTIME_SESSION_ID }
+    const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: 'stored-a' }
+    const onSeedState = vi.fn()
+    let handle: HarnessHandle | null = null
+
+    render(
+      <Harness
+        activeSessionIdRef={activeSessionIdRef}
+        onReady={value => (handle = value)}
+        onSeedState={onSeedState}
+        refreshSessions={vi.fn(async () => undefined)}
+        requestGateway={requestGateway}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+      />
+    )
+
+    const applying = handle!.applyToolResultPrune(preview)
+    activeSessionIdRef.current = 'runtime-b'
+    selectedStoredSessionIdRef.current = 'stored-b'
+    resolveRequest({
+      ...preview,
+      applied: true,
+      messages: [{ role: 'assistant', content: 'pruned old session' }],
+      status: 'pruned'
+    })
+    await applying
+
+    expect(onSeedState).not.toHaveBeenCalled()
   })
 })
 
