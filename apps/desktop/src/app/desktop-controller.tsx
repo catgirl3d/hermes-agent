@@ -999,27 +999,48 @@ export function DesktopController() {
     toggleCommandCenter
   })
 
+  const archiveSidebarSession = useCallback((sessionId: string) => void archiveSession(sessionId), [archiveSession])
+
+  const branchSidebarSession = useCallback(
+    (sessionId: string) => void branchStoredSession(sessionId),
+    [branchStoredSession]
+  )
+
+  const deleteSidebarSession = useCallback((sessionId: string) => void removeSession(sessionId), [removeSession])
+
+  const manageSidebarCronJob = useCallback(
+    (jobId: string) => {
+      setCronFocusJobId(jobId)
+      navigate(CRON_ROUTE)
+    },
+    [navigate]
+  )
+
+  const resumeSidebarSession = useCallback((sessionId: string) => navigate(sessionRoute(sessionId)), [navigate])
+
+  const triggerSidebarCronJob = useCallback(
+    (jobId: string) => {
+      void triggerCronJob(jobId)
+        .then(() => refreshCronJobs())
+        .catch(() => undefined)
+    },
+    [refreshCronJobs]
+  )
+
   const sidebar = (
     <ChatSidebar
       currentView={currentView}
-      onArchiveSession={sessionId => void archiveSession(sessionId)}
-      onBranchSession={sessionId => void branchStoredSession(sessionId)}
-      onDeleteSession={sessionId => void removeSession(sessionId)}
+      onArchiveSession={archiveSidebarSession}
+      onBranchSession={branchSidebarSession}
+      onDeleteSession={deleteSidebarSession}
       onLoadMoreMessaging={loadMoreMessagingForPlatform}
       onLoadMoreProfileSessions={loadMoreSessionsForProfile}
       onLoadMoreSessions={loadMoreSessions}
-      onManageCronJob={jobId => {
-        setCronFocusJobId(jobId)
-        navigate(CRON_ROUTE)
-      }}
+      onManageCronJob={manageSidebarCronJob}
       onNavigate={selectSidebarItem}
       onNewSessionInWorkspace={startSessionInWorkspace}
-      onResumeSession={sessionId => navigate(sessionRoute(sessionId))}
-      onTriggerCronJob={jobId => {
-        void triggerCronJob(jobId)
-          .then(() => refreshCronJobs())
-          .catch(() => undefined)
-      }}
+      onResumeSession={resumeSidebarSession}
+      onTriggerCronJob={triggerSidebarCronJob}
     />
   )
 
