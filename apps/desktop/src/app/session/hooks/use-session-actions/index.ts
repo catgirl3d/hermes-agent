@@ -1,5 +1,5 @@
 import type { MutableRefObject } from 'react'
-import { useCallback, useRef } from 'react'
+import { useCallback, useEffect, useRef } from 'react'
 import type { NavigateFunction } from 'react-router-dom'
 
 import { revealTreePane } from '@/components/pane-shell/tree/store'
@@ -64,7 +64,6 @@ import {
   applyRuntimeInfo,
   applyStoredSessionPreviewRuntimeInfo,
   type BranchMessage,
-  chatMessageArraysEquivalent,
   isSessionGoneError,
   patchSessionWorkspace,
   reconcileResumeMessages,
@@ -75,6 +74,8 @@ import {
   upsertOptimisticSession
 } from './utils'
 
+const SESSION_USAGE_PROBE_TIMEOUT_MS = 2_000
+
 interface SessionActionsOptions {
   activeSessionId: string | null
   activeSessionIdRef: MutableRefObject<string | null>
@@ -83,7 +84,12 @@ interface SessionActionsOptions {
   ensureSessionState: (sessionId: string, storedSessionId?: string | null) => ClientSessionState
   getRouteToken: () => string
   navigate: NavigateFunction
-  requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
+  requestGateway: <T>(
+    method: string,
+    params?: Record<string, unknown>,
+    timeoutMs?: number,
+    signal?: AbortSignal
+  ) => Promise<T>
   resetViewSync: () => void
   runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>>
   selectedStoredSessionId: string | null
@@ -174,6 +180,19 @@ export function useSessionActions({
   const { t } = useI18n()
   const copy = t.desktop
   const resumeRequestRef = useRef(0)
+
+  const resumeSessionRef = useRef<((storedSessionId: string, replaceRoute?: boolean) => Promise<void>) | undefined>(
+    undefined
+  )
+
+  const usageProbeAbortRef = useRef<AbortController | null>(null)
+
+  useEffect(
+    () => () => {
+      usageProbeAbortRef.current?.abort()
+    },
+    []
+  )
 
   const startFreshSessionDraft = useCallback(
     (options: boolean | FreshSessionDraftOptions = false) => {
@@ -394,6 +413,8 @@ export function useSessionActions({
 
   const resumeSession = useCallback(
     async (storedSessionId: string, replaceRoute = false) => {
+      usageProbeAbortRef.current?.abort()
+      usageProbeAbortRef.current = null
       const requestId = resumeRequestRef.current + 1
       resumeRequestRef.current = requestId
 
@@ -511,32 +532,48 @@ export function useSessionActions({
           setCurrentBranch(cachedViewState.branch)
           setSessionStartedAt(Date.now())
 
-          try {
-            const usage = await requestGateway<UsageStats>('session.usage', { session_id: cachedRuntimeId })
-
-            if (!isCurrentResume()) {
-              return
-            }
-
-            if (usage) {
-              setCurrentUsage(current => ({ ...current, ...usage }))
-            }
-
-            return
-          } catch {
-            // The cached runtime id was minted by a prior backend instance. A
-            // pooled profile backend that gets idle-reaped (pruneSecondaryGateways)
-            // and respawned across a profile swap mints fresh ids, so this mapping
-            // now 404s ("session not found"). Drop it and fall through to a full
-            // resume that rebinds a live runtime id.
-            if (!isCurrentResume()) {
-              return
-            }
-
-            runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
-            sessionStateByRuntimeIdRef.current.delete(cachedRuntimeId)
-            dropSessionState(cachedRuntimeId)
+          if (stored) {
+            applyStoredUsage(stored)
           }
+
+          // Cache validation is auxiliary. session.usage can wait on a backend
+          // round-trip, so never hold the visibly-complete warm resume behind it.
+          // A confirmed missing session transparently rebinds the stale runtime
+          // in the background; transient failures must not flicker a healthy view.
+          const usageProbe = new AbortController()
+          usageProbeAbortRef.current = usageProbe
+          void requestGateway<UsageStats>(
+            'session.usage',
+            { session_id: cachedRuntimeId },
+            SESSION_USAGE_PROBE_TIMEOUT_MS,
+            usageProbe.signal
+          )
+            .then(usage => {
+              if (isCurrentResume() && usage) {
+                setCurrentUsage(current => ({ ...current, ...usage }))
+              }
+            })
+            .catch(err => {
+              if (
+                !isCurrentResume() ||
+                !isSessionGoneError(err) ||
+                runtimeIdByStoredSessionIdRef.current.get(storedSessionId) !== cachedRuntimeId
+              ) {
+                return
+              }
+
+              runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
+              sessionStateByRuntimeIdRef.current.delete(cachedRuntimeId)
+              dropSessionState(cachedRuntimeId)
+              void resumeSessionRef.current?.(storedSessionId, replaceRoute)
+            })
+            .finally(() => {
+              if (usageProbeAbortRef.current === usageProbe) {
+                usageProbeAbortRef.current = null
+              }
+            })
+
+          return
         }
       }
 
@@ -575,16 +612,11 @@ export function useSessionActions({
 
       try {
         const watchWindow = isWatchWindow()
-        let localSnapshot = $messages.get()
 
-        // REST transcript prefetch and the gateway resume RPC are independent
-        // — run them concurrently so a big session's wall time is
-        // max(prefetch, resume) instead of their sum. The prefetch paints the
-        // transcript as soon as it lands; the RPC binds the runtime id.
-        // Watch windows skip the prefetch — lazy resume attaches the live mirror.
-        const prefetchPromise = watchWindow ? null : getSessionMessages(storedSessionId, sessionProfile)
-
-        const resumePromise = requestGateway<SessionResumeResponse>('session.resume', {
+        // session.resume returns the display transcript and binds the runtime id.
+        // It is the single successful resume read; REST remains a failure-only
+        // fallback so normal session switches do not contend on SQLite.
+        const resumed = await requestGateway<SessionResumeResponse>('session.resume', {
           session_id: storedSessionId,
           cols: 96,
           source: 'desktop',
@@ -592,32 +624,10 @@ export function useSessionActions({
           // gets the gateway's default deferred build: the RPC returns the
           // transcript immediately instead of blocking the switch on _make_agent
           // (MCP discovery / prompt build), and the agent pre-warms in the
-          // background while the prefetch above paints the transcript.
+          // background after the response is sent.
           ...(watchWindow ? { lazy: true } : {}),
           ...(sessionProfile ? { profile: sessionProfile } : {})
         })
-
-        // The rejection is consumed by the `await` below; this guard only
-        // keeps it from surfacing as unhandled while the prefetch settles.
-        resumePromise.catch(() => undefined)
-
-        try {
-          if (prefetchPromise) {
-            const storedMessages = await prefetchPromise
-
-            if (isCurrentResume()) {
-              localSnapshot = preserveLocalAssistantErrors(toChatMessages(storedMessages.messages), $messages.get())
-
-              if (!chatMessageArraysEquivalent($messages.get(), localSnapshot)) {
-                setMessages(localSnapshot)
-              }
-            }
-          }
-        } catch {
-          // Non-fatal: gateway resume below can still hydrate the session.
-        }
-
-        const resumed = await resumePromise
 
         if (!isCurrentResume()) {
           return
@@ -625,32 +635,12 @@ export function useSessionActions({
 
         const currentMessages = $messages.get()
 
-        // Keep the local snapshot when resume would only reshuffle runtime
-        // projection. When the REST prefetch already hydrated the transcript,
-        // skip converting/reconciling the resume payload entirely — on a
-        // 1000+-message session that second conversion plus the deep
-        // equivalence compare costs over a second of main-thread time.
-        const preferredMessages =
-          localSnapshot.length > 0
-            ? localSnapshot
-            : (() => {
-                const resumedMessages = preserveLocalAssistantErrors(
-                  reconcileResumeMessages(toChatMessages(resumed.messages), currentMessages),
-                  currentMessages
-                )
+        const resumedMessages = preserveLocalAssistantErrors(
+          reconcileResumeMessages(toChatMessages(resumed.messages), currentMessages),
+          currentMessages
+        )
 
-                return chatMessageArraysEquivalent(currentMessages, resumedMessages) ? currentMessages : resumedMessages
-              })()
-
-        // Prefetch-hit fast path: `preferredMessages` IS the live `$messages`
-        // array (already error-merged when `localSnapshot` was built), so reuse
-        // the ref instead of rebuilding a throwaway transcript+Map every switch.
-        const messagesForView =
-          preferredMessages === currentMessages
-            ? currentMessages
-            : preserveLocalAssistantErrors(preferredMessages, currentMessages)
-
-        if (sessionShouldHaveTranscript(stored) && messagesForView.length === 0) {
+        if (sessionShouldHaveTranscript(stored) && resumedMessages.length === 0) {
           setActiveSessionId(null)
           activeSessionIdRef.current = null
           setResumeFailedSessionId(storedSessionId)
@@ -672,7 +662,7 @@ export function useSessionActions({
           state => ({
             ...state,
             ...(runtimeInfo ?? {}),
-            messages: messagesForView,
+            messages: resumedMessages,
             busy: resumedRunning,
             awaitingResponse: resumedRunning
           }),
@@ -770,6 +760,8 @@ export function useSessionActions({
       updateSessionState
     ]
   )
+
+  resumeSessionRef.current = resumeSession
 
   // Shared fork: create a child session seeded with `branchMessages`, linked to
   // `parentStoredId` so it nests under its parent, then make it the active chat.
