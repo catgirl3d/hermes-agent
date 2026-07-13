@@ -2,7 +2,7 @@ import { KeyboardSensor, PointerSensor, useSensor, useSensors } from '@dnd-kit/c
 import { sortableKeyboardCoordinates } from '@dnd-kit/sortable'
 import { useStore } from '@nanostores/react'
 import type * as React from 'react'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { PlatformAvatar } from '@/app/messaging/platform-icon'
 import { Button } from '@/components/ui/button'
@@ -85,7 +85,6 @@ import {
   $messagingPlatformTotals,
   $messagingSessions,
   $messagingTruncated,
-  $selectedStoredSessionId,
   $sessionProfileTotals,
   $sessions,
   $sessionsLoading,
@@ -213,7 +212,30 @@ interface ChatSidebarProps extends React.ComponentProps<typeof Sidebar> {
   onTriggerCronJob: (jobId: string) => void
 }
 
-export function ChatSidebar({
+interface ChatSidebarContentsProps extends ChatSidebarProps {
+  contentVisible: boolean
+  panesFlipped: boolean
+  sidebarOpen: boolean
+}
+
+export const ChatSidebar = memo(function ChatSidebar(props: ChatSidebarProps) {
+  const sidebarOpen = useStore($sidebarOpen)
+  // Collapsed-but-overlay-mounted → render the full sidebar, not just the nav rail.
+  const sidebarOverlayMounted = useStore($sidebarOverlayMounted)
+  const contentVisible = sidebarOpen || sidebarOverlayMounted
+  const panesFlipped = useStore($panesFlipped)
+
+  return (
+    <ChatSidebarContents
+      {...props}
+      contentVisible={contentVisible}
+      panesFlipped={panesFlipped}
+      sidebarOpen={sidebarOpen}
+    />
+  )
+})
+
+function ChatSidebarContents({
   currentView,
   onNavigate,
   onLoadMoreSessions,
@@ -225,21 +247,18 @@ export function ChatSidebar({
   onBranchSession,
   onNewSessionInWorkspace,
   onManageCronJob,
-  onTriggerCronJob
-}: ChatSidebarProps) {
+  onTriggerCronJob,
+  contentVisible,
+  panesFlipped,
+  sidebarOpen
+}: ChatSidebarContentsProps) {
   const { t } = useI18n()
   const s = t.sidebar
-  const sidebarOpen = useStore($sidebarOpen)
-  // Collapsed-but-overlay-mounted → render the full sidebar, not just the nav rail.
-  const overlayMounted = useStore($sidebarOverlayMounted)
-  const contentVisible = sidebarOpen || overlayMounted
-  const panesFlipped = useStore($panesFlipped)
   const agentsGrouped = useStore($sidebarAgentsGrouped)
   const pinnedSessionIds = useStore($pinnedSessionIds)
   const pinsOpen = useStore($sidebarPinsOpen)
   const agentsOpen = useStore($sidebarRecentsOpen)
   const cronOpen = useStore($sidebarCronOpen)
-  const selectedSessionId = useStore($selectedStoredSessionId)
   const sessions = useStore($sessions)
   const cronSessions = useStore($cronSessions)
   const cronJobs = useStore($cronJobs)
@@ -249,7 +268,6 @@ export function ChatSidebar({
   const sessionsLoading = useStore($sessionsLoading)
   const sessionsTotal = useStore($sessionsTotal)
   const sessionProfileTotals = useStore($sessionProfileTotals)
-  const workingSessionIds = useStore($workingSessionIds)
   const profiles = useStore($profiles)
   const profileScope = useStore($profileScope)
   // Only surface the profile switcher when more than one profile exists, so
@@ -315,7 +333,6 @@ export function ChatSidebar({
     }
   }, [])
 
-  const activeSidebarSessionId = currentView === 'chat' ? selectedSessionId : null
 
   const dndSensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
@@ -339,7 +356,6 @@ export function ChatSidebar({
     [visibleSessions]
   )
 
-  const workingSessionIdSet = useMemo(() => new Set(workingSessionIds), [workingSessionIds])
 
   // Index sessions by both their live id and their lineage-root id so a pin
   // stored as the pre-compression root resolves to the live continuation tip.
@@ -655,26 +671,6 @@ export function ChatSidebar({
   const inEnteredProject = Boolean(enteredProject && !showAllProfiles)
   const [scopedRepoWorktrees] = useRepoWorktreeMap(scopedRepoPaths, inEnteredProject)
 
-  // Re-probe worktree lanes on out-of-band git changes the renderer can't see.
-  // A turn can `git worktree add/remove` in the terminal (e.g. you ask Hermes to
-  // "remove that worktree"), and the window never blurs during an in-app chat,
-  // so nothing would otherwise re-run the visual probe. Re-sync when a working
-  // session settles (its turn finished) or the window refocuses (an external
-  // terminal may have changed things) — only while a project is entered, and
-  // only the cheap per-repo `git worktree list`, never the heavy tree scan.
-  const prevWorkingIdsRef = useRef<string[]>(workingSessionIds)
-
-  useEffect(() => {
-    const prev = prevWorkingIdsRef.current
-    prevWorkingIdsRef.current = workingSessionIds
-
-    // A session leaving the working set means its turn just completed.
-    const aTurnSettled = prev.some(id => !workingSessionIds.includes(id))
-
-    if (inEnteredProject && aTurnSettled) {
-      refreshWorktrees()
-    }
-  }, [workingSessionIds, inEnteredProject])
 
   useEffect(() => {
     if (!inEnteredProject) {
@@ -1043,6 +1039,7 @@ export function ChatSidebar({
       )}
       collapsible="none"
     >
+      <ProjectWorktreeRefresh inEnteredProject={inEnteredProject} />
       <SidebarContent className="gap-0 overflow-hidden bg-transparent px-2.5">
         <SidebarGroup className="shrink-0 p-0 pb-2 pt-[calc(var(--titlebar-height)+0.375rem)]">
           <SidebarGroupContent>
@@ -1126,7 +1123,6 @@ export function ChatSidebar({
           <div className={cn('flex min-h-0 flex-1 flex-col pb-1.75', SCROLL_Y)}>
             {trimmedQuery && (
               <SidebarSessionsSection
-                activeSessionId={activeSidebarSessionId}
                 contentClassName={cn('flex min-h-0 flex-1 flex-col gap-px pb-1.75', SCROLL_Y)}
                 emptyState={
                   searchPending ? (
@@ -1149,13 +1145,12 @@ export function ChatSidebar({
                 pinned={false}
                 rootClassName="min-h-32 flex-1 overflow-hidden p-0"
                 sessions={searchResults}
-                workingSessionIdSet={workingSessionIdSet}
+                showSelection={currentView === 'chat'}
               />
             )}
 
             {!trimmedQuery && (
               <SidebarSessionsSection
-                activeSessionId={activeSidebarSessionId}
                 contentClassName={cn('flex max-h-44 flex-col gap-px rounded-lg pb-2 pt-1', GROUP_BODY)}
                 dndSensors={dndSensors}
                 emptyState={<SidebarPinnedEmptyState />}
@@ -1171,15 +1166,14 @@ export function ChatSidebar({
                 pinned
                 rootClassName="shrink-0 p-0 pb-1"
                 sessions={pinnedSessions}
+                showSelection={currentView === 'chat'}
                 sortable={pinnedSessions.length > 1}
-                workingSessionIdSet={workingSessionIdSet}
               />
             )}
 
             {!trimmedQuery && (
               <SidebarSessionsSection
                 activeProjectId={activeProjectId}
-                activeSessionId={activeSidebarSessionId}
                 collapsible={!inProject}
                 contentClassName={cn(
                   'flex min-h-0 flex-1 flex-col pb-1.75',
@@ -1326,8 +1320,8 @@ export function ChatSidebar({
                   !recentsVirtualizes && 'compact:min-h-0 compact:flex-none compact:overflow-visible'
                 )}
                 sessions={displayAgentSessions}
+                showSelection={currentView === 'chat'}
                 sortable={!showAllProfiles && agentSessions.length > 1}
-                workingSessionIdSet={workingSessionIdSet}
               />
             )}
 
@@ -1342,7 +1336,6 @@ export function ChatSidebar({
 
                 return (
                   <SidebarSessionsSection
-                    activeSessionId={activeSidebarSessionId}
                     contentClassName={cn('flex max-h-56 flex-col gap-px pb-1.75', GROUP_BODY)}
                     emptyState={null}
                     footer={
@@ -1373,7 +1366,7 @@ export function ChatSidebar({
                     pinned={false}
                     rootClassName="shrink-0 p-0"
                     sessions={shownSessions}
-                    workingSessionIdSet={workingSessionIdSet}
+                    showSelection={currentView === 'chat'}
                   />
                 )
               })}
@@ -1403,6 +1396,27 @@ export function ChatSidebar({
       <ProjectDialog />
     </Sidebar>
   )
+}
+
+function ProjectWorktreeRefresh({ inEnteredProject }: { inEnteredProject: boolean }) {
+  const workingSessionIds = useStore($workingSessionIds)
+  const previousWorkingSessionIdsRef = useRef(workingSessionIds)
+
+  // Re-probe worktree lanes when a turn settles: the agent may have changed
+  // them in its terminal without causing a window-focus event. This component
+  // owns the status subscription so the sidebar's session lists do not rerender
+  // on working-state transitions.
+  useEffect(() => {
+    const previous = previousWorkingSessionIdsRef.current
+    previousWorkingSessionIdsRef.current = workingSessionIds
+    const aTurnSettled = previous.some(id => !workingSessionIds.includes(id))
+
+    if (inEnteredProject && aTurnSettled) {
+      refreshWorktrees()
+    }
+  }, [inEnteredProject, workingSessionIds])
+
+  return null
 }
 
 interface MessagingSection {

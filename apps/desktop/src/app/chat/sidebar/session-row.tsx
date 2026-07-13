@@ -1,4 +1,6 @@
 import { useStore } from '@nanostores/react'
+import { computed } from 'nanostores'
+import { useMemo } from 'react'
 import type * as React from 'react'
 
 import { writeSessionDrag } from '@/app/chat/composer/inline-refs'
@@ -13,7 +15,7 @@ import { triggerHaptic } from '@/lib/haptics'
 import { handoffOriginSource, sessionSourceLabel } from '@/lib/session-source'
 import { coarseElapsed } from '@/lib/time'
 import { cn } from '@/lib/utils'
-import { $attentionSessionIds } from '@/store/session'
+import { $attentionSessionIds, $selectedStoredSessionId, $workingSessionIds } from '@/store/session'
 import { canOpenSessionWindow, openSessionInNewWindow } from '@/store/windows'
 
 import { SidebarRowBody, SidebarRowGrab, SidebarRowLabel, SidebarRowLead, SidebarRowShell } from './chrome'
@@ -24,8 +26,7 @@ interface SidebarSessionRowProps extends React.ComponentProps<'div'> {
   /** TUI-style tree stem for branched sessions (`└─ ` / `├─ `). */
   branchStem?: string
   isPinned: boolean
-  isSelected: boolean
-  isWorking: boolean
+  showSelection?: boolean
   onArchive: () => void
   onBranch?: () => void
   onDelete: () => void
@@ -49,8 +50,7 @@ export function SidebarSessionRow({
   session,
   branchStem,
   isPinned,
-  isSelected,
-  isWorking,
+  showSelection = true,
   onArchive,
   onBranch,
   onDelete,
@@ -74,10 +74,26 @@ export function SidebarSessionRow({
   // Telegram thread continued here still reads as Telegram.
   const handoffSource = handoffOriginSource(session.handoff_state, session.handoff_platform)
   const handoffLabel = handoffSource ? (sessionSourceLabel(handoffSource) ?? handoffSource) : null
-  // Subscribe per-row (the leaf) instead of drilling a set through the list —
-  // the atom is tiny and rarely non-empty. True when a clarify prompt in this
-  // session is waiting on the user.
-  const needsInput = useStore($attentionSessionIds).includes(session.id)
+
+  const isSelectedStore = useMemo(
+    () => computed($selectedStoredSessionId, selectedSessionId => selectedSessionId === session.id),
+    [session.id]
+  )
+
+  const isWorkingStore = useMemo(
+    () => computed($workingSessionIds, sessionIds => sessionIds.includes(session.id)),
+    [session.id]
+  )
+
+  const needsInputStore = useMemo(
+    () => computed($attentionSessionIds, sessionIds => sessionIds.includes(session.id)),
+    [session.id]
+  )
+
+  const selected = useStore(isSelectedStore)
+  const isSelected = showSelection && selected
+  const isWorking = useStore(isWorkingStore)
+  const needsInput = useStore(needsInputStore)
 
   return (
     <SessionContextMenu
