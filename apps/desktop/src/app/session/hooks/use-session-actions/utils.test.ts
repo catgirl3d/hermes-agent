@@ -4,7 +4,6 @@ import type { ChatMessage } from '@/lib/chat-messages'
 import type { SessionInfo } from '@/types/hermes'
 
 import {
-  chatMessageArraysEquivalent,
   isSessionGoneError,
   reconcileResumeMessages,
   sessionMatchesStoredId,
@@ -57,19 +56,21 @@ describe('toBranchMessages', () => {
   })
 })
 
-describe('chatMessageArraysEquivalent', () => {
-  it('compares length and per-message equivalence', () => {
-    const a = [msg('1', 'user', 'x'), msg('2', 'assistant', 'y')]
-    expect(chatMessageArraysEquivalent(a, [msg('1', 'user', 'x'), msg('2', 'assistant', 'y')])).toBe(true)
-    expect(chatMessageArraysEquivalent(a, [msg('1', 'user', 'x')])).toBe(false)
-    expect(chatMessageArraysEquivalent(a, [msg('1', 'user', 'x'), msg('2', 'assistant', 'changed')])).toBe(false)
-  })
-})
-
 describe('reconcileResumeMessages', () => {
   it('returns next untouched when there is no previous transcript', () => {
     const next = [msg('1', 'user', 'hi')]
     expect(reconcileResumeMessages(next, [])).toBe(next)
+  })
+
+  it('reuses previous message refs when the reconciled turn is unchanged', () => {
+    const previous = [msg('u', 'user', 'hi'), msg('a', 'assistant', 'answer')]
+    const next = [msg('u', 'user', 'hi'), msg('a', 'assistant', 'answer')]
+
+    const out = reconcileResumeMessages(next, previous)
+
+    expect(out).not.toBe(previous)
+    expect(out[0]).toBe(previous[0])
+    expect(out[1]).toBe(previous[1])
   })
 
   it('re-grafts reasoning parts onto a matching assistant turn', () => {
@@ -86,5 +87,25 @@ describe('reconcileResumeMessages', () => {
 
     const [out] = reconcileResumeMessages(next, previous)
     expect(out.parts.some(p => p.type === 'reasoning')).toBe(true)
+  })
+
+  it('keeps unchanged message identities when another resume message changed', () => {
+    const previous = [
+      msg('u-1', 'user', 'first prompt'),
+      msg('a-1', 'assistant', 'first answer'),
+      msg('u-2', 'user', 'second prompt')
+    ]
+
+    const next = [
+      msg('u-1', 'user', 'first prompt'),
+      msg('a-1', 'assistant', 'updated answer'),
+      msg('u-2', 'user', 'second prompt')
+    ]
+
+    const out = reconcileResumeMessages(next, previous)
+
+    expect(out[0]).toBe(previous[0])
+    expect(out[1]).toBe(next[1])
+    expect(out[2]).toBe(previous[2])
   })
 })

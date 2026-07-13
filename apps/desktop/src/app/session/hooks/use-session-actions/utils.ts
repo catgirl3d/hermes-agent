@@ -70,10 +70,6 @@ function chatMessagesEquivalent(a: ChatMessage, b: ChatMessage): boolean {
   return a.parts.every((part, index) => JSON.stringify(part) === JSON.stringify(b.parts[index]))
 }
 
-export function chatMessageArraysEquivalent(a: ChatMessage[], b: ChatMessage[]): boolean {
-  return a.length === b.length && a.every((message, index) => chatMessagesEquivalent(message, b[index]))
-}
-
 export function reconcileResumeMessages(nextMessages: ChatMessage[], previousMessages: ChatMessage[]): ChatMessage[] {
   if (!previousMessages.length) {
     return nextMessages
@@ -112,14 +108,16 @@ export function reconcileResumeMessages(nextMessages: ChatMessage[], previousMes
     const previousImages = embeddedImageUrls(previousText)
 
     if (!previousImages.length || embeddedImageUrls(chatMessageText(preserved)).length) {
-      return preserved
+      return chatMessagesEquivalent(preserved, previous) ? previous : preserved
     }
 
     if (nextText !== previousVisibleText) {
       return preserved
     }
 
-    return withAppendedText(preserved, previousImages.map(url => `\n${url}`).join(''))
+    const withImages = withAppendedText(preserved, previousImages.map(url => `\n${url}`).join(''))
+
+    return chatMessagesEquivalent(withImages, previous) ? previous : withImages
   })
 }
 
