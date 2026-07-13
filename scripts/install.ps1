@@ -61,6 +61,16 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Automatically resolve branch if calling installer from a local git repository
+if (-not $PSBoundParameters.ContainsKey('Branch')) {
+    if ($PSScriptRoot -and (Test-Path "$PSScriptRoot\..\.git")) {
+        $localBranch = git -c windows.appendAtomically=false -C "$PSScriptRoot\.." branch --show-current 2>$null
+        if ($localBranch) {
+            $Branch = $localBranch
+        }
+    }
+}
+
 # Suppress Invoke-WebRequest's per-chunk progress bar.  Windows PowerShell
 # 5.1's progress UI repaints synchronously on every received byte, which
 # pegs CPU on a single core and throttles downloads by 10-100x (a 57MB
@@ -136,8 +146,8 @@ foreach ($tmpVar in @('TEMP', 'TMP')) {
 # Configuration
 # ============================================================================
 
-$RepoUrlSsh = "git@github.com:catgirl3d/hermes-agent.git"
-$RepoUrlHttps = "https://github.com/catgirl3d/hermes-agent.git"
+$RepoUrlSsh = "file:///e:/git_external/hermes-agent-1"
+$RepoUrlHttps = "file:///e:/git_external/hermes-agent-1"
 $PythonVersion = "3.11"
 # Minor versions the installer accepts when the requested $PythonVersion isn't
 # available, in preference order.  uv discovers both uv-managed and system
