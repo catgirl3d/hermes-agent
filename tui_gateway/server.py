@@ -5662,6 +5662,17 @@ def _schedule_agent_build(sid: str, delay: float = 0.05) -> None:
     timer.start()
 
 
+def _resume_histories(db, session_id: str) -> tuple[list, list]:
+    """Use the one-query SessionDB resume projection, retaining fake-db support."""
+    get_resume_messages = getattr(db, "get_resume_messages", None)
+    if callable(get_resume_messages):
+        return get_resume_messages(session_id)
+    return (
+        db.get_messages_as_conversation(session_id),
+        db.get_messages_as_conversation(session_id, include_ancestors=True),
+    )
+
+
 @method("session.resume")
 def _(rid, params: dict) -> dict:
     target = params.get("session_id", "")
@@ -5839,8 +5850,7 @@ def _(rid, params: dict) -> dict:
         _enable_gateway_prompts()
         try:
             db.reopen_session(target)
-            raw_history = db.get_messages_as_conversation(target)
-            display_history = db.get_messages_as_conversation(target, include_ancestors=True)
+            raw_history, display_history = _resume_histories(db, target)
         except Exception as e:
             if lease is not None:
                 lease.release()
@@ -5913,10 +5923,7 @@ def _(rid, params: dict) -> dict:
     )
     try:
         db.reopen_session(target)
-        raw_history = db.get_messages_as_conversation(target)
-        display_history = db.get_messages_as_conversation(
-            target, include_ancestors=True
-        )
+        raw_history, display_history = _resume_histories(db, target)
         # The display transcript keeps every row so the user still sees their
         # full history.  The model-fed history is sanitized: a session whose
         # last turn died mid-tool-loop persists a dangling assistant(tool_calls)
