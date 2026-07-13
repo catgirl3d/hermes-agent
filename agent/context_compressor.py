@@ -22,7 +22,7 @@ import logging
 import sqlite3
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from agent.auxiliary_client import call_llm, _is_connection_error, aux_interrupt_protection
 from agent.context_engine import ContextEngine
@@ -200,6 +200,27 @@ _SUMMARY_TOKENS_CEILING = 10_000
 
 # Placeholder used when pruning old tool results
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
+
+# Manual tool-result cleanup keeps a small head/tail excerpt from very large
+# outputs. The ordinary automatic-compression pre-pass remains one-line-only;
+# this richer excerpt is opt-in so existing compression behavior stays stable.
+_LARGE_TOOL_RESULT_EDGE_THRESHOLD = 4_000
+_LARGE_TOOL_RESULT_HEAD_CHARS = 500
+_LARGE_TOOL_RESULT_TAIL_CHARS = 300
+_FILE_STRUCTURE_RE = re.compile(
+    r"^\s*(?:@\w+|from\s+\S+\s+import\b|import\s+|export\s+|class\s+|"
+    r"(?:async\s+)?def\s+|interface\s+|type\s+\w+\s*=|enum\s+|"
+    r"(?:async\s+)?function\s+|(?:const|let|var)\s+\w+\s*=|"
+    r"(?:(?:public|private|protected|static|async|get|set)\s+)+\w+\s*\(|"
+    r"[A-Z][A-Z0-9_]*\s*=|#{1,3}\s+)",
+    re.I,
+)
+_FILE_LINE_PREFIX_RE = re.compile(r"^\s*\d+\s*[|:]\s?")
+_WEB_RESULT_LIMIT = 5
+_WEB_PROVIDER_TOKENS = {
+    "bing", "brave", "exa", "firecrawl", "google", "perplexity", "serper", "tavily"
+}
+_WEB_ACTION_TOKENS = {"crawl", "extract", "fetch", "scrape", "search", "web"}
 
 # Chars per token rough estimate
 _CHARS_PER_TOKEN = 4
@@ -706,6 +727,209 @@ def _summarize_tool_result(tool_name: str, tool_args: str, tool_content: str) ->
         sv = str(v)[:40]
         first_arg += f" {k}={sv}"
     return f"[{tool_name}]{first_arg} ({content_len:,} chars result)"
+
+
+def _large_tool_result_excerpt(tool_content: str) -> str:
+    """Return a bounded head/tail excerpt for an opaque large result."""
+    if len(tool_content) <= _LARGE_TOOL_RESULT_EDGE_THRESHOLD:
+        return ""
+
+    head = tool_content[:_LARGE_TOOL_RESULT_HEAD_CHARS].rstrip()
+    tail = tool_content[-_LARGE_TOOL_RESULT_TAIL_CHARS:].lstrip()
+    omitted = max(0, len(tool_content) - len(head) - len(tail))
+    return (
+        f"\n[output head]\n{head}\n"
+        f"... [{omitted:,} chars omitted] ...\n"
+        f"[output tail]\n{tail}"
+    )
+
+
+def _bounded_lines(lines: Iterable[str], *, limit: int = 16, width: int = 240) -> str:
+    selected: List[str] = []
+    for line in lines:
+        clean = line.strip()
+        if clean and clean not in selected:
+            selected.append(clean[:width])
+        if len(selected) >= limit:
+            break
+    return "\n".join(selected)
+
+
+def _terminal_result_excerpt(tool_content: str) -> str:
+    """Keep structured stderr/error fields and output tail, not keyword guesses."""
+    output = tool_content
+    errors: List[str] = []
+    try:
+        payload = json.loads(tool_content)
+    except (json.JSONDecodeError, TypeError):
+        payload = None
+
+    if isinstance(payload, dict):
+        for key in ("stderr", "error", "exception", "traceback"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                errors.extend(value.splitlines())
+        for key in ("output", "stdout", "result"):
+            value = payload.get(key)
+            if isinstance(value, str):
+                output = value
+                break
+
+    error_text = _bounded_lines(errors[-8:], limit=8)
+    tail = _bounded_lines(output.splitlines()[-12:], limit=12)
+    sections = []
+    if error_text:
+        sections.append(f"[structured errors]\n{error_text}")
+    if tail:
+        sections.append(f"[output tail]\n{tail}")
+    return "\n".join(sections)
+
+
+def _file_result_structure(tool_content: str) -> str:
+    """Best-effort file outline for explicit, user-approved lossy cleanup."""
+    source = tool_content
+    try:
+        envelope = json.loads(tool_content)
+    except (json.JSONDecodeError, TypeError):
+        envelope = None
+    if isinstance(envelope, dict):
+        for key in ("content", "text", "output", "result"):
+            value = envelope.get(key)
+            if isinstance(value, str):
+                source = value
+                break
+
+    outline: List[str] = []
+    for line in source.splitlines():
+        normalized = _FILE_LINE_PREFIX_RE.sub("", line)
+        if _FILE_STRUCTURE_RE.search(normalized):
+            outline.append(normalized)
+    structure = _bounded_lines(outline, limit=40)
+    if structure:
+        return f"[file structure — lossy]\n{structure}"
+    if len(source) <= 800:
+        return source
+    head = source[:450].rstrip()
+    tail = source[-300:].lstrip()
+    omitted = max(0, len(source) - len(head) - len(tail))
+    return f"[file head]\n{head}\n... [{omitted:,} chars omitted] ...\n[file tail]\n{tail}"
+
+
+def _web_result_fields(tool_content: str) -> str:
+    """Extract high-value fields from at most five web result objects."""
+    wanted = {"title", "url", "name", "snippet", "summary", "description", "text"}
+    payload: Any = None
+    try:
+        payload = json.loads(tool_content)
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    def find_result_list(value: Any) -> List[Dict[str, Any]]:
+        if isinstance(value, dict):
+            for key in ("results", "items", "hits", "data"):
+                child = value.get(key)
+                if isinstance(child, list) and any(isinstance(item, dict) for item in child):
+                    return [item for item in child if isinstance(item, dict)]
+            for child in value.values():
+                found = find_result_list(child)
+                if found:
+                    return found
+        elif isinstance(value, list) and any(isinstance(item, dict) for item in value):
+            return [item for item in value if isinstance(item, dict)]
+        return []
+
+    results = find_result_list(payload)
+    if results:
+        rendered_results: List[str] = []
+        for index, result in enumerate(results[:_WEB_RESULT_LIMIT], start=1):
+            fields = []
+            for key, value in result.items():
+                if str(key).lower() not in wanted or not isinstance(value, (str, int, float)):
+                    continue
+                rendered = str(value).strip().replace("\n", " ")
+                if rendered:
+                    fields.append(f"{key}: {rendered[:300]}")
+            if fields:
+                rendered_results.append(f"[result {index}]\n" + "\n".join(fields))
+        if rendered_results:
+            return f"[top {len(rendered_results)} web results]\n" + "\n".join(rendered_results)
+
+    fields: List[str] = []
+
+    def collect(value: Any) -> None:
+        if len(fields) >= 14:
+            return
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if len(fields) >= 14:
+                    break
+                if str(key).lower() in wanted and isinstance(child, (str, int, float)):
+                    rendered = str(child).strip().replace("\n", " ")
+                    if rendered:
+                        fields.append(f"{key}: {rendered[:300]}")
+                elif isinstance(child, (dict, list)):
+                    collect(child)
+        elif isinstance(value, list):
+            for child in value:
+                collect(child)
+                if len(fields) >= 14:
+                    break
+
+    if payload is not None:
+        collect(payload)
+    else:
+        candidate_lines = [
+            line for line in tool_content.splitlines()
+            if "http://" in line or "https://" in line or re.search(r"\btitle\b", line, re.I)
+        ]
+        fields.extend(_bounded_lines(candidate_lines, limit=12).splitlines())
+
+    if fields:
+        return "[top web fields]\n" + "\n".join(fields[:14])
+    excerpt = _large_tool_result_excerpt(tool_content)
+    return excerpt.lstrip() if excerpt else tool_content[:800]
+
+
+def _is_web_tool(tool_name: str) -> bool:
+    name = tool_name.lower()
+    if name in {"web_search", "web_extract"} or name.startswith("browser_"):
+        return True
+    tokens = {token for token in re.split(r"[^a-z0-9]+", name) if token}
+    return bool(tokens & _WEB_PROVIDER_TOKENS) and bool(tokens & _WEB_ACTION_TOKENS)
+
+
+def _tool_compact_kind(tool_name: str) -> str:
+    name = tool_name.lower()
+    if name in {"terminal", "process", "execute_code"}:
+        return "terminal_tail"
+    if name in {"read_file", "write_file", "patch", "search_files"}:
+        return "file_structure"
+    if _is_web_tool(name):
+        return "web_fields"
+    return "bounded_excerpt"
+
+
+def _default_tool_prune_selected(tool_name: str) -> bool:
+    """Conservative defaults: select known noise, preserve code and unknown MCP."""
+    name = tool_name.lower()
+    return (
+        name in {"terminal", "process"}
+        or _is_web_tool(name)
+    )
+
+
+def _compact_tool_result(tool_name: str, tool_args: str, tool_content: str) -> str:
+    summary = _summarize_tool_result(tool_name, tool_args, tool_content)
+    kind = _tool_compact_kind(tool_name)
+    if kind == "terminal_tail":
+        detail = _terminal_result_excerpt(tool_content)
+    elif kind == "file_structure":
+        detail = _file_result_structure(tool_content)
+    elif kind == "web_fields":
+        detail = _web_result_fields(tool_content)
+    else:
+        detail = _large_tool_result_excerpt(tool_content).lstrip()
+    return f"{summary}\n{detail}" if detail else summary
 
 
 class ContextCompressor(ContextEngine):
@@ -1318,9 +1542,12 @@ class ContextCompressor(ContextEngine):
     # Tool output pruning (cheap pre-pass, no LLM call)
     # ------------------------------------------------------------------
 
+    @staticmethod
     def _prune_old_tool_results(
-        self, messages: List[Dict[str, Any]], protect_tail_count: int,
+        messages: List[Dict[str, Any]], protect_tail_count: int,
         protect_tail_tokens: int | None = None,
+        preserve_large_result_edges: bool = False,
+        tool_names: set[str] | None = None,
     ) -> tuple[List[Dict[str, Any]], int]:
         """Replace old tool result contents with informative 1-line summaries.
 
@@ -1355,13 +1582,23 @@ class ContextCompressor(ContextEngine):
                     if isinstance(tc, dict):
                         cid = tc.get("id", "")
                         fn = tc.get("function", {})
-                        call_id_to_tool[cid] = (fn.get("name", "unknown"), fn.get("arguments", ""))
+                        if cid:
+                            call_id_to_tool[cid] = (fn.get("name", "unknown"), fn.get("arguments", ""))
                     else:
                         cid = getattr(tc, "id", "") or ""
                         fn = getattr(tc, "function", None)
                         name = getattr(fn, "name", "unknown") if fn else "unknown"
                         args_str = getattr(fn, "arguments", "") if fn else ""
-                        call_id_to_tool[cid] = (name, args_str)
+                        if cid:
+                            call_id_to_tool[cid] = (name, args_str)
+
+        def _result_tool(msg: Dict[str, Any]) -> tuple[str, str]:
+            call_id = str(msg.get("tool_call_id") or "")
+            fallback_name = str(msg.get("tool_name") or msg.get("name") or "unknown")
+            return call_id_to_tool.get(call_id, (fallback_name, ""))
+
+        def _selected(tool_name: str) -> bool:
+            return tool_names is None or tool_name in tool_names
 
         # Determine the prune boundary
         if protect_tail_tokens is not None and protect_tail_tokens > 0:
@@ -1388,7 +1625,7 @@ class ContextCompressor(ContextEngine):
             protected_count = max(budget_protect_count, min_protect)
             prune_boundary = len(result) - protected_count
         else:
-            prune_boundary = len(result) - protect_tail_count
+            prune_boundary = max(0, len(result) - protect_tail_count)
 
         # Pass 1: Deduplicate identical tool results.
         # When the same file is read multiple times, keep only the most recent
@@ -1397,6 +1634,9 @@ class ContextCompressor(ContextEngine):
         for i in range(len(result) - 1, -1, -1):
             msg = result[i]
             if msg.get("role") != "tool":
+                continue
+            tool_name, _tool_args = _result_tool(msg)
+            if not _selected(tool_name):
                 continue
             content = msg.get("content") or ""
             # Multimodal content — dedupe by the text summary if available.
@@ -1409,17 +1649,26 @@ class ContextCompressor(ContextEngine):
             if len(content) < 200:
                 continue
             h = hashlib.md5(content.encode("utf-8", errors="replace")).hexdigest()[:12]
-            if h in content_hashes:
+            hash_key = (tool_name, h)
+            if i >= prune_boundary:
+                # Protected messages may anchor an older duplicate, but must
+                # themselves remain byte-for-byte unchanged.
+                content_hashes.setdefault(hash_key, (i, msg.get("tool_call_id", "?")))
+                continue
+            if hash_key in content_hashes:
                 # This is an older duplicate — replace with back-reference
                 result[i] = {**msg, "content": "[Duplicate tool output — same content as a more recent call]"}
                 pruned += 1
             else:
-                content_hashes[h] = (i, msg.get("tool_call_id", "?"))
+                content_hashes[hash_key] = (i, msg.get("tool_call_id", "?"))
 
         # Pass 2: Replace old tool results with informative summaries
         for i in range(prune_boundary):
             msg = result[i]
             if msg.get("role") != "tool":
+                continue
+            tool_name, tool_args = _result_tool(msg)
+            if not _selected(tool_name):
                 continue
             content = msg.get("content", "")
             # Multimodal content (base64 screenshots etc.): strip the image
@@ -1446,9 +1695,11 @@ class ContextCompressor(ContextEngine):
                 continue
             # Only prune if the content is substantial (>200 chars)
             if len(content) > 200:
-                call_id = msg.get("tool_call_id", "")
-                tool_name, tool_args = call_id_to_tool.get(call_id, ("unknown", ""))
-                summary = _summarize_tool_result(tool_name, tool_args, content)
+                summary = (
+                    _compact_tool_result(tool_name, tool_args, content)
+                    if preserve_large_result_edges
+                    else _summarize_tool_result(tool_name, tool_args, content)
+                )
                 result[i] = {**msg, "content": summary}
                 pruned += 1
 
@@ -1468,7 +1719,12 @@ class ContextCompressor(ContextEngine):
             modified = False
             for tc in msg["tool_calls"]:
                 if isinstance(tc, dict):
-                    args = tc.get("function", {}).get("arguments", "")
+                    function = tc.get("function", {})
+                    tool_name = str(function.get("name") or "unknown")
+                    args = function.get("arguments", "")
+                    if not _selected(tool_name):
+                        new_tcs.append(tc)
+                        continue
                     if len(args) > 500:
                         new_args = _truncate_tool_call_args_json(args)
                         if new_args != args:
@@ -1479,6 +1735,184 @@ class ContextCompressor(ContextEngine):
                 result[i] = {**msg, "tool_calls": new_tcs}
 
         return result, pruned
+
+    @staticmethod
+    def prune_tool_results(
+        messages: List[Dict[str, Any]],
+        *,
+        protect_tail_count: int,
+        tool_names: set[str] | None = None,
+    ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Deterministically prune old tool payloads without LLM summarization.
+
+        ``protect_tail_count`` is resolved by the caller from a user-turn
+        boundary. This method only transforms messages before that boundary;
+        recent conversation, user instructions, and assistant prose are left
+        untouched. It is side-effect free and therefore safe for previews.
+        """
+        prune_boundary = max(0, len(messages) - max(0, protect_tail_count))
+        call_id_to_tool: Dict[str, tuple[str, str]] = {}
+        available: Dict[str, Dict[str, int]] = {}
+
+        def _available(tool_name: str) -> Dict[str, int]:
+            return available.setdefault(
+                tool_name,
+                {"argument_count": 0, "result_count": 0},
+            )
+
+        for msg in messages:
+            if msg.get("role") != "assistant":
+                continue
+            for tc in msg.get("tool_calls") or []:
+                name, args = _extract_tool_call_name_and_args(tc)
+                call_id = _extract_tool_call_id(tc)
+                if call_id:
+                    call_id_to_tool[call_id] = (name, args)
+
+        def _result_name(msg: Dict[str, Any]) -> str:
+            call_id = str(msg.get("tool_call_id") or "")
+            fallback = str(msg.get("tool_name") or msg.get("name") or "unknown")
+            return call_id_to_tool.get(call_id, (fallback, ""))[0]
+
+        for msg in messages[:prune_boundary]:
+            if msg.get("role") == "tool":
+                content = msg.get("content")
+                eligible = (
+                    isinstance(content, str) and len(content) > 200
+                ) or (
+                    isinstance(content, list)
+                    and _strip_image_parts_from_parts(content) is not None
+                ) or (
+                    isinstance(content, dict)
+                    and bool(content.get("_multimodal"))
+                )
+                if eligible:
+                    _available(_result_name(msg))["result_count"] += 1
+            elif msg.get("role") == "assistant":
+                for tc in msg.get("tool_calls") or []:
+                    name, args = _extract_tool_call_name_and_args(tc)
+                    if len(args) > 500:
+                        _available(name)["argument_count"] += 1
+
+        available_names = set(available)
+        selected_names = (
+            {name for name in available_names if _default_tool_prune_selected(name)}
+            if tool_names is None
+            else available_names.intersection(tool_names)
+        )
+
+        # Compact every eligible tool once. Transformations are independent by
+        # tool name (including deduplication, whose key contains the tool name),
+        # so the selected transcript can be assembled from this result without
+        # running the full three-pass pruning pipeline a second time.
+        all_tools_messages, _ = ContextCompressor._prune_old_tool_results(
+            messages,
+            protect_tail_count=max(0, protect_tail_count),
+            preserve_large_result_edges=True,
+            tool_names=available_names,
+        )
+        potential_saved_bytes = {name: 0 for name in available_names}
+        pruned_messages: List[Dict[str, Any]] = []
+        for before, after in zip(messages, all_tools_messages):
+            role = before.get("role")
+            if role == "tool":
+                name = _result_name(before)
+                pruned_messages.append(after if name in selected_names else before.copy())
+                if before.get("content") != after.get("content"):
+                    before_size = len(json.dumps(before.get("content"), ensure_ascii=False, default=str))
+                    after_size = len(json.dumps(after.get("content"), ensure_ascii=False, default=str))
+                    potential_saved_bytes[name] = potential_saved_bytes.get(name, 0) + max(
+                        0, before_size - after_size
+                    )
+            elif role == "assistant" and before.get("tool_calls") != after.get("tool_calls"):
+                before_calls = before.get("tool_calls") or []
+                after_calls = after.get("tool_calls") or []
+                selected_calls = []
+                for old_tc, new_tc in zip(before_calls, after_calls):
+                    name, old_args = _extract_tool_call_name_and_args(old_tc)
+                    _new_name, new_args = _extract_tool_call_name_and_args(new_tc)
+                    selected_calls.append(new_tc if name in selected_names else old_tc)
+                    potential_saved_bytes[name] = potential_saved_bytes.get(name, 0) + max(
+                        0, len(old_args) - len(new_args)
+                    )
+                pruned_messages.append(
+                    {**before, "tool_calls": selected_calls}
+                    if selected_calls != before_calls
+                    else before.copy()
+                )
+            else:
+                pruned_messages.append(before.copy())
+
+        pruned_results = 0
+        duplicate_results = 0
+        excerpted_results = 0
+        truncated_tool_calls = 0
+        for before, after in zip(messages, pruned_messages):
+            if before.get("role") == "tool" and before.get("content") != after.get("content"):
+                pruned_results += 1
+                after_content = after.get("content")
+                if isinstance(after_content, str):
+                    if after_content.startswith("[Duplicate tool output"):
+                        duplicate_results += 1
+                    if any(
+                        marker in after_content
+                        for marker in (
+                            "\n[structured errors]\n",
+                            "\n[output head]\n",
+                            "\n[output tail]\n",
+                            "\n[file structure",
+                            "\n[file head]\n",
+                            "\n[file tail]\n",
+                            "\n[top ",
+                        )
+                    ):
+                        excerpted_results += 1
+            if (
+                before.get("role") == "assistant"
+                and before.get("tool_calls") != after.get("tool_calls")
+            ):
+                truncated_tool_calls += 1
+
+        def _serialized_bytes(value: List[Dict[str, Any]]) -> int:
+            payload = json.dumps(
+                value,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=str,
+            )
+            return len(payload.encode("utf-8"))
+
+        before_bytes = _serialized_bytes(messages)
+        after_bytes = _serialized_bytes(pruned_messages)
+        before_tokens = estimate_messages_tokens_rough(messages)
+        after_tokens = estimate_messages_tokens_rough(pruned_messages)
+        tools = [
+            {
+                "name": name,
+                "argument_count": available[name]["argument_count"],
+                "result_count": available[name]["result_count"],
+                "default_selected": _default_tool_prune_selected(name),
+                "selected": name in selected_names,
+                "compact_kind": _tool_compact_kind(name),
+                "estimated_saved_tokens": potential_saved_bytes.get(name, 0) // _CHARS_PER_TOKEN,
+            }
+            for name in sorted(available_names)
+        ]
+        return pruned_messages, {
+            "changed": pruned_messages != messages,
+            "pruned_results": pruned_results,
+            "duplicate_results": duplicate_results,
+            "excerpted_results": excerpted_results,
+            "truncated_tool_calls": truncated_tool_calls,
+            "before_bytes": before_bytes,
+            "after_bytes": after_bytes,
+            "saved_bytes": max(0, before_bytes - after_bytes),
+            "before_tokens": before_tokens,
+            "after_tokens": after_tokens,
+            "saved_tokens": max(0, before_tokens - after_tokens),
+            "selected_tool_names": sorted(selected_names),
+            "tools": tools,
+        }
 
     # ------------------------------------------------------------------
     # Summarization
