@@ -741,6 +741,7 @@ def _close_session_by_id(sid: str, *, end_reason: str = "tui_close") -> bool:
         session = _sessions.pop(sid, None)
     if session is None:
         return False
+    _cancel_scheduled_agent_build(session)
     # The session is already out of _sessions here, so downstream teardown
     # (e.g. _finalize_session's per-session async-delegation interrupt) can't
     # recover its live id by scanning the dict — stamp it on the record.
@@ -894,13 +895,19 @@ def _reap_idle_sessions() -> None:
 def _max_live_sessions() -> int:
     try:
         from hermes_cli.active_sessions import coerce_max_concurrent_sessions
+        from hermes_cli.config import DEFAULT_CONFIG
 
         cfg = _load_cfg() or {}
-        raw = cfg.get("max_live_sessions")
-        if raw is None:
+        if "max_live_sessions" in cfg:
+            # An explicit 0/null is the documented opt-out; do not replace it
+            # with the shipped default below.
+            raw = cfg["max_live_sessions"]
+        else:
             gateway_cfg = cfg.get("gateway")
             if isinstance(gateway_cfg, dict):
-                raw = gateway_cfg.get("max_live_sessions")
+                raw = gateway_cfg.get("max_live_sessions", DEFAULT_CONFIG["max_live_sessions"])
+            else:
+                raw = DEFAULT_CONFIG["max_live_sessions"]
         coerced = coerce_max_concurrent_sessions(raw, key="max_live_sessions")
         return int(coerced) if coerced else 0
     except Exception:
@@ -1331,6 +1338,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
     with lock:
         if ready.is_set() or session.get("agent_build_started"):
             return
+        _cancel_scheduled_agent_build(session)
         session["agent_build_started"] = True
         # An upgrading lazy session is now genuinely mid-construction — restore
         # its "still starting" eviction exemption.
@@ -5663,13 +5671,31 @@ def _schedule_agent_build(sid: str, delay: float = 0.05) -> None:
     and cold resume both build through here; _sess() also builds on demand)."""
 
     def _run():
-        session = _sessions.get(sid)
-        if session is not None:
-            _start_agent_build(sid, session)
+        with _sessions_lock:
+            session = _sessions.get(sid)
+            # A newer schedule superseded this timer, or teardown removed the
+            # session before the deferred build fired.
+            if session is None or session.get("agent_build_timer") is not timer:
+                return
+            session.pop("agent_build_timer", None)
+        _start_agent_build(sid, session)
 
     timer = threading.Timer(delay, _run)
     timer.daemon = True
+    with _sessions_lock:
+        session = _sessions.get(sid)
+        if session is None:
+            return
+        _cancel_scheduled_agent_build(session)
+        session["agent_build_timer"] = timer
     timer.start()
+
+
+def _cancel_scheduled_agent_build(session: dict) -> None:
+    """Cancel a deferred pre-warm that no longer owns this session record."""
+    timer = session.pop("agent_build_timer", None)
+    if timer is not None:
+        timer.cancel()
 
 
 def _resume_histories(db, session_id: str) -> tuple[list, list]:
@@ -5814,6 +5840,7 @@ def _(rid, params: dict) -> dict:
         )
         if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
             return _ok(rid, _reuse_live_payload(*live))
+        _schedule_session_cap_enforcement()  # watch sessions are also live records
         # A delegated child mid-run emits no session events of its own — report
         # its liveness from the relay registry so the window shows a busy turn.
         child_running = _child_run_active(target)
@@ -6032,6 +6059,7 @@ def _(rid, params: dict) -> dict:
                 lease.release()
             return _err(rid, 5000, f"resume failed: {e}")
         session = _sessions.get(sid) or {}
+    _schedule_session_cap_enforcement()  # keep eager resume consistent with deferred
     return _ok(
         rid,
         {
