@@ -12,6 +12,7 @@ import { playCompletionSound } from '@/lib/completion-sound'
 import { resolveGatewayEventSessionId } from '@/lib/gateway-events'
 import { triggerHaptic } from '@/lib/haptics'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
+import { recordSessionSwitchTransportTiming } from '@/lib/session-switch-trace'
 import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
 import { clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
 import { setSessionCompacting } from '@/store/compaction'
@@ -115,6 +116,12 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
     (event: RpcEvent) => {
       const payload = event.payload as GatewayEventPayload | undefined
       const explicitSid = event.session_id || ''
+
+      if (event.type === 'gateway.transport_timing') {
+        recordSessionSwitchTransportTiming(event.payload)
+
+        return
+      }
 
       const route = resolveGatewayEventSessionId({
         activeSessionId: activeSessionIdRef.current,

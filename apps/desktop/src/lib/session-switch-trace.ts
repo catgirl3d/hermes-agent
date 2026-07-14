@@ -9,6 +9,15 @@ export interface SessionSwitchTrace {
   complete: (outcome: SessionSwitchTraceOutcome, fields?: TraceFields) => void
 }
 
+interface SessionSwitchTransportTiming {
+  json_serialize_ms?: unknown
+  prefix_frame_count?: unknown
+  prefix_send_ms?: unknown
+  response_send_ms?: unknown
+  send_total_ms?: unknown
+  stored_session_id?: unknown
+}
+
 interface SessionSwitchTraceOptions {
   requestId: number
   storedSessionId: string
@@ -23,6 +32,28 @@ export function markActiveSessionSwitchTrace(storedSessionId: string | null, nam
   if (storedSessionId) {
     activeTraces.get(storedSessionId)?.mark(name, fields)
   }
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+/** Attaches the post-response server send measurement to the active switch. */
+export function recordSessionSwitchTransportTiming(payload: unknown): void {
+  if (!payload || typeof payload !== 'object') {
+    return
+  }
+
+  const timing = payload as SessionSwitchTransportTiming
+  const storedSessionId = typeof timing.stored_session_id === 'string' ? timing.stored_session_id : null
+
+  markActiveSessionSwitchTrace(storedSessionId, 'resume-response-sent', {
+    backendJsonSerializeMs: finiteNumber(timing.json_serialize_ms),
+    backendPrefixFrameCount: finiteNumber(timing.prefix_frame_count),
+    backendPrefixSendMs: finiteNumber(timing.prefix_send_ms),
+    backendResponseSendMs: finiteNumber(timing.response_send_ms),
+    backendSendTotalMs: finiteNumber(timing.send_total_ms)
+  })
 }
 
 export function measureActiveSessionSwitchTrace<T>(
