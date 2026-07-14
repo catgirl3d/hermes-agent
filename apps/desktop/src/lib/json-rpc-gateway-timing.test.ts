@@ -44,6 +44,8 @@ class FakeWebSocket {
         backend_timing_ms: {
           handler_total: 5,
           schema_version: 11,
+          resume_prewarm_enabled: 0,
+          resume_prewarm_mode: 'on_demand',
           ws_ack_send: 1.5,
           ws_receive_to_ack: 0.2
         },
@@ -90,6 +92,7 @@ describe('JsonRpcGatewayClient timing instrumentation', () => {
         client_request_receive_ack_transport?: number
         client_request_send?: number
         response_chars?: number
+        resume_prewarm_mode?: string
         ws_ack_send?: number
         ws_receive_to_ack?: number
       }
@@ -107,6 +110,7 @@ describe('JsonRpcGatewayClient timing instrumentation', () => {
     expect(result.backend_timing_ms.client_request_receive_ack_transport).toBeGreaterThanOrEqual(0)
     expect(result.backend_timing_ms.client_request_send).toBeGreaterThanOrEqual(0)
     expect(result.backend_timing_ms.response_chars).toBeGreaterThan(0)
+    expect(result.backend_timing_ms.resume_prewarm_mode).toBe('on_demand')
     expect(result.backend_timing_ms.ws_ack_send).toBe(1.5)
     expect(result.backend_timing_ms.ws_receive_to_ack).toBe(0.2)
   })

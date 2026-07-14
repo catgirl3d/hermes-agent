@@ -411,6 +411,8 @@ export interface SessionResumeResponse {
     record_prepare?: number
     reopen?: number
     resume_info?: number
+    resume_prewarm_enabled?: number
+    resume_prewarm_mode?: 'on_demand'
     client_json_parse?: number
     response_chars?: number
     schedule?: number
