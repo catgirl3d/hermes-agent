@@ -296,7 +296,7 @@ export function useComposerActions({
   )
 
   const addTextToDraft = useCallback((text: string) => {
-    requestComposerInsert(text, { mode: 'block' })
+    requestComposerInsert(text, { intent: 'text', mode: 'block' })
   }, [])
 
   const addTerminalSelectionAttachment = useCallback((text: string, label = 'selection') => {
@@ -309,7 +309,7 @@ export function useComposerActions({
     }
 
     setComposerTerminalSelection(normalizedLabel, trimmed)
-    requestComposerInsert(refText, { mode: 'inline' })
+    requestComposerInsert(refText, { intent: 'attachment', mode: 'inline' })
   }, [])
 
   const addContextRefAttachment = useCallback(
@@ -371,7 +371,7 @@ export function useComposerActions({
         return false
       }
 
-      requestComposerInsertRefs([ref], { target: scope.target })
+      requestComposerInsertRefs([ref], { intent: 'attachment', target: scope.target })
       requestComposerFocus(scope.target)
 
       return true

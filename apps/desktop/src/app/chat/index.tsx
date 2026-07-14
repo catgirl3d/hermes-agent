@@ -61,6 +61,7 @@ import type { ChatBarState } from './composer/types'
 import { type DroppedFile, partitionDroppedFiles } from './hooks/use-composer-actions'
 import { type DragKind, useFileDropZone } from './hooks/use-file-drop-zone'
 import { useRuntimeMessageRepository } from './runtime-repository'
+import { useComposerIntentPrewarm } from './hooks/use-composer-intent-prewarm'
 import { ScrollToBottomButton } from './scroll-to-bottom-button'
 import { useSessionView } from './session-view'
 import { SessionActionsMenu } from './sidebar/session-actions-menu'
@@ -228,6 +229,7 @@ function ChatRuntimeBoundary({
     }),
     [busy, onCancel, onEdit, onReload, onThreadMessagesChange, runtimeMessageRepository]
   )
+
   const runtime = useIncrementalExternalStoreRuntime<ThreadMessage>(runtimeAdapter, {
     onAdapterSync: onRuntimeAdapterSync
   })
@@ -277,6 +279,7 @@ export function ChatView({
   // Dock anchor for a session drop onto this surface: the workspace pane for the
   // primary, this tile's pane id for a tile. Read by the session-drop bridge.
   const sessionAnchor = isPrimary ? 'workspace' : `session-tile:${storedId ?? ''}`
+  const prewarmOnIntent = useComposerIntentPrewarm({ gateway, sessionId: activeSessionId })
   const awaitingResponse = useStore(view.$awaitingResponse)
   const busy = useStore(view.$busy)
   const contextSuggestions = useStore($contextSuggestions)
@@ -340,6 +343,7 @@ export function ChatView({
   const resumeExhausted = isPrimary && isRoutedSessionView && resumeExhaustedSessionId === routedSessionId
 
   const hasVisibleSession = Boolean(visibleStoredSessionId || activeSessionId || !messagesEmpty)
+
   const loadingSession =
     !resumeExhausted && isRoutedSessionView && !hasVisibleSession && (routeSessionMismatch || !activeSessionId)
 
@@ -437,6 +441,10 @@ export function ChatView({
   // pipeline — otherwise the local path leaks into the prompt verbatim.
   const onDropFiles = useCallback(
     (candidates: DroppedFile[]) => {
+      if (candidates.length > 0) {
+        prewarmOnIntent('attachment')
+      }
+
       const { inAppRefs, osDrops } = partitionDroppedFiles(candidates)
       const refs = droppedFileInlineRefs(inAppRefs, currentCwd)
 
@@ -448,7 +456,7 @@ export function ChatView({
         void onAttachDroppedItems(osDrops)
       }
     },
-    [composerScope.target, currentCwd, onAttachDroppedItems]
+    [currentCwd, onAttachDroppedItems, prewarmOnIntent]
   )
 
   // Session drags are POINTER drags (session-drag.ts) — never native DnD.
@@ -581,6 +589,7 @@ export function ChatView({
                 onAttachDroppedItems={onAttachDroppedItems}
                 onAttachImageBlob={onAttachImageBlob}
                 onCancel={onCancel}
+                onIntent={prewarmOnIntent}
                 onPasteClipboardImage={onPasteClipboardImage}
                 onPickFiles={onPickFiles}
                 onPickFolders={onPickFolders}

@@ -28,6 +28,7 @@ interface UseComposerDraftArgs {
   activeQueueSessionKey: string | null
   focusKey: ChatBarProps['focusKey']
   inputDisabled: boolean
+  onIntent: ChatBarProps['onIntent']
   queueEditRef: RefObject<QueueEditState | null>
   sessionId: string | null | undefined
 }
@@ -46,6 +47,7 @@ export function useComposerDraft({
   activeQueueSessionKey,
   focusKey,
   inputDisabled,
+  onIntent,
   queueEditRef,
   sessionId
 }: UseComposerDraftArgs) {
@@ -53,6 +55,8 @@ export function useComposerDraft({
   const composerRuntime = useComposerRuntime()
   // Which composer this is on the focus bus + which attachment set it owns.
   const { attachments: attachmentScope, target } = useComposerScope()
+  const onIntentRef = useRef(onIntent)
+  onIntentRef.current = onIntent
 
   // Coarse edges only — these flip rarely (empty↔non-empty, the `?` help sigil,
   // steerable-vs-slash), so typing within a line costs no render.
@@ -164,8 +168,12 @@ export function useComposerDraft({
       }
     })
 
-    const offInsert = onComposerInsertRequest(({ mode, target: requested, text }) => {
+    const offInsert = onComposerInsertRequest(({ intent, mode, target: requested, text }) => {
       if (requested === target) {
+        if (intent) {
+          onIntentRef.current?.(intent)
+        }
+
         appendExternalText(text, mode)
       }
     })
@@ -299,8 +307,12 @@ export function useComposerDraft({
   insertInlineRefsRef.current = insertInlineRefs
 
   useEffect(() => {
-    return onComposerInsertRefsRequest(({ refs, target: requested }) => {
+    return onComposerInsertRefsRequest(({ intent, refs, target: requested }) => {
       if (requested === target) {
+        if (intent) {
+          onIntentRef.current?.(intent)
+        }
+
         insertInlineRefsRef.current(refs)
       }
     })

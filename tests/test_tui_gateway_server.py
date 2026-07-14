@@ -1115,9 +1115,9 @@ def test_session_resume_dispatch_records_thread_pool_queue_start(monkeypatch):
 
 def _assert_resume_timing(result: dict, *, ws_receive_to_ack: float, ws_ack_send: float) -> dict:
     timing = result["backend_timing_ms"]
-    assert timing["schema_version"] == 11.0
+    assert timing["schema_version"] == 12.0
     assert timing["resume_prewarm_enabled"] == 0.0
-    assert timing["resume_prewarm_mode"] == "on_demand"
+    assert timing["resume_prewarm_mode"] == "composer_intent"
     assert timing["handler_total"] >= 0
     assert timing["ws_receive_to_ack"] == ws_receive_to_ack
     assert timing["ws_ack_send"] == ws_ack_send
@@ -1369,6 +1369,45 @@ def test_prompt_submit_starts_deferred_agent_build(monkeypatch):
     assert resp["result"]["status"] == "streaming"
     assert starts == [(sid, session)]
     assert session["_agent_build_trigger"] == "prompt_submit"
+
+
+def test_session_prewarm_starts_nonblocking_build_from_composer_intent(monkeypatch):
+    sid = "runtime-composer-intent"
+    current_transport = object()
+    session = {
+        "agent": None,
+        "agent_ready": threading.Event(),
+        "session_key": "stored-composer-intent",
+        "transport": object(),
+    }
+    starts = []
+    server._sessions[sid] = session
+    monkeypatch.setattr(
+        server,
+        "_start_agent_build",
+        lambda session_id, target: starts.append((session_id, target)),
+    )
+    monkeypatch.setattr(server, "current_transport", lambda: current_transport)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "prewarm",
+                "method": "session.prewarm",
+                "params": {"session_id": sid, "intent": "voice"},
+            }
+        )
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert resp["result"] == {
+        "accepted": True,
+        "session_id": sid,
+        "trigger": "composer_voice",
+    }
+    assert starts == [(sid, session)]
+    assert session["_agent_build_trigger"] == "composer_voice"
+    assert session["transport"] is current_transport
 
 
 def test_process_status_rpcs_do_not_start_deferred_agent_build(monkeypatch):
@@ -9291,6 +9330,16 @@ def test_start_agent_build_passes_session_model_override(monkeypatch):
     """
     captured = {}
     emitted = []
+    reconciled = []
+
+    class FakeAgent:
+        model = "claude-sonnet-4.6"
+        provider = "anthropic"
+        base_url = ""
+        api_mode = ""
+
+        def switch_model(self, **_kwargs):
+            raise AssertionError("matching build must not switch model")
 
     class FakeWorker:
         def __init__(self, *_a, **_k):
@@ -9302,7 +9351,7 @@ def test_start_agent_build_passes_session_model_override(monkeypatch):
     def fake_make_agent(sid, key, session_id=None, session_db=None, **kwargs):
         captured.update(kwargs)
         captured["build_timing"] = server.agent_build_timing_snapshot()
-        return types.SimpleNamespace(model="claude-sonnet-4.6")
+        return FakeAgent()
 
     monkeypatch.setattr(server, "_set_session_context", lambda target: [])
     monkeypatch.setattr(server, "_clear_session_context", lambda tokens: None)
@@ -9321,6 +9370,12 @@ def test_start_agent_build_passes_session_model_override(monkeypatch):
     monkeypatch.setattr(server, "_start_notification_poller", lambda *a, **k: None)
     monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **k: None)
     monkeypatch.setattr(server, "_probe_config_health", lambda *_a: None)
+    original_sync = server._sync_built_agent_with_session_override
+    monkeypatch.setattr(
+        server,
+        "_sync_built_agent_with_session_override",
+        lambda target, agent: (reconciled.append((target, agent)), original_sync(target, agent))[1],
+    )
 
     sid = "build-sid"
     override = {"model": "claude-sonnet-4.6", "provider": "anthropic"}
@@ -9344,6 +9399,7 @@ def test_start_agent_build_passes_session_model_override(monkeypatch):
         assert captured.get("service_tier_override") == "priority"
         assert captured["build_timing"]["backend_agent_build_active_count"] >= 1
         assert session["agent"].model == "claude-sonnet-4.6"
+        assert reconciled == [(session, session["agent"])]
         deadline = time.time() + 1
         while len([item for item in emitted if item[0] == "agent.build_timing"]) < 2:
             assert time.time() < deadline, "build timing finish event did not arrive"
@@ -9367,6 +9423,52 @@ def test_start_agent_build_passes_session_model_override(monkeypatch):
         assert build_events[1][2]["stored_session_id"] == "k1"
     finally:
         server._sessions.clear()
+
+
+def test_built_agent_reconciles_model_override_changed_during_build():
+    switched = []
+
+    class Agent:
+        model = "old-model"
+        provider = "old-provider"
+        base_url = "https://old.example"
+        api_mode = "old-mode"
+
+        def switch_model(self, **kwargs):
+            switched.append(kwargs)
+            self.model = kwargs["new_model"]
+            self.provider = kwargs["new_provider"]
+            self.base_url = kwargs["base_url"]
+            self.api_mode = kwargs["api_mode"]
+
+    agent = Agent()
+    session = {
+        "model_override": {
+            "model": "new-model",
+            "provider": "new-provider",
+            "base_url": "https://new.example",
+            "api_key": "new-key",
+            "api_mode": "new-mode",
+        }
+    }
+
+    server._sync_built_agent_with_session_override(session, agent)
+
+    assert switched == [
+        {
+            "new_model": "new-model",
+            "new_provider": "new-provider",
+            "api_key": "new-key",
+            "base_url": "https://new.example",
+            "api_mode": "new-mode",
+        }
+    ]
+    assert (agent.model, agent.provider, agent.base_url, agent.api_mode) == (
+        "new-model",
+        "new-provider",
+        "https://new.example",
+        "new-mode",
+    )
 
 
 # ── _get_usage active_subagents (TUI status-bar ⛓ indicator) ──────────────
