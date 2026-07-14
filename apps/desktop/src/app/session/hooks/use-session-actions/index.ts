@@ -598,8 +598,7 @@ export function useSessionActions({
           // Watch windows attach lazily (live mirror). Every other cold resume
           // gets the gateway's default deferred build: the RPC returns the
           // transcript immediately instead of blocking the switch on _make_agent
-          // (MCP discovery / prompt build), and the agent pre-warms in the
-          // background after the response is sent.
+          // (MCP discovery / prompt build). The first prompt starts it on demand.
           ...(watchWindow ? { lazy: true } : {}),
           ...(sessionProfile ? { profile: sessionProfile } : {})
         })
