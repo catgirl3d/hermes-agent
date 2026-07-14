@@ -1,4 +1,9 @@
-import { type AppendMessage, AssistantRuntimeProvider, type ThreadMessage } from '@assistant-ui/react'
+import {
+  type AppendMessage,
+  AssistantRuntimeProvider,
+  type ExternalStoreAdapter,
+  type ThreadMessage
+} from '@assistant-ui/react'
 import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
 import type * as React from 'react'
@@ -16,7 +21,10 @@ import { TitleMenuTrigger } from '@/components/ui/title-menu-trigger'
 import { getGlobalModelOptions, type HermesGateway } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { quickModelOptions, sessionTitle } from '@/lib/chat-runtime'
-import { useIncrementalExternalStoreRuntime } from '@/lib/incremental-external-store-runtime'
+import {
+  type RuntimeAdapterSyncMetrics,
+  useIncrementalExternalStoreRuntime
+} from '@/lib/incremental-external-store-runtime'
 import { markActiveSessionSwitchTrace } from '@/lib/session-switch-trace'
 import { cn } from '@/lib/utils'
 import type { ComposerAttachment } from '@/store/composer'
@@ -195,17 +203,33 @@ function ChatRuntimeBoundary({
   const messages = useStore(view.$messages)
   const runtimeMessageRepository = useRuntimeMessageRepository(messages, traceSessionId)
 
-  const runtime = useIncrementalExternalStoreRuntime<ThreadMessage>({
-    messageRepository: runtimeMessageRepository,
-    isRunning: busy,
-    setMessages: onThreadMessagesChange,
-    onNew: async () => {
-      // Submission is handled explicitly by ChatBar.
-      // Keeping this no-op avoids duplicate prompt.submit calls.
+  const onRuntimeAdapterSync = useCallback(
+    ({ durationMs, messageCount }: RuntimeAdapterSyncMetrics) => {
+      markActiveSessionSwitchTrace(traceSessionId, 'runtime-adapter-synced', {
+        messageCount,
+        operationDurationMs: durationMs
+      })
     },
-    onEdit,
-    onCancel: async () => onCancel(),
-    onReload
+    [traceSessionId]
+  )
+
+  const runtimeAdapter = useMemo<ExternalStoreAdapter<ThreadMessage>>(
+    () => ({
+      messageRepository: runtimeMessageRepository,
+      isRunning: busy,
+      setMessages: onThreadMessagesChange,
+      onNew: async () => {
+        // Submission is handled explicitly by ChatBar.
+        // Keeping this no-op avoids duplicate prompt.submit calls.
+      },
+      onEdit,
+      onCancel: async () => onCancel(),
+      onReload
+    }),
+    [busy, onCancel, onEdit, onReload, onThreadMessagesChange, runtimeMessageRepository]
+  )
+  const runtime = useIncrementalExternalStoreRuntime<ThreadMessage>(runtimeAdapter, {
+    onAdapterSync: onRuntimeAdapterSync
   })
 
   return <AssistantRuntimeProvider runtime={runtime}>{children}</AssistantRuntimeProvider>
