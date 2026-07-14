@@ -1319,7 +1319,9 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
                             (time.perf_counter() - handler_finished_at) * 1000,
                             2,
                         )
-                t.write(resp)
+                written = t.write(resp)
+                if written and method == "session.resume":
+                    _handle_resume_response_after_write(resp)
 
         _pool.submit(lambda: ctx.run(run))
 
@@ -5782,6 +5784,13 @@ def _schedule_agent_build(sid: str, delay: float = 0.05) -> None:
     timer.start()
 
 
+def _handle_resume_response_after_write(resp: dict) -> None:
+    """Run post-write housekeeping without speculative agent construction."""
+    result = resp.get("result") if isinstance(resp, dict) else None
+    if not isinstance(result, dict) or not result.get("resumed"):
+        return
+
+    _schedule_session_cap_enforcement()
 
 
 def _cancel_scheduled_agent_build(session: dict) -> None:
@@ -6009,9 +6018,10 @@ def _(rid, params: dict) -> dict:
     # construction), and every resume caller (desktop + Ink TUI) awaits this RPC
     # before it paints — so building eagerly is the bulk of the multi-second
     # "switching sessions is frozen" latency. Return the full display transcript
-    # immediately and pre-warm the agent on a short timer (the same deferred-
-    # build contract session.create uses); _sess() also builds on demand if the
-    # first prompt beats the timer. A caller that needs the agent built
+    # immediately. Agent construction starts on the first prompt through
+    # prompt.submit -> _start_agent_build, avoiding background contention while
+    # the user switches sessions. A
+    # caller that needs the agent built
     # synchronously (e.g. tests of the build race) passes ``eager_build: true``
     # to fall through to the eager path below. Distinct from the lazy/watch
     # branch above: a normal resume restores the full ancestor history and the
@@ -6067,9 +6077,6 @@ def _(rid, params: dict) -> dict:
             _mark_resume_stage("live_register")
             return _ok_resume(_reuse_live_payload(*live))
         _mark_resume_stage("live_register")
-
-        _schedule_agent_build(sid)
-        _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
 
         messages = _history_to_messages(display_history)
         _mark_resume_stage("message_transport")

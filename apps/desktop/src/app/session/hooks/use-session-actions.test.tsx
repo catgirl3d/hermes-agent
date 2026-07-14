@@ -288,9 +288,12 @@ describe('resumeSession failure recovery', () => {
 
   it('keeps the previous snapshot visible until the cold target is ready', async () => {
     publishSessionViewSnapshot(
-      prepareSessionSnapshot('runtime-old', createClientSessionState('stored-old', [
-        { id: 'old-message', role: 'user', parts: [{ type: 'text', text: 'old transcript' }] }
-      ]))
+      prepareSessionSnapshot(
+        'runtime-old',
+        createClientSessionState('stored-old', [
+          { id: 'old-message', role: 'user', parts: [{ type: 'text', text: 'old transcript' }] }
+        ])
+      )
     )
     setSessions([storedSession({ message_count: 0 })])
 
@@ -459,9 +462,9 @@ describe('resumeSession failure recovery', () => {
 
   it('resumes via the gateway default (deferred build) — not lazy, no eager opt-out', async () => {
     // The switch-latency fix lives backend-side: a normal cold resume gets the
-    // gateway's default DEFERRED build (transcript returns immediately, agent
-    // pre-warms in the background). The client must NOT force the synchronous
-    // path (eager_build) and is only `lazy` for subagent watch windows.
+    // gateway's default DEFERRED build (transcript returns immediately). The
+    // client must NOT force the synchronous path (eager_build) and is only
+    // `lazy` for subagent watch windows.
     let resumeParams: Record<string, unknown> | undefined
 
     const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
