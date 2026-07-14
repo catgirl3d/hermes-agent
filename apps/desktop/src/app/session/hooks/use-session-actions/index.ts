@@ -344,6 +344,7 @@ export function useSessionActions({
 
       return
     }
+
     navigate(NEW_CHAT_ROUTE)
   }, [navigate, selectedStoredSessionId])
 
@@ -355,15 +356,32 @@ export function useSessionActions({
       const trace = createSessionSwitchTrace({ requestId, storedSessionId })
 
       const completeAfterNextPaint = (...args: Parameters<typeof trace.complete>) => {
-        const complete = () => trace.complete(...args)
+        const startedAt = performance.now()
+
+        const markPaintWaitStage = (name: string, waitMethod: 'double-raf' | 'timeout', rafCount: number) => {
+          trace.mark(name, {
+            waitDurationMs: Math.round((performance.now() - startedAt) * 10) / 10,
+            rafCount,
+            waitMethod
+          })
+        }
+
+        const complete = (name: string, waitMethod: 'double-raf' | 'timeout', rafCount: number) => {
+          markPaintWaitStage(name, waitMethod, rafCount)
+          trace.complete(...args)
+        }
+
         if (typeof window === 'undefined' || typeof window.requestAnimationFrame !== 'function') {
-          setTimeout(complete, 0)
+          trace.mark('paint-wait-start', { rafCount: 0, waitMethod: 'timeout' })
+          setTimeout(() => complete('paint-wait-finished', 'timeout', 0), 0)
 
           return
         }
 
+        trace.mark('paint-wait-start', { rafCount: 2, waitMethod: 'double-raf' })
         window.requestAnimationFrame(() => {
-          window.requestAnimationFrame(complete)
+          markPaintWaitStage('paint-raf-1', 'double-raf', 1)
+          window.requestAnimationFrame(() => complete('paint-raf-2', 'double-raf', 2))
         })
       }
 
@@ -592,7 +610,7 @@ export function useSessionActions({
           targetCachedMessages
         )
         trace.mark('transcript-transformed', {
-          durationMs: Math.round((performance.now() - transcriptTransformStartedAt) * 10) / 10,
+          transformDurationMs: Math.round((performance.now() - transcriptTransformStartedAt) * 10) / 10,
           messageCount: resumedMessages.length
         })
 
@@ -633,7 +651,9 @@ export function useSessionActions({
           return
         }
 
-        trace.mark('resume-rpc-failed')
+        trace.mark('resume-rpc-failed', {
+          error: err instanceof Error ? err.message : String(err)
+        })
 
         // The gateway resume RPC failed. Try the REST transcript as a fallback
         // so the window at least shows history. CRITICAL: this fallback must be

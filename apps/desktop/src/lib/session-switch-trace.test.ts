@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { createSessionSwitchTrace, markActiveSessionSwitchTrace, measureActiveSessionSwitchTrace } from './session-switch-trace'
+import {
+  createSessionSwitchTrace,
+  markActiveSessionSwitchTrace,
+  measureActiveSessionSwitchTrace
+} from './session-switch-trace'
 
 describe('session switch trace', () => {
   afterEach(() => {
@@ -21,7 +25,9 @@ describe('session switch trace', () => {
       expect.objectContaining({
         outcome: 'warm-restored',
         requestId: 7,
-        stages: expect.arrayContaining([expect.objectContaining({ name: 'initial-cache', warm: true })])
+        stages: expect.arrayContaining([
+          expect.objectContaining({ name: 'initial-cache', sincePreviousStageMs: expect.any(Number), warm: true })
+        ])
       })
     )
     expect(groupEnd).toHaveBeenCalledTimes(1)
@@ -36,7 +42,31 @@ describe('session switch trace', () => {
 
     expect(info).toHaveBeenCalledWith(
       expect.objectContaining({
-        stages: expect.arrayContaining([expect.objectContaining({ messageCount: 14, name: 'react-layout-commit' })])
+        stages: expect.arrayContaining([
+          expect.objectContaining({ messageCount: 14, name: 'react-layout-commit', sincePreviousStageMs: expect.any(Number) })
+        ])
+      })
+    )
+  })
+
+  it('assigns an interval duration to every stage', () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined)
+    const trace = createSessionSwitchTrace({ requestId: 10, storedSessionId: 'stored-session-1010' })
+
+    trace.mark('first')
+    trace.mark('second')
+    trace.complete('cold-resumed')
+
+    const summary = info.mock.calls[0]?.[0] as { stages: Array<Record<string, unknown>> }
+
+    expect(Object.keys(summary.stages[0] ?? {})).toEqual(['atMs', 'sincePreviousStageMs', 'name'])
+    expect(Object.keys(summary.stages[1] ?? {})).toEqual(['atMs', 'sincePreviousStageMs', 'name'])
+    expect(info).toHaveBeenCalledWith(
+      expect.objectContaining({
+        stages: expect.arrayContaining([
+          expect.objectContaining({ name: 'first', sincePreviousStageMs: expect.any(Number) }),
+          expect.objectContaining({ name: 'second', sincePreviousStageMs: expect.any(Number) })
+        ])
       })
     )
   })
@@ -60,9 +90,10 @@ describe('session switch trace', () => {
         stages: expect.arrayContaining([
           expect.objectContaining({
             coalescedCount: 3,
-            durationMs: expect.any(Number),
             messageCount: 5,
-            name: 'runtime-message-repository-built'
+            name: 'runtime-message-repository-built',
+            operationDurationMs: expect.any(Number),
+            sincePreviousStageMs: expect.any(Number)
           })
         ])
       })

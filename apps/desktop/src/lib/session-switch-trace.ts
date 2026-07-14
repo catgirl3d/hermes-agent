@@ -19,11 +19,7 @@ const SLOW_SWITCH_MS = 250
 const activeTraces = new Map<string, Pick<SessionSwitchTrace, 'mark'>>()
 
 /** Records a stage from a renderer boundary that does not own the resume hook. */
-export function markActiveSessionSwitchTrace(
-  storedSessionId: string | null,
-  name: string,
-  fields?: TraceFields
-): void {
+export function markActiveSessionSwitchTrace(storedSessionId: string | null, name: string, fields?: TraceFields): void {
   if (storedSessionId) {
     activeTraces.get(storedSessionId)?.mark(name, fields)
   }
@@ -42,36 +38,49 @@ export function measureActiveSessionSwitchTrace<T>(
     const extraFields = typeof fields === 'function' ? fields(result) : (fields ?? {})
 
     markActiveSessionSwitchTrace(storedSessionId, name, {
-      durationMs: Math.round((performance.now() - startedAt) * 10) / 10,
+      operationDurationMs: Math.round((performance.now() - startedAt) * 10) / 10,
       ...extraFields
     })
 
     return result
   } catch (error) {
     markActiveSessionSwitchTrace(storedSessionId, name, {
-      durationMs: Math.round((performance.now() - startedAt) * 10) / 10,
+      operationDurationMs: Math.round((performance.now() - startedAt) * 10) / 10,
       threw: true
     })
     throw error
   }
 }
 
-
 /**
  * Collects a single session-switch timeline and emits it only after the view is
  * ready. This keeps diagnostic console I/O out of the latency being measured.
  */
-export function createSessionSwitchTrace({ requestId, storedSessionId }: SessionSwitchTraceOptions): SessionSwitchTrace {
+export function createSessionSwitchTrace({
+  requestId,
+  storedSessionId
+}: SessionSwitchTraceOptions): SessionSwitchTrace {
   const startedAt = performance.now()
   const stages: Array<{ atMs: number; name: string } & TraceFields> = []
   let completed = false
+  let previousStageAt = startedAt
 
   const mark = (name: string, fields: TraceFields = {}) => {
     if (completed) {
       return
     }
 
-    stages.push({ atMs: Math.round((performance.now() - startedAt) * 10) / 10, name, ...fields })
+    const markedAt = performance.now()
+    const atMs = Math.round((markedAt - startedAt) * 10) / 10
+    const sincePreviousStageMs = Math.round((markedAt - previousStageAt) * 10) / 10
+    const stageFields = { ...fields }
+
+    delete stageFields.atMs
+    delete stageFields.durationMs
+    delete stageFields.name
+    delete stageFields.sincePreviousStageMs
+    previousStageAt = markedAt
+    stages.push({ atMs, sincePreviousStageMs, name, ...stageFields })
   }
 
   const activeTrace = { mark }
