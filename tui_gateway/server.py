@@ -5658,12 +5658,18 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"verification": {"status": "unknown", "evidence": None}})
 
 
-def _lazy_resume_info(cwd: str, *, model: str = "", provider: str = "") -> dict:
+def _lazy_resume_info(
+    cwd: str,
+    *,
+    branch: str | None = None,
+    model: str = "",
+    provider: str = "",
+) -> dict:
     """session.info for a not-yet-built session (the shape session.create
     returns). tools/skills land later when the deferred build emits session.info."""
     info = {
         "cwd": cwd,
-        "branch": _git_branch_for_cwd(cwd),
+        "branch": _git_branch_for_cwd(cwd) if branch is None else branch,
         "model": model or _resolve_model(),
         "tools": {},
         "skills": {},
@@ -5750,7 +5756,7 @@ def _claim_or_reuse_live(
 
 def _schedule_agent_build(sid: str, delay: float = 0.05) -> None:
     """Pre-warm a deferred session's agent off the response path (session.create
-    and cold resume both build through here; _sess() also builds on demand)."""
+    and deferred resume both build here; _sess() also builds on demand)."""
 
     def _run():
         with _sessions_lock:
@@ -6072,6 +6078,7 @@ def _(rid, params: dict) -> dict:
         _mark_resume_stage("message_transport")
         resume_info = _lazy_resume_info(
             cwd,
+            branch=str(found.get("git_branch") or ""),
             model=model_override.get("model") or "",
             provider=overrides.get("provider_override") or "",
         )
