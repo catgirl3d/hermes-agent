@@ -141,6 +141,10 @@ _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
 _session_resume_lock = threading.Lock()
+_agent_build_timing_lock = threading.Lock()
+_active_agent_builds: dict[str, float] = {}
+_last_agent_build_duration_ms: float | None = None
+_last_agent_build_finished_at: float | None = None
 try:
     _slash_timeout = float(os.environ.get("HERMES_TUI_SLASH_TIMEOUT_S") or "45")
 except (ValueError, TypeError):
@@ -233,6 +237,9 @@ _LONG_HANDLERS = frozenset(
         "slash.exec",
     }
 )
+_DISPATCH_QUEUED_AT_PARAM = "__hermes_dispatch_queued_at"
+_WS_RECEIVE_TO_ACK_PARAM = "__hermes_ws_receive_to_ack_ms"
+_WS_ACK_SEND_PARAM = "__hermes_ws_ack_send_ms"
 
 try:
     _rpc_pool_workers = max(
@@ -1287,6 +1294,9 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
         if method not in _LONG_HANDLERS:
             return handle_request(req)
 
+        if method == "session.resume":
+            _params[_DISPATCH_QUEUED_AT_PARAM] = time.perf_counter()
+
         # Snapshot the context so the pool worker sees the bound transport.
         ctx = contextvars.copy_context()
 
@@ -1296,6 +1306,19 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
             except Exception as exc:
                 resp = _err(req.get("id"), -32000, f"handler error: {exc}")
             if resp is not None:
+                result = resp.get("result") if isinstance(resp, dict) else None
+                timing = (
+                    result.get("backend_timing_ms")
+                    if isinstance(result, dict)
+                    else None
+                )
+                if isinstance(timing, dict):
+                    handler_finished_at = timing.pop("_handler_finished_perf", None)
+                    if isinstance(handler_finished_at, (int, float)):
+                        timing["handler_to_write"] = round(
+                            (time.perf_counter() - handler_finished_at) * 1000,
+                            2,
+                        )
                 t.write(resp)
 
         _pool.submit(lambda: ctx.run(run))
@@ -1346,11 +1369,16 @@ def _start_agent_build(sid: str, session: dict) -> None:
     key = session["session_key"]
 
     def _build() -> None:
+        global _last_agent_build_duration_ms, _last_agent_build_finished_at
         with _sessions_lock:
             current = _sessions.get(sid)
         if current is None:
             ready.set()
             return
+
+        build_started_at = time.perf_counter()
+        with _agent_build_timing_lock:
+            _active_agent_builds[sid] = build_started_at
 
         worker = None
         notify_registered = False
@@ -1474,6 +1502,14 @@ def _start_agent_build(sid: str, session: dict) -> None:
             current["agent_error"] = str(e)
             _emit("error", sid, {"message": f"agent init failed: {e}"})
         finally:
+            build_finished_at = time.perf_counter()
+            with _agent_build_timing_lock:
+                _active_agent_builds.pop(sid, None)
+                _last_agent_build_duration_ms = round(
+                    (build_finished_at - build_started_at) * 1000,
+                    2,
+                )
+                _last_agent_build_finished_at = build_finished_at
             if home_token is not None:
                 reset_hermes_home_override(home_token)
             # _attach_worker already closed the worker if this session was
@@ -1491,6 +1527,32 @@ def _start_agent_build(sid: str, session: dict) -> None:
             ready.set()
 
     threading.Thread(target=_build, daemon=True).start()
+
+
+def agent_build_timing_snapshot() -> dict[str, float]:
+    """Return process-local agent-build activity for WS latency diagnostics."""
+    now = time.perf_counter()
+    with _agent_build_timing_lock:
+        active_started_at = tuple(_active_agent_builds.values())
+        last_duration_ms = _last_agent_build_duration_ms
+        last_finished_at = _last_agent_build_finished_at
+
+    snapshot: dict[str, float] = {
+        "backend_agent_build_active_count": float(len(active_started_at)),
+    }
+    if active_started_at:
+        snapshot["backend_agent_build_active_max_elapsed_ms"] = round(
+            max(now - started_at for started_at in active_started_at) * 1000,
+            2,
+        )
+    if last_duration_ms is not None:
+        snapshot["backend_agent_build_last_duration_ms"] = last_duration_ms
+    if last_finished_at is not None:
+        snapshot["backend_agent_build_last_finished_ago_ms"] = round(
+            max(0.0, now - last_finished_at) * 1000,
+            2,
+        )
+    return snapshot
 
 
 def _sess_nowait(params, rid):
@@ -5683,6 +5745,8 @@ def _schedule_agent_build(sid: str, delay: float = 0.05) -> None:
     timer.start()
 
 
+
+
 def _cancel_scheduled_agent_build(session: dict) -> None:
     """Cancel a deferred pre-warm that no longer owns this session record."""
     timer = session.pop("agent_build_timer", None)
@@ -5703,6 +5767,42 @@ def _resume_histories(db, session_id: str) -> tuple[list, list]:
 
 @method("session.resume")
 def _(rid, params: dict) -> dict:
+    dispatch_queued_at = params.pop(_DISPATCH_QUEUED_AT_PARAM, None)
+    ws_receive_to_ack_ms = params.pop(_WS_RECEIVE_TO_ACK_PARAM, None)
+    ws_ack_send_ms = params.pop(_WS_ACK_SEND_PARAM, None)
+    resume_started_at = time.perf_counter()
+    resume_stage_started_at = resume_started_at
+    resume_timing_ms: dict[str, float] = {
+        "schema_version": 11.0,
+    }
+    if isinstance(dispatch_queued_at, (int, float)):
+        resume_timing_ms["dispatch_queue"] = round(
+            (resume_started_at - dispatch_queued_at) * 1000, 2
+        )
+    if isinstance(ws_receive_to_ack_ms, (int, float)):
+        resume_timing_ms["ws_receive_to_ack"] = round(ws_receive_to_ack_ms, 2)
+    if isinstance(ws_ack_send_ms, (int, float)):
+        resume_timing_ms["ws_ack_send"] = round(ws_ack_send_ms, 2)
+
+    def _mark_resume_stage(name: str) -> None:
+        nonlocal resume_stage_started_at
+        now = time.perf_counter()
+        resume_timing_ms[name] = round((now - resume_stage_started_at) * 1000, 2)
+        resume_stage_started_at = now
+
+    def _finish_resume_timing() -> dict[str, float | str]:
+        handler_finished_at = time.perf_counter()
+        resume_timing_ms["handler_total"] = round(
+            (handler_finished_at - resume_started_at) * 1000, 2
+        )
+        resume_timing_ms["_handler_finished_perf"] = handler_finished_at
+        return resume_timing_ms
+
+    def _ok_resume(payload: dict) -> dict:
+        result = dict(payload)
+        result["backend_timing_ms"] = _finish_resume_timing()
+        return _ok(rid, result)
+
     target = params.get("session_id", "")
     if not target:
         return _err(rid, 4006, "session_id required")
@@ -5723,6 +5823,7 @@ def _(rid, params: dict) -> dict:
         db = SessionDB(db_path=profile_home / "state.db")
     else:
         db = _get_db()
+    _mark_resume_stage("db_open")
     if db is None:
         return _db_unavailable_error(rid, code=5000)
 
@@ -5746,6 +5847,7 @@ def _(rid, params: dict) -> dict:
             found = {}
         else:
             return _err(rid, 4007, "session not found")
+    _mark_resume_stage("session_lookup")
 
     # Follow the compression-continuation chain to the live tip so a resume on
     # a rotated-out parent id binds to the descendant that actually holds the
@@ -5766,6 +5868,7 @@ def _(rid, params: dict) -> dict:
         if tip and tip != target:
             target = tip
             found = db.get_session(target) or found
+    _mark_resume_stage("tip_resolve")
 
     profile_resume_cwd = str(found.get("cwd") or "").strip() or _profile_configured_cwd(
         profile_home
@@ -5791,8 +5894,9 @@ def _(rid, params: dict) -> dict:
     # Fast path: if the session is already live, reuse it under the lock.
     with _session_resume_lock:
         live = _find_live_session_by_key(target)
-        if live is not None:
-            return _ok(rid, _reuse_live_payload(*live))
+    _mark_resume_stage("live_lookup")
+    if live is not None:
+        return _ok_resume(_reuse_live_payload(*live))
 
     # Lazy/watch resume: register the live session WITHOUT building an agent.
     # Used by the desktop's subagent windows — the child runs inside the
@@ -5807,6 +5911,7 @@ def _(rid, params: dict) -> dict:
         lease, limit_message = _claim_active_session_slot(
             target, live_session_id=sid, surface=source
         )
+        _mark_resume_stage("slot_claim")
         if limit_message is not None:
             return _err(rid, 4090, limit_message)
         try:
@@ -5814,6 +5919,7 @@ def _(rid, params: dict) -> dict:
             # The child's OWN conversation only — include_ancestors would prepend
             # the parent's transcript onto the subagent's branch.
             history = db.get_messages_as_conversation(target)
+            _mark_resume_stage("history_read")
         except Exception as e:
             if lease is not None:
                 lease.release()
@@ -5830,27 +5936,32 @@ def _(rid, params: dict) -> dict:
             profile_home=profile_home,
             lazy=True,
         )
+        _mark_resume_stage("record_prepare")
         if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
-            return _ok(rid, _reuse_live_payload(*live))
+            _mark_resume_stage("live_register")
+            return _ok_resume(_reuse_live_payload(*live))
+        _mark_resume_stage("live_register")
         _schedule_session_cap_enforcement()  # watch sessions are also live records
         # A delegated child mid-run emits no session events of its own — report
         # its liveness from the relay registry so the window shows a busy turn.
         child_running = _child_run_active(target)
         messages = _history_to_messages(history)
-        return _ok(
-            rid,
+        _mark_resume_stage("message_transport")
+        resume_info = _lazy_resume_info(cwd)
+        _mark_resume_stage("resume_info")
+        return _ok_resume(
             {
                 "session_id": sid,
                 "resumed": target,
                 "message_count": len(messages),
                 "messages": messages,
-                "info": _lazy_resume_info(cwd),
+                "info": resume_info,
                 "inflight": None,
                 "running": child_running,
                 "session_key": target,
                 "started_at": record["created_at"],
                 "status": "streaming" if child_running else "idle",
-            },
+            }
         )
 
     # Cold resume default: register the live session and read its stored
@@ -5872,14 +5983,18 @@ def _(rid, params: dict) -> dict:
         lease, limit_message = _claim_active_session_slot(
             target, live_session_id=sid, surface=source
         )
+        _mark_resume_stage("slot_claim")
         if limit_message is not None:
             return _err(rid, 4090, limit_message)
         # Interactive resume routes approvals/clarify through gateway prompts;
         # the deferred build wires the remaining per-session callbacks.
         _enable_gateway_prompts()
+        _mark_resume_stage("prompt_setup")
         try:
             db.reopen_session(target)
+            _mark_resume_stage("reopen")
             raw_history, display_history = _resume_histories(db, target)
+            _mark_resume_stage("history_read")
         except Exception as e:
             if lease is not None:
                 lease.release()
@@ -5908,31 +6023,36 @@ def _(rid, params: dict) -> dict:
             model_override=overrides.get("model_override"),
             resume_runtime_overrides=overrides or None,
         )
+        _mark_resume_stage("record_prepare")
         if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
-            return _ok(rid, _reuse_live_payload(*live))
+            _mark_resume_stage("live_register")
+            return _ok_resume(_reuse_live_payload(*live))
+        _mark_resume_stage("live_register")
 
         _schedule_agent_build(sid)
         _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
 
         messages = _history_to_messages(display_history)
-        return _ok(
-            rid,
+        _mark_resume_stage("message_transport")
+        resume_info = _lazy_resume_info(
+            cwd,
+            model=model_override.get("model") or "",
+            provider=overrides.get("provider_override") or "",
+        )
+        _mark_resume_stage("resume_info")
+        return _ok_resume(
             {
                 "session_id": sid,
                 "resumed": target,
                 "message_count": len(messages),
                 "messages": messages,
-                "info": _lazy_resume_info(
-                    cwd,
-                    model=model_override.get("model") or "",
-                    provider=overrides.get("provider_override") or "",
-                ),
+                "info": resume_info,
                 "inflight": None,
                 "running": False,
                 "session_key": target,
                 "started_at": record["created_at"],
                 "status": "idle",
-            },
+            }
         )
 
     # Build the agent OUTSIDE the lock — _make_agent can block for seconds
@@ -5944,15 +6064,19 @@ def _(rid, params: dict) -> dict:
     lease, limit_message = _claim_active_session_slot(
         target, live_session_id=sid, surface=source
     )
+    _mark_resume_stage("slot_claim")
     if limit_message is not None:
         return _err(rid, 4090, limit_message)
     _enable_gateway_prompts()
+    _mark_resume_stage("prompt_setup")
     home_token = (
         set_hermes_home_override(str(profile_home)) if profile_home is not None else None
     )
     try:
         db.reopen_session(target)
+        _mark_resume_stage("reopen")
         raw_history, display_history = _resume_histories(db, target)
+        _mark_resume_stage("history_read")
         # The display transcript keeps every row so the user still sees their
         # full history.  The model-fed history is sanitized: a session whose
         # last turn died mid-tool-loop persists a dangling assistant(tool_calls)
@@ -5965,6 +6089,7 @@ def _(rid, params: dict) -> dict:
         ]
         history = sanitize_replay_history(raw_history)
         messages = _history_to_messages(display_history)
+        _mark_resume_stage("message_transport")
         tokens = _set_session_context(target)
         try:
             # Pass the profile's db so the agent persists turns to the right
@@ -5981,6 +6106,7 @@ def _(rid, params: dict) -> dict:
                 platform_override=source,
                 **stored_runtime_overrides,
             )
+            _mark_resume_stage("agent_build")
         finally:
             _clear_session_context(tokens)
     except Exception as e:
@@ -5996,6 +6122,7 @@ def _(rid, params: dict) -> dict:
     # discard our just-built agent and reuse theirs (no worker/poller wired yet).
     with _session_resume_lock:
         live = _find_live_session_by_key(target)
+        _mark_resume_stage("live_register")
         if live is not None:
             try:
                 if hasattr(agent, "close"):
@@ -6013,7 +6140,7 @@ def _(rid, params: dict) -> dict:
                 transport=current_transport() or _stdio_transport,
             )
             payload["resumed"] = target
-            return _ok(rid, payload)
+            return _ok_resume(payload)
         try:
             init_home_token = (
                 set_hermes_home_override(str(profile_home))
@@ -6046,26 +6173,28 @@ def _(rid, params: dict) -> dict:
                 if profile_home is not None:
                     _sessions[sid]["profile_home"] = str(profile_home)
                 _sessions[sid]["active_session_lease"] = lease
+            _mark_resume_stage("session_init")
         except Exception as e:
             if lease is not None:
                 lease.release()
             return _err(rid, 5000, f"resume failed: {e}")
         session = _sessions.get(sid) or {}
     _schedule_session_cap_enforcement()  # keep eager resume consistent with deferred
-    return _ok(
-        rid,
+    resume_info = _session_info(agent, session)
+    _mark_resume_stage("resume_info")
+    return _ok_resume(
         {
             "session_id": sid,
             "resumed": target,
             "message_count": len(messages),
             "messages": messages,
-            "info": _session_info(agent, session),
+            "info": resume_info,
             "inflight": None,
             "running": False,
             "session_key": target,
             "started_at": float(session.get("created_at") or time.time()),
             "status": "idle",
-        },
+        }
     )
 
 

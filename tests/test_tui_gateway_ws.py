@@ -1,4 +1,5 @@
 import asyncio
+import json
 import threading
 import time
 
@@ -40,6 +41,81 @@ def test_ws_startup_starts_background_mcp_discovery(monkeypatch):
         server._sessions.clear()
 
     assert calls == [{"logger": ws_mod._log, "thread_name": "tui-ws-mcp-discovery"}]
+
+
+def test_ws_long_handler_skips_default_executor_hop(monkeypatch):
+    dispatch_threads = []
+    dispatched_requests = []
+    receive_count = 0
+    sent = []
+
+    monkeypatch.setattr(
+        mcp_startup,
+        "start_background_mcp_discovery",
+        lambda **_kwargs: None,
+    )
+
+    def fake_dispatch(req, _transport):
+        dispatch_threads.append(threading.get_ident())
+        dispatched_requests.append(req)
+        return None
+
+    monkeypatch.setattr(server, "dispatch", fake_dispatch)
+    monkeypatch.setattr(
+        server,
+        "agent_build_timing_snapshot",
+        lambda: {
+            "backend_agent_build_active_count": 1.0,
+            "backend_agent_build_active_max_elapsed_ms": 412.5,
+        },
+    )
+
+    class FakeWS:
+        async def accept(self):
+            pass
+
+        async def send_text(self, line):
+            sent.append(json.loads(line))
+
+        async def receive_text(self):
+            nonlocal receive_count
+            receive_count += 1
+            if receive_count == 1:
+                return json.dumps(
+                    {
+                        "id": "resume",
+                        "method": "session.resume",
+                        "params": {"_transport_timing": True},
+                    }
+                )
+            raise ws_mod._WebSocketDisconnect()
+
+        async def close(self):
+            pass
+
+    async def run():
+        loop_thread = threading.get_ident()
+        await ws_mod.handle_ws(FakeWS())
+        return loop_thread
+
+    loop_thread = asyncio.run(run())
+
+    assert dispatch_threads == [loop_thread]
+    timing_params = dispatched_requests[0]["params"]
+    assert timing_params[server._WS_RECEIVE_TO_ACK_PARAM] >= 0
+    assert timing_params[server._WS_ACK_SEND_PARAM] >= 0
+    assert sent[1] == {
+        "jsonrpc": "2.0",
+        "method": "event",
+        "params": {
+            "type": "gateway.request_received",
+            "payload": {
+                "request_id": "resume",
+                "backend_agent_build_active_count": 1.0,
+                "backend_agent_build_active_max_elapsed_ms": 412.5,
+            },
+        },
+    }
 
 
 def _run_disconnect(monkeypatch, seed):
@@ -158,6 +234,91 @@ def test_ws_write_loop_stall_does_not_latch_transport(monkeypatch):
             time.sleep(0.01)
         assert len(sent) == 2
         assert transport._closed is False
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=2)
+        loop.close()
+
+
+def test_ws_timed_response_reports_event_loop_queue():
+    sent = []
+
+    class FakeWS:
+        async def send_text(self, line):
+            await asyncio.sleep(0.01)
+            sent.append(json.loads(line))
+
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    try:
+        transport = ws_mod.WSTransport(FakeWS(), loop, peer="timing-test")
+        response = {
+            "id": "resume",
+            "result": {
+                "backend_timing_ms": {"handler_total": 1.0},
+                "messages": [ws_mod._JSON_SERIALIZE_TIMING_MARKER],
+                "resumed": "stored",
+                "session_id": "runtime",
+            },
+        }
+
+        assert transport.write(response) is True
+        deadline = time.time() + 1
+        while len(sent) < 2 and time.time() < deadline:
+            time.sleep(0.01)
+        response_timing = sent[0]["result"]["backend_timing_ms"]
+        transport_event = sent[1]["params"]
+
+        assert response_timing["event_loop_queue"] >= 0
+        assert response_timing["json_serialize"] >= 0
+        assert sent[0]["result"]["messages"] == [
+            ws_mod._JSON_SERIALIZE_TIMING_MARKER
+        ]
+        assert transport_event["type"] == "gateway.transport_timing"
+        assert transport_event["session_id"] == "runtime"
+        assert transport_event["payload"]["stored_session_id"] == "stored"
+        assert transport_event["payload"]["prefix_frame_count"] == 0
+        assert transport_event["payload"]["response_send_ms"] >= 5
+        assert transport_event["payload"]["send_total_ms"] >= 5
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=2)
+        loop.close()
+
+
+def test_ws_timed_response_still_succeeds_when_transport_timing_event_fails():
+    sent = []
+    send_count = 0
+
+    class FakeWS:
+        async def send_text(self, line):
+            nonlocal send_count
+            send_count += 1
+            if send_count == 1:
+                sent.append(json.loads(line))
+                return
+            raise RuntimeError("transport timing event failed")
+
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    try:
+        transport = ws_mod.WSTransport(FakeWS(), loop, peer="timing-fail-test")
+        response = {
+            "id": "resume",
+            "result": {
+                "backend_timing_ms": {"handler_total": 1.0},
+                "messages": [],
+                "resumed": "stored",
+                "session_id": "runtime",
+            },
+        }
+
+        assert transport.write(response) is True
+        assert send_count == 2
+        assert sent[0]["id"] == "resume"
+        assert transport._closed is True
     finally:
         loop.call_soon_threadsafe(loop.stop)
         thread.join(timeout=2)
