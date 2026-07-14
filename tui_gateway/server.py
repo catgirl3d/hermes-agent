@@ -1360,9 +1360,11 @@ def _start_agent_build(sid: str, session: dict) -> None:
     lock = session.setdefault("agent_build_lock", threading.Lock())
     with lock:
         if ready.is_set() or session.get("agent_build_started"):
+            session.pop("_agent_build_trigger", None)
             return
         _cancel_scheduled_agent_build(session)
         session["agent_build_started"] = True
+        build_trigger = str(session.pop("_agent_build_trigger", "") or "unspecified")
         # An upgrading lazy session is now genuinely mid-construction — restore
         # its "still starting" eviction exemption.
         session.pop("lazy", None)
@@ -1376,6 +1378,15 @@ def _start_agent_build(sid: str, session: dict) -> None:
             ready.set()
             return
 
+        _emit(
+            "agent.build_timing",
+            sid,
+            {
+                "phase": "started",
+                "trigger": build_trigger,
+                "stored_session_id": str(current.get("session_key") or ""),
+            },
+        )
         build_started_at = time.perf_counter()
         with _agent_build_timing_lock:
             _active_agent_builds[sid] = build_started_at
@@ -1383,6 +1394,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
         worker = None
         notify_registered = False
         home_token = None
+        build_error_type = None
         profile_home = current.get("profile_home")
         try:
             tokens = _set_session_context(key)
@@ -1499,16 +1511,18 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # _schedule_mcp_late_refresh. Cache-safe (pre-first-turn only).
             _schedule_mcp_late_refresh(sid, agent)
         except Exception as e:
+            build_error_type = type(e).__name__
             current["agent_error"] = str(e)
             _emit("error", sid, {"message": f"agent init failed: {e}"})
         finally:
             build_finished_at = time.perf_counter()
+            build_duration_ms = round(
+                (build_finished_at - build_started_at) * 1000,
+                2,
+            )
             with _agent_build_timing_lock:
                 _active_agent_builds.pop(sid, None)
-                _last_agent_build_duration_ms = round(
-                    (build_finished_at - build_started_at) * 1000,
-                    2,
-                )
+                _last_agent_build_duration_ms = build_duration_ms
                 _last_agent_build_finished_at = build_finished_at
             if home_token is not None:
                 reset_hermes_home_override(home_token)
@@ -1525,6 +1539,19 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 except Exception:
                     pass
             ready.set()
+            if not replaced:
+                _emit(
+                    "agent.build_timing",
+                    sid,
+                    {
+                        "phase": "finished",
+                        "trigger": build_trigger,
+                        "duration_ms": build_duration_ms,
+                        "success": build_error_type is None and current.get("agent") is not None,
+                        "error_type": build_error_type,
+                        "stored_session_id": str(current.get("session_key") or ""),
+                    },
+                )
 
     threading.Thread(target=_build, daemon=True).start()
 
@@ -1564,6 +1591,7 @@ def _sess(params, rid):
     s, err = _sess_nowait(params, rid)
     if err:
         return (None, err)
+    s["_agent_build_trigger"] = "rpc_demand"
     _start_agent_build(params.get("session_id") or "", s)
     return (s, _wait_agent(s, rid))
 
@@ -5732,6 +5760,7 @@ def _schedule_agent_build(sid: str, delay: float = 0.05) -> None:
             if session is None or session.get("agent_build_timer") is not timer:
                 return
             session.pop("agent_build_timer", None)
+            session["_agent_build_trigger"] = "session_create"
         _start_agent_build(sid, session)
 
     timer = threading.Timer(delay, _run)
@@ -8921,6 +8950,7 @@ def _(rid, params: dict) -> dict:
     # A branch becomes real here: copy its parent's transcript into the row so it
     # resumes with full context (the agent won't persist the seed itself).
     _persist_branch_seed(session)
+    session["_agent_build_trigger"] = "prompt_submit"
     _start_agent_build(sid, session)
 
     def run_after_agent_ready() -> None:
@@ -10723,6 +10753,7 @@ def _(rid, params: dict) -> dict:
                 _model_input, explicit_provider, _persist_global, _force_refresh, _is_session = parsed_flags
                 if session.get("agent") is None and not explicit_provider.strip():
                     session_id = params.get("session_id", "")
+                    session["_agent_build_trigger"] = "model_switch"
                     _start_agent_build(session_id, session)
                     init_err = _wait_agent(session, rid)
                     if init_err:
