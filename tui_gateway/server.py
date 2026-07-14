@@ -12017,7 +12017,7 @@ def _session_processes(session: dict) -> list:
 @method("process.list")
 def _(rid, params: dict) -> dict:
     """Session-scoped view of the background process registry (desktop status stack)."""
-    session, err = _sess(params, rid)
+    session, err = _sess_nowait(params, rid)
     if err:
         return err
     try:
@@ -12030,7 +12030,7 @@ def _(rid, params: dict) -> dict:
 def _(rid, params: dict) -> dict:
     """Kill ONE background process — scoped to the caller's session so one
     window can't reap another session's work (unlike process.stop's kill_all)."""
-    session, err = _sess(params, rid)
+    session, err = _sess_nowait(params, rid)
     if err:
         return err
     proc_id = str(params.get("process_id") or "")
