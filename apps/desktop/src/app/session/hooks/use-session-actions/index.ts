@@ -582,10 +582,13 @@ export function useSessionActions({
         // It is the single successful resume read; REST remains a failure-only
         // fallback so normal session switches do not contend on SQLite.
         trace.mark('resume-rpc-start')
+        const resumeRpcStartedAt = performance.now()
+
         const resumed = await requestGateway<SessionResumeResponse>('session.resume', {
           session_id: storedSessionId,
           cols: 96,
           source: 'desktop',
+          _transport_timing: true,
           // Watch windows attach lazily (live mirror). Every other cold resume
           // gets the gateway's default deferred build: the RPC returns the
           // transcript immediately instead of blocking the switch on _make_agent
@@ -594,7 +597,79 @@ export function useSessionActions({
           ...(watchWindow ? { lazy: true } : {}),
           ...(sessionProfile ? { profile: sessionProfile } : {})
         })
-        trace.mark('resume-rpc-finished', { messageCount: resumed.messages.length })
+
+        const resumeRpcDurationMs = Math.round((performance.now() - resumeRpcStartedAt) * 10) / 10
+        const backendTiming = resumed.backend_timing_ms
+        const backendHandlerMs = backendTiming?.handler_total
+        const backendDispatchQueueMs = backendTiming?.dispatch_queue
+        const backendEventLoopQueueMs = backendTiming?.event_loop_queue
+        const backendHandlerToWriteMs = backendTiming?.handler_to_write
+        const clientJsonParseMs = backendTiming?.client_json_parse
+        const backendJsonSerializeMs = backendTiming?.json_serialize
+
+        const outsideHandlerRoundTripMs =
+          backendHandlerMs === undefined
+            ? undefined
+            : Math.round(Math.max(0, resumeRpcDurationMs - backendHandlerMs) * 10) / 10
+
+        const unmeasuredRoundTripMs =
+          outsideHandlerRoundTripMs === undefined
+            ? undefined
+            : Math.round(
+                Math.max(
+                  0,
+                  outsideHandlerRoundTripMs -
+                    (backendDispatchQueueMs ?? 0) -
+                    (backendHandlerToWriteMs ?? 0) -
+                    (backendEventLoopQueueMs ?? 0) -
+                    (backendJsonSerializeMs ?? 0) -
+                    (backendTiming?.ws_ack_send ?? 0) -
+                    (backendTiming?.ws_receive_to_ack ?? 0) -
+                    (clientJsonParseMs ?? 0) -
+                    (backendTiming?.client_message_event_queue ?? 0) -
+                    (backendTiming?.client_request_send ?? 0)
+                ) * 10
+              ) / 10
+
+        trace.mark('resume-rpc-finished', {
+          backendAgentBuildActiveCount: backendTiming?.backend_agent_build_active_count,
+          backendAgentBuildActiveMaxElapsedMs: backendTiming?.backend_agent_build_active_max_elapsed_ms,
+          backendAgentBuildLastDurationMs: backendTiming?.backend_agent_build_last_duration_ms,
+          backendAgentBuildLastFinishedAgoMs: backendTiming?.backend_agent_build_last_finished_ago_ms,
+          backendDbOpenMs: backendTiming?.db_open,
+          backendDispatchQueueMs,
+          backendEventLoopQueueMs,
+          backendHandlerMs,
+          backendHandlerToWriteMs,
+          backendHistoryReadMs: backendTiming?.history_read,
+          backendJsonSerializeMs,
+          backendLiveLookupMs: backendTiming?.live_lookup,
+          backendLiveRegisterMs: backendTiming?.live_register,
+          backendMessageTransportMs: backendTiming?.message_transport,
+          backendPromptSetupMs: backendTiming?.prompt_setup,
+          backendRecordPrepareMs: backendTiming?.record_prepare,
+          backendReopenMs: backendTiming?.reopen,
+          backendResumeInfoMs: backendTiming?.resume_info,
+          backendScheduleMs: backendTiming?.schedule,
+          backendSessionLookupMs: backendTiming?.session_lookup,
+          backendSlotClaimMs: backendTiming?.slot_claim,
+          backendTimingVersion: backendTiming?.schema_version,
+          backendTipResolveMs: backendTiming?.tip_resolve,
+          backendWsAckSendMs: backendTiming?.ws_ack_send,
+          backendWsReceiveToAckMs: backendTiming?.ws_receive_to_ack,
+          clientJsonParseMs,
+          clientMessageEventQueueMs: backendTiming?.client_message_event_queue,
+          clientReceiveAckEventQueueMs: backendTiming?.client_receive_ack_event_queue,
+          clientReceiveAckToResponseMs: backendTiming?.client_receive_ack_to_response,
+          clientRequestReceiveAckMs: backendTiming?.client_request_receive_ack,
+          clientRequestReceiveAckTransportMs: backendTiming?.client_request_receive_ack_transport,
+          clientRequestSendMs: backendTiming?.client_request_send,
+          clientResponseChars: backendTiming?.response_chars,
+          outsideHandlerRoundTripMs,
+          unmeasuredRoundTripMs,
+          messageCount: resumed.messages.length,
+          rpcDurationMs: resumeRpcDurationMs
+        })
 
         if (!isCurrentResume()) {
           trace.complete('superseded', { phase: 'resume-rpc' })

@@ -29,6 +29,7 @@ import json
 import logging
 import socket
 import threading
+import time
 from typing import Any
 
 from tui_gateway import server
@@ -40,6 +41,7 @@ _log = logging.getLogger(__name__)
 # threads from a wedged socket.
 _WS_WRITE_TIMEOUT_S = 10.0
 _WS_LOG_PAYLOAD_PREVIEW = 240
+_JSON_SERIALIZE_TIMING_MARKER = "__hermes_json_serialize_timing__"
 
 # Per-token streaming frames are coalesced: buffered and flushed as a batch on
 # a short timer instead of waking the event loop once per token. A model reply
@@ -115,12 +117,19 @@ class WSTransport:
         if self._closed:
             return False
 
-        line = json.dumps(obj, ensure_ascii=False)
-
         try:
             on_loop = asyncio.get_running_loop() is self._loop
         except RuntimeError:
             on_loop = False
+
+        result = obj.get("result") if isinstance(obj, dict) else None
+        timing = (
+            result.get("backend_timing_ms")
+            if isinstance(result, dict)
+            else None
+        )
+        timed_response = isinstance(timing, dict)
+        line = "" if timed_response else json.dumps(obj, ensure_ascii=False)
 
         # Coalesce streamed token frames: buffer this frame and arm a short
         # flush timer instead of waking the loop right now. Cheap and
@@ -144,22 +153,32 @@ class WSTransport:
         # order even if the coalesce timer fires on the loop at the same moment.
         from agent.async_utils import safe_schedule_threadsafe
         with self._token_lock:
-            self._pending_tokens.append(line)
             batch = self._pending_tokens
             self._pending_tokens = []
+            if timed_response:
+                send_coro = self._safe_send_timed_response(
+                    batch,
+                    obj,
+                    time.perf_counter(),
+                )
+            else:
+                batch.append(line)
+                send_coro = self._safe_send_many(batch)
             if on_loop:
                 # Fire-and-forget — don't block the loop waiting on itself.
-                self._loop.create_task(self._safe_send_many(batch))
+                self._loop.create_task(send_coro)
                 return True
             fut = safe_schedule_threadsafe(
-                self._safe_send_many(batch), self._loop
+                send_coro, self._loop
             )
             if fut is None:
                 self._closed = True
                 return False
 
         try:
-            fut.result(timeout=_WS_WRITE_TIMEOUT_S)
+            write_result = fut.result(timeout=_WS_WRITE_TIMEOUT_S)
+            if timed_response:
+                return bool(write_result)
             return not self._closed
         except concurrent.futures.TimeoutError:  # builtin TimeoutError on 3.11+
             # The event loop is stalled (GIL-heavy agent turn, delegation
@@ -181,6 +200,102 @@ class WSTransport:
                 self._peer, type(exc).__name__, exc,
             )
             return False
+
+    async def _safe_send_timed_response(
+        self,
+        prefix: list[str],
+        obj: dict,
+        scheduled_at: float,
+    ) -> bool:
+        result = obj.get("result") if isinstance(obj, dict) else None
+        timing = (
+            result.get("backend_timing_ms")
+            if isinstance(result, dict)
+            else None
+        )
+        if isinstance(timing, dict):
+            timing["event_loop_queue"] = round(
+                (time.perf_counter() - scheduled_at) * 1000,
+                2,
+            )
+
+        # The serialization duration has to travel in the response it measures.
+        # A unique placeholder lets us encode once, then replace only that JSON
+        # value without paying for (and measuring) a second full serialization.
+        if isinstance(timing, dict):
+            timing["json_serialize"] = _JSON_SERIALIZE_TIMING_MARKER
+        serialize_started_at = time.perf_counter()
+        line = json.dumps(obj, ensure_ascii=False)
+        json_serialize_ms = round(
+            (time.perf_counter() - serialize_started_at) * 1000,
+            2,
+        )
+        if isinstance(timing, dict):
+            placeholder = (
+                f'{json.dumps("json_serialize")}: '
+                f'{json.dumps(_JSON_SERIALIZE_TIMING_MARKER)}'
+            )
+            line = line.replace(
+                placeholder,
+                f'{json.dumps("json_serialize")}: {json_serialize_ms}',
+                1,
+            )
+            timing["json_serialize"] = json_serialize_ms
+
+        send_started_at = time.perf_counter()
+        prefix_send_ms = 0.0
+        prefix_frame_count = len(prefix)
+        if prefix:
+            prefix_started_at = time.perf_counter()
+            await self._safe_send_many(prefix)
+            prefix_send_ms = round(
+                (time.perf_counter() - prefix_started_at) * 1000,
+                2,
+            )
+            if self._closed:
+                return False
+
+        response_send_started_at = time.perf_counter()
+        await self._safe_send(line)
+        response_send_ms = round(
+            (time.perf_counter() - response_send_started_at) * 1000,
+            2,
+        )
+        send_total_ms = round(
+            (time.perf_counter() - send_started_at) * 1000,
+            2,
+        )
+        if self._closed:
+            return False
+
+        # send_text duration is only knowable after the response has left this
+        # coroutine. Report it in the immediately-following event rather than
+        # delaying or falsifying the response timing payload.
+        transport_event = {
+            "jsonrpc": "2.0",
+            "method": "event",
+            "params": {
+                "type": "gateway.transport_timing",
+                "session_id": (
+                    result.get("session_id") if isinstance(result, dict) else None
+                ),
+                "payload": {
+                    "request_id": obj.get("id"),
+                    "stored_session_id": (
+                        result.get("resumed") if isinstance(result, dict) else None
+                    ),
+                    "json_serialize_ms": json_serialize_ms,
+                    "prefix_frame_count": prefix_frame_count,
+                    "prefix_send_ms": prefix_send_ms,
+                    "response_send_ms": response_send_ms,
+                    "send_total_ms": send_total_ms,
+                },
+            },
+        }
+        await self._safe_send(json.dumps(transport_event, ensure_ascii=False))
+        # The response already reached the client. A telemetry-send failure must
+        # not retroactively fail the write or suppress post-write housekeeping.
+        return True
 
     def _arm_token_flush(self) -> None:
         """Arm the coalesce timer. Runs on the loop thread (call_soon_threadsafe)."""
@@ -335,6 +450,7 @@ async def handle_ws(ws: Any) -> None:
         while True:
             try:
                 raw = await ws.receive_text()
+                received_at = time.perf_counter()
             except _WebSocketDisconnect as exc:
                 disconnect_reason = (
                     "client_disconnect("
@@ -384,8 +500,46 @@ async def handle_ws(ws: Any) -> None:
             # response dict, which we write here from the loop.
             req_id = req.get("id") if isinstance(req, dict) else None
             req_method = req.get("method") if isinstance(req, dict) else None
+            req_params = req.get("params") if isinstance(req, dict) else None
             try:
-                resp = await asyncio.to_thread(server.dispatch, req, transport)
+                if (
+                    req_method == "session.resume"
+                    and isinstance(req_params, dict)
+                    and req_params.get("_transport_timing") is True
+                ):
+                    ack_started_at = time.perf_counter()
+                    req_params[server._WS_RECEIVE_TO_ACK_PARAM] = (
+                        ack_started_at - received_at
+                    ) * 1000
+                    ack_ok = await transport.write_async(
+                        {
+                            "jsonrpc": "2.0",
+                            "method": "event",
+                            "params": {
+                                "type": "gateway.request_received",
+                                "payload": {
+                                    "request_id": req_id,
+                                    **server.agent_build_timing_snapshot(),
+                                },
+                            },
+                        }
+                    )
+                    req_params[server._WS_ACK_SEND_PARAM] = (
+                        time.perf_counter() - ack_started_at
+                    ) * 1000
+                    if not ack_ok:
+                        disconnect_reason = "send_failed_after_request_received"
+                        send_failures += 1
+                        break
+
+                if req_method in server._LONG_HANDLERS:
+                    # dispatch() only snapshots context and submits these methods
+                    # to its own pool. Sending that tiny operation through the
+                    # asyncio default executor first creates a redundant second
+                    # queue and delays already-complete RPC responses.
+                    resp = server.dispatch(req, transport)
+                else:
+                    resp = await asyncio.to_thread(server.dispatch, req, transport)
             except Exception:
                 dispatch_crashes += 1
                 _log.exception(

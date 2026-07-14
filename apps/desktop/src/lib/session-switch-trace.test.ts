@@ -3,7 +3,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   createSessionSwitchTrace,
   markActiveSessionSwitchTrace,
-  measureActiveSessionSwitchTrace
+  measureActiveSessionSwitchTrace,
+  recordSessionSwitchTransportTiming
 } from './session-switch-trace'
 
 describe('session switch trace', () => {
@@ -43,7 +44,41 @@ describe('session switch trace', () => {
     expect(info).toHaveBeenCalledWith(
       expect.objectContaining({
         stages: expect.arrayContaining([
-          expect.objectContaining({ messageCount: 14, name: 'react-layout-commit', sincePreviousStageMs: expect.any(Number) })
+          expect.objectContaining({
+            messageCount: 14,
+            name: 'react-layout-commit',
+            sincePreviousStageMs: expect.any(Number)
+          })
+        ])
+      })
+    )
+  })
+
+  it('records exact post-response WebSocket send timing', () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined)
+    const trace = createSessionSwitchTrace({ requestId: 11, storedSessionId: 'stored-session-transport' })
+
+    recordSessionSwitchTransportTiming({
+      stored_session_id: 'stored-session-transport',
+      json_serialize_ms: 0.7,
+      prefix_frame_count: 2,
+      prefix_send_ms: 1.2,
+      response_send_ms: 3.4,
+      send_total_ms: 4.6
+    })
+    trace.complete('cold-resumed')
+
+    expect(info).toHaveBeenCalledWith(
+      expect.objectContaining({
+        stages: expect.arrayContaining([
+          expect.objectContaining({
+            backendJsonSerializeMs: 0.7,
+            backendPrefixFrameCount: 2,
+            backendPrefixSendMs: 1.2,
+            backendResponseSendMs: 3.4,
+            backendSendTotalMs: 4.6,
+            name: 'resume-response-sent'
+          })
         ])
       })
     )
