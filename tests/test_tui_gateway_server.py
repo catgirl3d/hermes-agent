@@ -1371,6 +1371,36 @@ def test_prompt_submit_starts_deferred_agent_build(monkeypatch):
     assert session["_agent_build_trigger"] == "prompt_submit"
 
 
+def test_process_status_rpcs_do_not_start_deferred_agent_build(monkeypatch):
+    sid = "runtime-process-status"
+    session = {
+        "agent": None,
+        "agent_ready": threading.Event(),
+        "session_key": "stored-process-status",
+    }
+    server._sessions[sid] = session
+    monkeypatch.setattr(
+        server,
+        "_start_agent_build",
+        lambda *_args, **_kwargs: pytest.fail("process status RPC must not build agent"),
+    )
+    monkeypatch.setattr(server, "_session_processes", lambda target: [])
+
+    try:
+        listed = server.handle_request(
+            {"id": "list", "method": "process.list", "params": {"session_id": sid}}
+        )
+        killed = server.handle_request(
+            {"id": "kill", "method": "process.kill", "params": {"session_id": sid}}
+        )
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert listed["result"] == {"processes": []}
+    assert killed["error"]["code"] == 4012
+    assert session.get("agent_build_started") is None
+
+
 def test_session_resume_follows_compression_tip(monkeypatch, tmp_path):
     """Resuming a rotated-out parent id must load the continuation's messages.
 
