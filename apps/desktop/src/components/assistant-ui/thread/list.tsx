@@ -28,6 +28,7 @@ import {
 import { isSecondaryWindow } from '@/store/windows'
 
 import { MessageRenderBoundary } from '../message-render-boundary'
+import { firstVisibleGroupIndex } from './render-window'
 
 type ThreadMessageComponents = ComponentProps<typeof ThreadPrimitive.MessageByIndex>['components']
 
@@ -36,14 +37,11 @@ type MessageGroup = { id: string; weight: number } & (
   | { indices: number[]; kind: 'turn' }
 )
 
-// DOM is bounded by a rendered-PART budget, not a message/turn count: a single
-// assistant message folds every tool call into a part, so heavy sessions are
-// ~40 turns / ~100 messages but ~1000 parts — and parts are what drive node
-// count. "Show earlier" prepends another page; whole turns stay intact so the
-// sticky human bubble never loses its turn. This is the long-session perf lever
-// WITHOUT a virtualizer — pure rendering, never touches scrollTop, so it can't
-// fight use-stick-to-bottom (the single scroll owner).
-const RENDER_BUDGET = 300
+// Bound the first mount by both turns and rendered parts. Turns cap the number
+// of markdown/tool subtrees React commits before first paint, while parts still
+// protect against a single unusually tool-heavy turn.
+const TURN_RENDER_BATCH = 1
+const PART_RENDER_BUDGET = 300
 
 interface ThreadMessageListProps {
   clampToComposer: boolean
@@ -121,23 +119,20 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
     resize: 'instant'
   })
 
-  const [renderBudget, setRenderBudget] = useState(RENDER_BUDGET)
-
-  // Walk turns newest-first, summing their part weights until the budget is met;
-  // everything before that first kept turn is hidden.
-  let firstVisible = groups.length
-
-  for (let i = groups.length - 1, weight = 0; i >= 0; i--) {
-    weight += groups[i].weight
-    firstVisible = i
-
-    if (weight >= renderBudget) {
-      break
-    }
-  }
+  const [renderBudget, setRenderBudget] = useState(PART_RENDER_BUDGET)
+  const [visibleTurnLimit, setVisibleTurnLimit] = useState(TURN_RENDER_BATCH)
+  const renderWindowSessionKeyRef = useRef(sessionKey)
+  const sessionWindowChanged = renderWindowSessionKeyRef.current !== sessionKey
+  const effectiveRenderBudget = sessionWindowChanged ? PART_RENDER_BUDGET : renderBudget
+  const effectiveTurnLimit = sessionWindowChanged ? TURN_RENDER_BATCH : visibleTurnLimit
+  const firstVisible = firstVisibleGroupIndex(groups, effectiveTurnLimit, effectiveRenderBudget)
 
   const hiddenCount = firstVisible
   const visibleGroups = hiddenCount > 0 ? groups.slice(hiddenCount) : groups
+  const mountedMessageCount = visibleGroups.reduce(
+    (count, group) => count + (group.kind === 'turn' ? group.indices.length : 1),
+    0
+  )
   const restoreFromBottomRef = useRef<number | null>(null)
   // Secondary windows (new-session scratch, subagent watch, cmd-click pop-out)
   // hide the titlebar tool cluster + session header, but the OS traffic lights
@@ -163,12 +158,13 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
         groupCount: groups.length,
         hiddenGroupCount: hiddenCount,
         phase,
-        renderBudget,
+        renderBudget: effectiveRenderBudget,
         renderEmpty,
+        visibleTurnLimit: effectiveTurnLimit,
         visibleGroupCount: visibleGroups.length
       })
     },
-    [groups.length, hiddenCount, renderBudget, renderEmpty, traceSessionId, visibleGroups.length]
+    [effectiveRenderBudget, effectiveTurnLimit, groups.length, hiddenCount, renderEmpty, traceSessionId, visibleGroups.length]
   )
 
   useEffect(() => setThreadAtBottom(isAtBottom), [isAtBottom])
@@ -198,6 +194,16 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   useEffect(() => onThreadEditOpen(beginEditHold), [beginEditHold])
   useEffect(() => onThreadEditClose(endEditHold), [endEditHold])
   useEffect(() => () => endEditHold(), [endEditHold])
+
+  useLayoutEffect(() => {
+    markActiveSessionSwitchTrace(traceSessionId, 'thread-message-list-layout-commit', {
+      groupCount: groups.length,
+      hiddenGroupCount: hiddenCount,
+      mountedMessageCount,
+      visibleGroupCount: visibleGroups.length
+    })
+  }, [groups.length, hiddenCount, mountedMessageCount, traceSessionId, visibleGroups.length])
+
   // New run → snap to the latest turn.
   useAuiEvent('thread.runStart', () => void scrollToBottom())
 
@@ -208,7 +214,9 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   // Instead: quiet it, glue to the true bottom until the height holds steady,
   // then hand back locked. Live streaming afterward uses the normal resize follow.
   useLayoutEffect(() => {
-    setRenderBudget(RENDER_BUDGET)
+    renderWindowSessionKeyRef.current = sessionKey
+    setRenderBudget(PART_RENDER_BUDGET)
+    setVisibleTurnLimit(TURN_RENDER_BATCH)
 
     const el = scrollRef.current
 
@@ -258,7 +266,8 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
     const el = scrollRef.current
 
     restoreFromBottomRef.current = el ? el.scrollHeight - el.scrollTop : null
-    setRenderBudget(budget => budget + RENDER_BUDGET)
+    setRenderBudget(budget => budget + PART_RENDER_BUDGET)
+    setVisibleTurnLimit(limit => limit + TURN_RENDER_BATCH)
   }, [scrollRef])
 
   useLayoutEffect(() => {
@@ -268,7 +277,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
       el.scrollTop = el.scrollHeight - restoreFromBottomRef.current
       restoreFromBottomRef.current = null
     }
-  }, [scrollRef, renderBudget])
+  }, [scrollRef, renderBudget, visibleTurnLimit])
 
   return (
     <div
