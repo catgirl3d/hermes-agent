@@ -718,6 +718,8 @@ export function useSessionActions({
           backendRecordPrepareMs: backendTiming?.record_prepare,
           backendReopenMs: backendTiming?.reopen,
           backendResumeInfoMs: backendTiming?.resume_info,
+          backendResumePrewarmEnabled: backendTiming?.resume_prewarm_enabled,
+          backendResumePrewarmMode: backendTiming?.resume_prewarm_mode,
           backendScheduleMs: backendTiming?.schedule,
           backendSessionLookupMs: backendTiming?.session_lookup,
           backendSlotClaimMs: backendTiming?.slot_claim,

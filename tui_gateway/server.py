@@ -5809,8 +5809,10 @@ def _(rid, params: dict) -> dict:
     ws_ack_send_ms = params.pop(_WS_ACK_SEND_PARAM, None)
     resume_started_at = time.perf_counter()
     resume_stage_started_at = resume_started_at
-    resume_timing_ms: dict[str, float] = {
+    resume_timing_ms: dict[str, float | str] = {
         "schema_version": 11.0,
+        "resume_prewarm_enabled": 0.0,
+        "resume_prewarm_mode": "on_demand",
     }
     if isinstance(dispatch_queued_at, (int, float)):
         resume_timing_ms["dispatch_queue"] = round(
