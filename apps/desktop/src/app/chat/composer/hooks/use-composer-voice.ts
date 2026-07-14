@@ -22,6 +22,7 @@ interface UseComposerVoiceArgs {
   focusInput: () => void
   insertText: (text: string) => void
   maxRecordingSeconds: number
+  onIntent: ChatBarProps['onIntent']
   onSubmit: ChatBarProps['onSubmit']
   onTranscribeAudio: ChatBarProps['onTranscribeAudio']
   sessionId: string | null | undefined
@@ -40,6 +41,7 @@ export function useComposerVoice({
   focusInput,
   insertText,
   maxRecordingSeconds,
+  onIntent,
   onSubmit,
   onTranscribeAudio,
   sessionId
@@ -118,15 +120,24 @@ export function useComposerVoice({
       setVoiceConversationActive(false)
       void conversation.end()
     } else {
+      onIntent?.('voice')
       setVoiceConversationActive(true)
     }
-  }, [conversation, disabled, voiceConversationActive])
+  }, [conversation, disabled, onIntent, voiceConversationActive])
 
   useEffect(() => onComposerVoiceToggleRequest(toggleVoiceConversation), [toggleVoiceConversation])
 
   // Explicit start/end for the on-screen conversation controls (the hotkey uses
   // the gated toggle above).
-  const startConversation = useCallback(() => setVoiceConversationActive(true), [])
+  const startConversation = useCallback(() => {
+    onIntent?.('voice')
+    setVoiceConversationActive(true)
+  }, [onIntent])
+
+  const dictateWithIntent = useCallback(() => {
+    onIntent?.('voice')
+    dictate()
+  }, [dictate, onIntent])
 
   const endConversation = useCallback(() => {
     setVoiceConversationActive(false)
@@ -149,7 +160,7 @@ export function useComposerVoice({
 
   return {
     conversation,
-    dictate,
+    dictate: dictateWithIntent,
     endConversation,
     handleToggleAutoSpeak,
     startConversation,

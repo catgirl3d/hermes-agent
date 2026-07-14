@@ -412,7 +412,7 @@ export interface SessionResumeResponse {
     reopen?: number
     resume_info?: number
     resume_prewarm_enabled?: number
-    resume_prewarm_mode?: 'on_demand'
+    resume_prewarm_mode?: 'composer_intent'
     client_json_parse?: number
     response_chars?: number
     schedule?: number

@@ -272,7 +272,7 @@ export function useComposerActions({ activeSessionId, currentCwd, requestGateway
   const copy = t.desktop
 
   const addTextToDraft = useCallback((text: string) => {
-    requestComposerInsert(text, { mode: 'block' })
+    requestComposerInsert(text, { intent: 'text', mode: 'block' })
   }, [])
 
   const addTerminalSelectionAttachment = useCallback((text: string, label = 'selection') => {
@@ -285,7 +285,7 @@ export function useComposerActions({ activeSessionId, currentCwd, requestGateway
     }
 
     setComposerTerminalSelection(normalizedLabel, trimmed)
-    requestComposerInsert(refText, { mode: 'inline' })
+    requestComposerInsert(refText, { intent: 'attachment', mode: 'inline' })
   }, [])
 
   const addContextRefAttachment = useCallback((refText: string, label?: string, detail?: string) => {
@@ -344,7 +344,7 @@ export function useComposerActions({ activeSessionId, currentCwd, requestGateway
         return false
       }
 
-      requestComposerInsertRefs([ref])
+      requestComposerInsertRefs([ref], { intent: 'attachment' })
       requestComposerFocus('main')
 
       return true
