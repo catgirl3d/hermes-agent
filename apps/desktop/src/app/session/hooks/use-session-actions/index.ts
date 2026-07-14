@@ -6,6 +6,7 @@ import { revealTreePane } from '@/components/pane-shell/tree/store'
 import { deleteSession, getSessionMessages, setSessionArchived } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
+import { createClientSessionState } from '@/lib/chat-runtime'
 import { prepareSessionSnapshot } from '@/lib/session-view-snapshot'
 import { createSessionSwitchTrace } from '@/lib/session-switch-trace'
 import { setSessionYolo } from '@/lib/yolo-session'
@@ -20,24 +21,16 @@ import {
   $currentModel,
   $currentProvider,
   $currentReasoningEffort,
-  $messages,
   $newChatWorkspaceTarget,
+  $sessionViewSnapshot,
   $sessions,
   $yoloActive,
-  publishSessionViewSnapshot,
   type NewChatWorkspaceTarget,
+  publishSessionViewSnapshot,
   sessionPinId,
-  setActiveSessionId,
-  setAwaitingResponse,
-  setBusy,
-  setCurrentBranch,
-  setCurrentCwd,
-  setCurrentCwdTransient,
-  setCurrentServiceTier,
   setCurrentUsage,
   setFreshDraftReady,
   setIntroSeed,
-  setMessages,
   setNewChatWorkspaceTarget,
   setResumeExhaustedSessionId,
   setResumeFailedSessionId,
@@ -45,8 +38,6 @@ import {
   setSessions,
   setSessionStartedAt,
   setSessionsTotal,
-  setTurnStartedAt,
-  setYoloActive
 } from '@/store/session'
 import {
   closeSessionTile,
@@ -64,11 +55,11 @@ import { NEW_CHAT_ROUTE, sessionRoute, SETTINGS_ROUTE } from '../../../routes'
 import type { ClientSessionState, SidebarNavItem } from '../../../types'
 
 import {
-  applyRuntimeInfo,
-  applyStoredSessionPreviewRuntimeInfo,
+  applyRuntimeInfoEffects,
   type BranchMessage,
   isSessionGoneError,
   patchSessionWorkspace,
+  prepareRuntimeInfo,
   reconcileResumeMessages,
   resolveStoredSession,
   sessionMatchesStoredId,
@@ -206,19 +197,42 @@ export function useSessionActions({
       const workspaceTarget = hasWorkspaceTarget
         ? normalizeNewChatWorkspaceTarget(draftOptions.workspaceTarget)
         : undefined
+      const currentSnapshot = $sessionViewSnapshot.get()
+      const draftCwd = !hasWorkspaceTarget
+        ? resolveNewSessionCwd()
+        : workspaceTarget === null
+          ? ''
+          : typeof workspaceTarget === 'string'
+            ? workspaceTarget
+            : currentSnapshot.cwd
+      const { runtimeSessionId: _runtimeSessionId, ...currentState } = currentSnapshot
+      const draftState: ClientSessionState = {
+        ...currentState,
+        storedSessionId: null,
+        messages: [],
+        branch: '',
+        cwd: draftCwd,
+        serviceTier: '',
+        yolo: false,
+        busy: false,
+        awaitingResponse: false,
+        streamId: null,
+        sawAssistantPayload: false,
+        pendingBranchGroup: null,
+        interrupted: false,
+        needsInput: false,
+        turnStartedAt: null
+      }
 
       resetViewSync()
       busyRef.current = false
-      setBusy(false)
-      setAwaitingResponse(false)
       clearNotifications()
       setIntroSeed(seed => seed + 1)
       navigate(NEW_CHAT_ROUTE, { replace: replaceRoute })
-      setActiveSessionId(null)
       activeSessionIdRef.current = null
       setSelectedStoredSessionId(null)
       selectedStoredSessionIdRef.current = null
-      setMessages([])
+      publishSessionViewSnapshot(prepareSessionSnapshot(null, draftState))
       setCurrentUsage({
         calls: 0,
         input: 0,
@@ -226,28 +240,13 @@ export function useSessionActions({
         total: 0
       })
       setSessionStartedAt(null)
-      setTurnStartedAt(null)
       // The composer's model/effort/fast is sticky UI state (persisted in
       // localStorage) — a new chat FOLLOWS your last pick instead of snapping
       // back to the profile default, so we deliberately don't reset it here. The
       // profile default still owns first-run seeding and profile switches (see
       // refreshCurrentModel). Only $currentServiceTier (a live-session mirror)
       // is cleared.
-      setCurrentServiceTier('')
-      setYoloActive(false)
       setNewChatWorkspaceTarget(hasWorkspaceTarget ? workspaceTarget : undefined)
-
-      if (!hasWorkspaceTarget) {
-        // In a project → the repo's default-branch checkout; not in a project →
-        // detached. So cmd-n does not inherit an unrelated linked worktree.
-        setCurrentCwd(resolveNewSessionCwd())
-      } else if (workspaceTarget === null) {
-        setCurrentCwdTransient('')
-      } else if (typeof workspaceTarget === 'string') {
-        setCurrentCwd(workspaceTarget)
-      }
-
-      setCurrentBranch('')
       // Never clear the composer here — ChatBar's per-thread draft swap owns it.
       setFreshDraftReady(true)
     },
@@ -290,8 +289,8 @@ export function useSessionActions({
         }
 
         resetViewSync()
-        activeSessionIdRef.current = created.session_id
         selectedStoredSessionIdRef.current = stored
+        const currentSnapshot = $sessionViewSnapshot.get()
         ensureSessionState(created.session_id, stored)
 
         if (stored) {
@@ -309,15 +308,25 @@ export function useSessionActions({
 
         setFreshDraftReady(false)
         setNewChatWorkspaceTarget(undefined)
-        setActiveSessionId(created.session_id)
         setSelectedStoredSessionId(stored)
         setSessionStartedAt(Date.now())
         const yoloArmed = $yoloActive.get()
-        const runtimeInfo = applyRuntimeInfo(created.info)
-
-        if (runtimeInfo) {
-          updateSessionState(created.session_id, state => ({ ...state, ...runtimeInfo }), stored)
-        }
+        const runtimeInfo = prepareRuntimeInfo(created.info)
+        applyRuntimeInfoEffects(created.info)
+        const createdState = updateSessionState(
+          created.session_id,
+          state => ({
+            ...state,
+            ...(runtimeInfo ?? {}),
+            messages: currentSnapshot.messages,
+            busy: currentSnapshot.busy,
+            awaitingResponse: currentSnapshot.awaitingResponse
+          }),
+          stored
+        )
+        activeSessionIdRef.current = created.session_id
+        busyRef.current = createdState.busy
+        publishSessionViewSnapshot(prepareSessionSnapshot(created.session_id, createdState))
 
         // User may have armed YOLO on the new-chat draft before the runtime
         // session existed — apply it to the freshly created session.
@@ -408,7 +417,6 @@ export function useSessionActions({
 
       return
     }
-
     navigate(NEW_CHAT_ROUTE)
   }, [navigate, selectedStoredSessionId])
 
@@ -418,9 +426,9 @@ export function useSessionActions({
       usageProbeAbortRef.current = null
       const requestId = resumeRequestRef.current + 1
       const trace = createSessionSwitchTrace({ requestId, storedSessionId })
+
       const completeAfterNextPaint = (...args: Parameters<typeof trace.complete>) => {
         const complete = () => trace.complete(...args)
-
         if (typeof window === 'undefined' || typeof window.requestAnimationFrame !== 'function') {
           setTimeout(complete, 0)
 
@@ -431,6 +439,7 @@ export function useSessionActions({
           window.requestAnimationFrame(complete)
         })
       }
+
       resumeRequestRef.current = requestId
 
       const isCurrentResume = () =>
@@ -488,12 +497,6 @@ export function useSessionActions({
       }
 
       trace.mark('initial-cache', { warm: takeWarmCache() !== null })
-
-      if (!takeWarmCache()) {
-        setActiveSessionId(null)
-        activeSessionIdRef.current = null
-        setMessages([])
-      }
 
       // Swap the single live gateway to this session's profile before any
       // gateway call (no-op when it's already on that profile / single-profile).
@@ -555,14 +558,11 @@ export function useSessionActions({
           clearNotifications()
           setSelectedStoredSessionId(storedSessionId)
           selectedStoredSessionIdRef.current = storedSessionId
-          setActiveSessionId(cachedRuntimeId)
           activeSessionIdRef.current = cachedRuntimeId
           busyRef.current = cachedViewState.busy
           publishSessionViewSnapshot(prepareSessionSnapshot(cachedRuntimeId, cachedViewState))
           trace.mark('warm-view-published', { messageCount: cachedViewState.messages.length })
           completeAfterNextPaint('warm-restored', { messageCount: cachedViewState.messages.length, profileSwitch })
-          setCurrentCwd(cachedViewState.cwd)
-          setCurrentBranch(cachedViewState.branch)
           setSessionStartedAt(Date.now())
 
           if (stored) {
@@ -611,22 +611,6 @@ export function useSessionActions({
       }
 
       setFreshDraftReady(false)
-      setActiveSessionId(null)
-      activeSessionIdRef.current = null
-
-      // A warm-cache hit at entry skipped the cold-path transcript clear, but the
-      // warm path can still bail down to here — an empty-transcript drop, or the
-      // cache getting purged during the profile-swap await — so the PREVIOUS
-      // session's transcript would leak into this cold resume ("switching
-      // sessions shows the same messages"). Clear it so the loader/prefetch
-      // paints fresh; guarded so the normal cold path (already cleared) no-ops.
-      if ($messages.get().length > 0) {
-        setMessages([])
-      }
-
-      busyRef.current = true
-      setBusy(true)
-      setAwaitingResponse(false)
       clearNotifications()
       setSelectedStoredSessionId(storedSessionId)
       selectedStoredSessionIdRef.current = storedSessionId
@@ -634,8 +618,6 @@ export function useSessionActions({
 
       const stored =
         $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId)) ?? storedForProfile
-
-      applyStoredSessionPreviewRuntimeInfo(stored)
 
       if (stored) {
         applyStoredUsage(stored)
@@ -670,12 +652,12 @@ export function useSessionActions({
           return
         }
 
-        const currentMessages = $messages.get()
+        const targetCachedMessages = sessionStateByRuntimeIdRef.current.get(resumed.session_id)?.messages ?? []
 
         const transcriptTransformStartedAt = performance.now()
         const resumedMessages = preserveLocalAssistantErrors(
-          reconcileResumeMessages(toChatMessages(resumed.messages), currentMessages),
-          currentMessages
+          reconcileResumeMessages(toChatMessages(resumed.messages), targetCachedMessages),
+          targetCachedMessages
         )
         trace.mark('transcript-transformed', {
           durationMs: Math.round((performance.now() - transcriptTransformStartedAt) * 10) / 10,
@@ -683,24 +665,20 @@ export function useSessionActions({
         })
 
         if (sessionShouldHaveTranscript(stored) && resumedMessages.length === 0) {
-          setActiveSessionId(null)
-          activeSessionIdRef.current = null
           setResumeFailedSessionId(storedSessionId)
-          resumedRunning = false
           completeAfterNextPaint('failed', { emptyTranscript: true, profileSwitch })
 
           return
         }
 
-        setActiveSessionId(resumed.session_id)
-        activeSessionIdRef.current = resumed.session_id
-        const runtimeInfo = applyRuntimeInfo(resumed.info)
+        const runtimeInfo = prepareRuntimeInfo(resumed.info)
+        applyRuntimeInfoEffects(resumed.info)
 
         patchSessionWorkspace(storedSessionId, runtimeInfo?.cwd)
 
         resumedRunning = Boolean((resumed as { running?: boolean }).running)
 
-        updateSessionState(
+        const resumedState = updateSessionState(
           resumed.session_id,
           state => ({
             ...state,
@@ -711,6 +689,9 @@ export function useSessionActions({
           }),
           storedSessionId
         )
+        activeSessionIdRef.current = resumed.session_id
+        busyRef.current = resumedState.busy
+        publishSessionViewSnapshot(prepareSessionSnapshot(resumed.session_id, resumedState))
         trace.mark('cold-view-published', { messageCount: resumedMessages.length })
         completeAfterNextPaint('cold-resumed', { messageCount: resumedMessages.length, profileSwitch })
       } catch (err) {
@@ -740,7 +721,15 @@ export function useSessionActions({
             return
           }
 
-          setMessages(preserveLocalAssistantErrors(toChatMessages(fallback.messages), $messages.get()))
+          const fallbackMessages = toChatMessages(fallback.messages)
+          const fallbackState = {
+            ...createClientSessionState(storedSessionId, fallbackMessages),
+            cwd: stored?.cwd || '',
+            model: stored?.model || ''
+          }
+          activeSessionIdRef.current = null
+          busyRef.current = false
+          publishSessionViewSnapshot(prepareSessionSnapshot(null, fallbackState))
           fallbackPainted = true
         } catch (e) {
           // Fallback also failed: nothing to paint. Leave whatever messages are
@@ -763,7 +752,7 @@ export function useSessionActions({
         // instead of toasting an error and hot-looping the bounded retry on a
         // permanently-dead id. (Booting straight into a no-longer-existent
         // last-session id is the common trigger.)
-        if ($messages.get().length === 0 && isSessionGoneError(fallbackError)) {
+        if (!fallbackPainted && isSessionGoneError(fallbackError)) {
           completeAfterNextPaint('failed', { profileSwitch, sessionGone: true })
           // A session created THIS run isn't gone — its backend just flapped
           // before the turn-less session persisted. Keep the empty view and arm
@@ -780,7 +769,7 @@ export function useSessionActions({
           return
         }
 
-        if ($messages.get().length === 0) {
+        if (!fallbackPainted) {
           // Arm the self-heal ONLY when the window is still empty: the gateway
           // resume rejected AND the REST fallback failed to paint a transcript.
           // That is the exact stranded state the loader latches on
@@ -795,11 +784,8 @@ export function useSessionActions({
         notifyError(err, copy.resumeFailed)
         completeAfterNextPaint('failed', { fallbackPainted, profileSwitch })
       } finally {
-        if (isCurrentResume()) {
-          busyRef.current = resumedRunning
-          setBusy(resumedRunning)
-          setAwaitingResponse(resumedRunning)
-        }
+        // Successful paths publish their complete target snapshot above. Failed
+        // paths intentionally leave the previous visible snapshot untouched.
       }
     },
     [
@@ -812,7 +798,6 @@ export function useSessionActions({
       selectedStoredSessionIdRef,
       sessionStateByRuntimeIdRef,
       startFreshSessionDraft,
-      syncSessionStateToView,
       updateSessionState
     ]
   )
@@ -857,28 +842,26 @@ export function useSessionActions({
           parent ? parent.last_active || parent.started_at : undefined
         )
         ensureSessionState(branched.session_id, routedSessionId)
-        setActiveSessionId(branched.session_id)
-        activeSessionIdRef.current = branched.session_id
-        updateSessionState(
+        const runtimeInfo = prepareRuntimeInfo(branched.info)
+        applyRuntimeInfoEffects(branched.info)
+        const branchState = updateSessionState(
           branched.session_id,
           state => ({
             ...state,
+            ...(runtimeInfo ?? {}),
             messages: branchMessages.map(({ source }) => source),
             busy: false,
             awaitingResponse: false
           }),
           routedSessionId
         )
+        activeSessionIdRef.current = branched.session_id
+        busyRef.current = false
+        publishSessionViewSnapshot(prepareSessionSnapshot(branched.session_id, branchState))
         setSelectedStoredSessionId(routedSessionId)
         selectedStoredSessionIdRef.current = routedSessionId
         navigate(sessionRoute(routedSessionId))
-
-        const runtimeInfo = applyRuntimeInfo(branched.info)
         patchSessionWorkspace(routedSessionId, runtimeInfo?.cwd)
-
-        if (runtimeInfo) {
-          updateSessionState(branched.session_id, state => ({ ...state, ...runtimeInfo }), routedSessionId)
-        }
 
         return true
       } catch (err) {
@@ -893,6 +876,7 @@ export function useSessionActions({
     },
     [
       activeSessionIdRef,
+      busyRef,
       copy,
       creatingSessionRef,
       ensureSessionState,
@@ -918,7 +902,7 @@ export function useSessionActions({
         return false
       }
 
-      const messages = $messages.get()
+      const messages = $sessionViewSnapshot.get().messages
 
       const at = messageId
         ? messages.findIndex(message => message.id === messageId)
@@ -979,7 +963,7 @@ export function useSessionActions({
       const removed = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
       const wasSelected = selectedStoredSessionId === storedSessionId
       const closingRuntimeId = wasSelected ? activeSessionId : null
-      const previousMessages = $messages.get()
+      const previousSnapshot = $sessionViewSnapshot.get()
       const previousPinned = $pinnedSessionIds.get()
       // Pins are keyed on the durable lineage-root id; the stored id may be the
       // live tip after compression. Drop both so the pin can't linger.
@@ -1043,11 +1027,10 @@ export function useSessionActions({
             applyStoredUsage(stored)
           }
 
-          setMessages(previousMessages)
+          publishSessionViewSnapshot(previousSnapshot)
           navigate(sessionRoute(storedSessionId), { replace: true })
 
           if (closingRuntimeId) {
-            setActiveSessionId(closingRuntimeId)
             activeSessionIdRef.current = closingRuntimeId
           }
         }

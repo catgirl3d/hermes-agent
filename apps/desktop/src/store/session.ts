@@ -331,6 +331,7 @@ export const $sessionViewSnapshot = atom<SessionViewSnapshot>(
 )
 export const $sessionViewActiveSessionId = computed($sessionViewSnapshot, snapshot => snapshot.runtimeSessionId)
 export const $sessionViewStoredSessionId = computed($sessionViewSnapshot, snapshot => snapshot.storedSessionId)
+export const $sessionViewMessages = computed($sessionViewSnapshot, snapshot => snapshot.messages)
 export const $sessionViewMessagesEmpty = computed($sessionViewSnapshot, snapshot => snapshot.messages.length === 0)
 export const $sessionViewLastVisibleMessageIsUser = computed($sessionViewSnapshot, snapshot =>
   lastVisibleMessageIsUser(snapshot.messages)
@@ -392,8 +393,6 @@ export const setSelectedStoredSessionId = (next: Updater<string | null>) => {
   if (id && $unreadFinishedSessionIds.get().includes(id)) {
     toggleMembership(setUnreadFinishedSessionIds, id, false)
   }
-
-  patchSessionViewSnapshot({ storedSessionId: id })
 }
 
 export const setMessages = (next: Updater<ChatMessage[]>) => {
