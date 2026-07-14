@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { getSessionMessages, type SessionInfo } from '@/hermes'
 import { createClientSessionState } from '@/lib/chat-runtime'
+import { prepareSessionSnapshot } from '@/lib/session-view-snapshot'
 import { $activeGatewayProfile, $newChatProfile } from '@/store/profile'
 import { $projectScope, $projectTree, ALL_PROJECTS } from '@/store/projects'
 import {
@@ -13,6 +14,8 @@ import {
   $messages,
   $newChatWorkspaceTarget,
   $resumeFailedSessionId,
+  $sessionViewSnapshot,
+  publishSessionViewSnapshot,
   setActiveSessionId,
   setCurrentCwd,
   setMessages,
@@ -280,6 +283,94 @@ describe('resumeSession failure recovery', () => {
     await waitFor(() => expect(resume).not.toBeNull())
     await resume!('stored-1', true)
   }
+
+  it('keeps the previous snapshot visible until the cold target is ready', async () => {
+    publishSessionViewSnapshot(
+      prepareSessionSnapshot('runtime-old', createClientSessionState('stored-old', [
+        { id: 'old-message', role: 'user', parts: [{ type: 'text', text: 'old transcript' }] }
+      ]))
+    )
+    setSessions([storedSession({ message_count: 0 })])
+
+    let resolveResume: ((value: unknown) => void) | undefined
+    const requestGateway = vi.fn((method: string) => {
+      if (method === 'session.resume') {
+        return new Promise(resolve => {
+          resolveResume = resolve
+        }) as never
+      }
+
+      return Promise.resolve({}) as never
+    })
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+    render(<ResumeHarness onReady={next => (resume = next)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(resume).not.toBeNull())
+
+    let pendingResume: Promise<unknown>
+    act(() => {
+      pendingResume = resume!('stored-1', true)
+    })
+    await waitFor(() => expect(resolveResume).toBeDefined())
+
+    expect($sessionViewSnapshot.get()).toMatchObject({
+      runtimeSessionId: 'runtime-old',
+      storedSessionId: 'stored-old'
+    })
+    expect($sessionViewSnapshot.get().messages[0]?.id).toBe('old-message')
+
+    resolveResume?.({
+      session_id: 'runtime-target',
+      messages: [{ role: 'user', text: 'target transcript' }],
+      info: {}
+    })
+    await act(async () => pendingResume!)
+
+    expect($sessionViewSnapshot.get()).toMatchObject({
+      runtimeSessionId: 'runtime-target',
+      storedSessionId: 'stored-1'
+    })
+  })
+
+  it('does not publish a superseded resume response', async () => {
+    publishSessionViewSnapshot(prepareSessionSnapshot('runtime-old', createClientSessionState('stored-old')))
+    setSessions([storedSession({ id: 'stored-A' }), storedSession({ id: 'stored-B' })])
+
+    const resolvers = new Map<string, (value: unknown) => void>()
+    const requestGateway = vi.fn((method: string, params?: Record<string, unknown>) => {
+      if (method === 'session.resume') {
+        return new Promise(resolve => {
+          resolvers.set(String(params?.session_id), resolve)
+        }) as never
+      }
+
+      return Promise.resolve({}) as never
+    })
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+    render(<ResumeHarness onReady={next => (resume = next)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(resume).not.toBeNull())
+
+    let resumeA: Promise<unknown>
+    let resumeB: Promise<unknown>
+    act(() => {
+      resumeA = resume!('stored-A', true)
+    })
+    await waitFor(() => expect(resolvers.has('stored-A')).toBe(true))
+    act(() => {
+      resumeB = resume!('stored-B', true)
+    })
+    await waitFor(() => expect(resolvers.has('stored-B')).toBe(true))
+
+    resolvers.get('stored-A')?.({ session_id: 'runtime-A', messages: [], info: {} })
+    await act(async () => resumeA!)
+    expect($sessionViewSnapshot.get().runtimeSessionId).toBe('runtime-old')
+
+    resolvers.get('stored-B')?.({ session_id: 'runtime-B', messages: [], info: {} })
+    await act(async () => resumeB!)
+    expect($sessionViewSnapshot.get()).toMatchObject({
+      runtimeSessionId: 'runtime-B',
+      storedSessionId: 'stored-B'
+    })
+  })
 
   it('arms $resumeFailedSessionId when resume RPC and REST fallback both fail', async () => {
     // session.resume rejects (e.g. timeout against a wedged backend)...

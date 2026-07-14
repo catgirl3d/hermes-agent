@@ -36,9 +36,6 @@ import { $petActive } from '@/store/pet'
 import { $petOverlayActive } from '@/store/pet-overlay'
 import { $gatewaySwapTarget } from '@/store/profile'
 import {
-  $activeSessionId,
-  $awaitingResponse,
-  $busy,
   $contextSuggestions,
   $currentCwd,
   $currentModel,
@@ -47,10 +44,14 @@ import {
   $gatewayState,
   $introPersonality,
   $introSeed,
-  $lastVisibleMessageIsUser,
-  $messages,
-  $messagesEmpty,
   $resumeExhaustedSessionId,
+  $sessionViewActiveSessionId,
+  $sessionViewAwaitingResponse,
+  $sessionViewBusy,
+  $sessionViewLastVisibleMessageIsUser,
+  $sessionViewMessagesEmpty,
+  $sessionViewSnapshot,
+  $sessionViewStoredSessionId,
   $selectedStoredSessionId,
   $sessions,
   sessionPinId
@@ -187,19 +188,13 @@ function ChatHeader({
 }
 
 interface ChatRuntimeBoundaryProps {
-  busy: boolean
   children: React.ReactNode
   onCancel: () => Promise<void> | void
   onEdit: (message: AppendMessage) => Promise<void>
   onReload: (parentId: string | null) => Promise<void>
   onThreadMessagesChange: (messages: readonly ThreadMessage[]) => void
   traceSessionId: null | string
-  /** Route points at an unloaded session — render empty until resume swaps in
-   *  the new transcript, so the previous session's messages don't linger. */
-  suppressMessages: boolean
 }
-
-const NO_MESSAGES: ChatMessage[] = []
 
 /**
  * Owns the $messages subscription and the assistant-ui external-store runtime.
@@ -212,17 +207,14 @@ const NO_MESSAGES: ChatMessage[] = []
  * confined to the streaming message's own subtree.
  */
 function ChatRuntimeBoundary({
-  busy,
   children,
   onCancel,
   onEdit,
   onReload,
   onThreadMessagesChange,
-  traceSessionId,
-  suppressMessages
+  traceSessionId
 }: ChatRuntimeBoundaryProps) {
-  const storeMessages = useStore($messages)
-  const messages = suppressMessages ? NO_MESSAGES : storeMessages
+  const { busy, messages } = useStore($sessionViewSnapshot)
   const runtimeMessageCacheRef = useRef(new WeakMap<ChatMessage, ThreadMessage>())
   const toolMergeCacheRef = useRef(createToolMergeCache())
 
@@ -331,9 +323,9 @@ export function ChatView({
 }: ChatViewProps) {
   const location = useLocation()
   const { t } = useI18n()
-  const activeSessionId = useStore($activeSessionId)
-  const awaitingResponse = useStore($awaitingResponse)
-  const busy = useStore($busy)
+  const activeSessionId = useStore($sessionViewActiveSessionId)
+  const awaitingResponse = useStore($sessionViewAwaitingResponse)
+  const busy = useStore($sessionViewBusy)
   const contextSuggestions = useStore($contextSuggestions)
   const currentCwd = useStore($currentCwd)
   const currentModel = useStore($currentModel)
@@ -353,18 +345,17 @@ export function ChatView({
   // the entire chat shell (header, chat bar, thread wrapper) per token. The
   // runtime that DOES need the messages lives in ChatRuntimeBoundary below;
   // this component only needs streaming-stable derivations.
-  const messagesEmpty = useStore($messagesEmpty)
-  const lastVisibleIsUser = useStore($lastVisibleMessageIsUser)
+  const messagesEmpty = useStore($sessionViewMessagesEmpty)
+  const lastVisibleIsUser = useStore($sessionViewLastVisibleMessageIsUser)
+  const visibleStoredSessionId = useStore($sessionViewStoredSessionId)
   const selectedSessionId = useStore($selectedStoredSessionId)
   const resumeExhaustedSessionId = useStore($resumeExhaustedSessionId)
   const routedSessionId = routeSessionId(location.pathname)
   const isRoutedSessionView = Boolean(routedSessionId)
 
-  // The URL points at a session the store hasn't loaded yet (sidebar / cmd-K /
-  // direct nav). Derived in render so the swap reads instantly: the same frame
-  // the id changes we drop the old transcript and show the loader, instead of
-  // waiting for the resume effect (which paints a frame later) to clear them.
-  const routeSessionMismatch = isRoutedSessionView && routedSessionId !== selectedSessionId
+  // Navigation intent changes immediately, but the visible snapshot remains on
+  // the previous session until the target is completely prepared and published.
+  const routeSessionMismatch = isRoutedSessionView && routedSessionId !== visibleStoredSessionId
 
   // The compact new-session pop-out skips the wordmark/tagline intro — it's a
   // scratch window, not the full-height empty state.
@@ -389,15 +380,16 @@ export function ChatView({
   // session can't blank the current one.
   const resumeExhausted = isRoutedSessionView && resumeExhaustedSessionId === routedSessionId
 
+  const hasVisibleSession = Boolean(visibleStoredSessionId || activeSessionId || !messagesEmpty)
   const loadingSession =
-    !resumeExhausted && isRoutedSessionView && (routeSessionMismatch || (messagesEmpty && !activeSessionId))
+    !resumeExhausted && isRoutedSessionView && !hasVisibleSession && (routeSessionMismatch || !activeSessionId)
 
   const threadLoading = threadLoadingState(loadingSession, busy, awaitingResponse, lastVisibleIsUser)
   // Hide the composer in the exhausted error state too: there's no live runtime
   // to send to until a retry rebinds one. Watch windows are pure spectators of a
   // subagent run driven elsewhere — no composer, transcript is read-only.
-  const showChatBar = !loadingSession && !resumeExhausted && !isWatchWindow()
-  const threadKey = selectedSessionId || activeSessionId || (isRoutedSessionView ? location.pathname : 'new')
+  const showChatBar = !routeSessionMismatch && !loadingSession && !resumeExhausted && !isWatchWindow()
+  const threadKey = visibleStoredSessionId || activeSessionId || (isRoutedSessionView ? location.pathname : 'new')
   const traceSessionIdRef = useRef<null | string>(selectedSessionId)
   traceSessionIdRef.current = selectedSessionId
 
@@ -531,13 +523,11 @@ export function ChatView({
 
       <Profiler id="chat-runtime-boundary" onRender={onRuntimeBoundaryRender}>
         <ChatRuntimeBoundary
-          busy={busy}
           onCancel={onCancel}
           onEdit={onEdit}
           onReload={onReload}
           onThreadMessagesChange={onThreadMessagesChange}
           traceSessionId={selectedSessionId}
-          suppressMessages={routeSessionMismatch}
         >
           <div
             className="relative min-h-0 max-w-full flex-1 overflow-hidden bg-(--ui-chat-surface-background) contain-[layout_paint]"
