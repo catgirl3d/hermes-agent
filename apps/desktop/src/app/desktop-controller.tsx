@@ -267,15 +267,11 @@ export function DesktopController() {
     runtimeIdByStoredSessionIdRef,
     selectedStoredSessionIdRef,
     sessionStateByRuntimeIdRef,
-    syncSessionStateToView,
     updateSessionState
   } = useSessionStateCache({
     activeSessionId,
     busyRef,
-    selectedStoredSessionId,
-    setAwaitingResponse,
-    setBusy,
-    setMessages
+    selectedStoredSessionId
   })
 
   const { connectionRef, gatewayRef, requestGateway } = useGatewayRequest()
@@ -659,7 +655,6 @@ export function DesktopController() {
     selectedStoredSessionId,
     selectedStoredSessionIdRef,
     sessionStateByRuntimeIdRef,
-    syncSessionStateToView,
     updateSessionState
   })
 

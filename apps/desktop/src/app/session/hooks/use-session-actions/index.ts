@@ -5,6 +5,7 @@ import type { NavigateFunction } from 'react-router-dom'
 import { deleteSession, getSessionMessages, setSessionArchived } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
+import { prepareSessionSnapshot } from '@/lib/session-view-snapshot'
 import { createSessionSwitchTrace } from '@/lib/session-switch-trace'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { clearQueuedPrompts } from '@/store/composer-queue'
@@ -22,6 +23,7 @@ import {
   $newChatWorkspaceTarget,
   $sessions,
   $yoloActive,
+  publishSessionViewSnapshot,
   type NewChatWorkspaceTarget,
   sessionPinId,
   setActiveSessionId,
@@ -87,7 +89,6 @@ interface SessionActionsOptions {
   selectedStoredSessionId: string | null
   selectedStoredSessionIdRef: MutableRefObject<string | null>
   sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>>
-  syncSessionStateToView: (sessionId: string, state: ClientSessionState) => void
   updateSessionState: (
     sessionId: string,
     updater: (state: ClientSessionState) => ClientSessionState,
@@ -118,7 +119,6 @@ export function useSessionActions({
   selectedStoredSessionId,
   selectedStoredSessionIdRef,
   sessionStateByRuntimeIdRef,
-  syncSessionStateToView,
   updateSessionState
 }: SessionActionsOptions) {
   const { t } = useI18n()
@@ -486,7 +486,8 @@ export function useSessionActions({
           selectedStoredSessionIdRef.current = storedSessionId
           setActiveSessionId(cachedRuntimeId)
           activeSessionIdRef.current = cachedRuntimeId
-          syncSessionStateToView(cachedRuntimeId, cachedViewState)
+          busyRef.current = cachedViewState.busy
+          publishSessionViewSnapshot(prepareSessionSnapshot(cachedRuntimeId, cachedViewState))
           trace.mark('warm-view-published', { messageCount: cachedViewState.messages.length })
           completeAfterNextPaint('warm-restored', { messageCount: cachedViewState.messages.length, profileSwitch })
           setCurrentCwd(cachedViewState.cwd)
