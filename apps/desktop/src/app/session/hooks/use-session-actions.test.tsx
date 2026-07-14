@@ -81,7 +81,6 @@ function Harness({
     selectedStoredSessionId: null,
     selectedStoredSessionIdRef: ref<string | null>(null),
     sessionStateByRuntimeIdRef: ref(new Map<string, ClientSessionState>()),
-    syncSessionStateToView: vi.fn(),
     updateSessionState: () => ({}) as ClientSessionState
   })
 
@@ -242,8 +241,9 @@ function ResumeHarness({
     selectedStoredSessionId: null,
     selectedStoredSessionIdRef: ref<string | null>(null),
     sessionStateByRuntimeIdRef: sessionStateByRuntimeIdRef ?? ref(new Map<string, ClientSessionState>()),
-    syncSessionStateToView: vi.fn(),
-    updateSessionState: updateSessionState ?? ((_sessionId, updater) => updater({} as ClientSessionState))
+    updateSessionState:
+      updateSessionState ??
+      ((_sessionId, updater, storedSessionId) => updater(createClientSessionState(storedSessionId ?? null)))
   })
 
   useEffect(() => {
@@ -506,7 +506,6 @@ function BranchHarness({
     selectedStoredSessionId: null,
     selectedStoredSessionIdRef: ref<string | null>(null),
     sessionStateByRuntimeIdRef: ref(new Map<string, ClientSessionState>()),
-    syncSessionStateToView: vi.fn(),
     updateSessionState: () => ({}) as ClientSessionState
   })
 
