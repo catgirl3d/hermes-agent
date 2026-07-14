@@ -4,6 +4,7 @@ import type { HermesGateway } from '@/hermes'
 import type { ComposerAttachment } from '@/store/composer'
 
 import type { DroppedFile } from '../hooks/use-composer-actions'
+import type { ComposerIntent } from '../hooks/use-composer-intent-prewarm'
 
 export interface ContextSuggestion {
   text: string
@@ -46,6 +47,7 @@ export interface ChatBarProps {
   onAddUrl?: (url: string) => void
   onAttachImageBlob?: (blob: Blob) => Promise<boolean | void> | boolean | void
   onAttachDroppedItems?: (candidates: DroppedFile[]) => Promise<boolean | void> | boolean | void
+  onIntent?: (intent: ComposerIntent) => void
   onPasteClipboardImage?: (opts?: { silent?: boolean }) => Promise<boolean> | void
   onPickFiles?: () => void
   onPickFolders?: () => void

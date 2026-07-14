@@ -498,7 +498,7 @@ function SourceView({ filePath, language, text }: { filePath: string; language: 
 
       event.preventDefault()
       event.stopPropagation()
-      requestComposerInsertRefs([ref])
+      requestComposerInsertRefs([ref], { intent: 'attachment' })
       requestComposerFocus('main')
     }
 

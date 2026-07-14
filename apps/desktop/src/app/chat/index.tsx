@@ -49,6 +49,8 @@ import {
   $introPersonality,
   $introSeed,
   $resumeExhaustedSessionId,
+  $selectedStoredSessionId,
+  $sessions,
   $sessionViewActiveSessionId,
   $sessionViewAwaitingResponse,
   $sessionViewBusy,
@@ -56,8 +58,6 @@ import {
   $sessionViewMessagesEmpty,
   $sessionViewSnapshot,
   $sessionViewStoredSessionId,
-  $selectedStoredSessionId,
-  $sessions,
   sessionPinId
 } from '@/store/session'
 import { isSecondaryWindow, isWatchWindow } from '@/store/windows'
@@ -74,6 +74,7 @@ import { requestComposerInsert, requestComposerInsertRefs } from './composer/foc
 import { droppedFileInlineRefs, type SessionDragPayload, sessionInlineRef } from './composer/inline-refs'
 import type { ChatBarState } from './composer/types'
 import { type DroppedFile, partitionDroppedFiles } from './hooks/use-composer-actions'
+import { useComposerIntentPrewarm } from './hooks/use-composer-intent-prewarm'
 import { useFileDropZone } from './hooks/use-file-drop-zone'
 import { ScrollToBottomButton } from './scroll-to-bottom-button'
 import { SessionActionsMenu } from './sidebar/session-actions-menu'
@@ -304,6 +305,7 @@ function ChatRuntimeBoundary({
     }),
     [busy, onCancel, onEdit, onReload, onThreadMessagesChange, runtimeMessageRepository]
   )
+
   const runtime = useIncrementalExternalStoreRuntime<ThreadMessage>(runtimeAdapter, {
     onAdapterSync: onRuntimeAdapterSync
   })
@@ -344,6 +346,7 @@ export function ChatView({
   const location = useLocation()
   const { t } = useI18n()
   const activeSessionId = useStore($sessionViewActiveSessionId)
+  const prewarmOnIntent = useComposerIntentPrewarm({ gateway, sessionId: activeSessionId })
   const awaitingResponse = useStore($sessionViewAwaitingResponse)
   const busy = useStore($sessionViewBusy)
   const contextSuggestions = useStore($contextSuggestions)
@@ -401,6 +404,7 @@ export function ChatView({
   const resumeExhausted = isRoutedSessionView && resumeExhaustedSessionId === routedSessionId
 
   const hasVisibleSession = Boolean(visibleStoredSessionId || activeSessionId || !messagesEmpty)
+
   const loadingSession =
     !resumeExhausted && isRoutedSessionView && !hasVisibleSession && (routeSessionMismatch || !activeSessionId)
 
@@ -498,6 +502,10 @@ export function ChatView({
   // pipeline — otherwise the local path leaks into the prompt verbatim.
   const onDropFiles = useCallback(
     (candidates: DroppedFile[]) => {
+      if (candidates.length > 0) {
+        prewarmOnIntent('attachment')
+      }
+
       const { inAppRefs, osDrops } = partitionDroppedFiles(candidates)
       const refs = droppedFileInlineRefs(inAppRefs, currentCwd)
 
@@ -509,13 +517,13 @@ export function ChatView({
         void onAttachDroppedItems(osDrops)
       }
     },
-    [currentCwd, onAttachDroppedItems]
+    [currentCwd, onAttachDroppedItems, prewarmOnIntent]
   )
 
   // Dropping a sidebar session inserts an @session link the agent can resolve
   // via session_search (carries the source profile, so cross-profile works).
   const onDropSession = useCallback((session: SessionDragPayload) => {
-    requestComposerInsertRefs([sessionInlineRef(session)], { target: 'main' })
+    requestComposerInsertRefs([sessionInlineRef(session)], { intent: 'attachment', target: 'main' })
   }, [])
 
   const { dragKind, dropHandlers } = useFileDropZone({ enabled: showChatBar, onDropFiles, onDropSession })
@@ -563,12 +571,12 @@ export function ChatView({
                 loading={threadLoading}
                 onBranchInNewChat={onBranchInNewChat}
                 onCancel={onCancel}
-              onDismissError={onDismissError}
-              onRestoreToMessage={onRestoreToMessage}
-              sessionId={activeSessionId}
-              sessionKey={threadKey}
-              traceSessionId={selectedSessionId}
-            />
+                onDismissError={onDismissError}
+                onRestoreToMessage={onRestoreToMessage}
+                sessionId={activeSessionId}
+                sessionKey={threadKey}
+                traceSessionId={selectedSessionId}
+              />
             </Profiler>
             {resumeExhausted && routedSessionId && (
               <div className="absolute inset-0 z-10 grid place-items-center bg-(--ui-chat-surface-background) px-8 py-10">
@@ -623,6 +631,7 @@ export function ChatView({
                 onAttachDroppedItems={onAttachDroppedItems}
                 onAttachImageBlob={onAttachImageBlob}
                 onCancel={onCancel}
+                onIntent={prewarmOnIntent}
                 onPasteClipboardImage={onPasteClipboardImage}
                 onPickFiles={onPickFiles}
                 onPickFolders={onPickFolders}

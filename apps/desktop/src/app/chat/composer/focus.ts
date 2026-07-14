@@ -15,18 +15,21 @@ import { RICH_INPUT_SLOT } from './rich-editor'
 
 export type ComposerTarget = 'edit' | 'main'
 export type ComposerInsertMode = 'block' | 'inline'
+export type ComposerInsertIntent = 'attachment' | 'text'
 
 interface FocusDetail {
   target: ComposerTarget
 }
 
 interface InsertDetail {
+  intent?: ComposerInsertIntent
   mode: ComposerInsertMode
   target: ComposerTarget
   text: string
 }
 
 interface InsertRefsDetail {
+  intent?: ComposerInsertIntent
   refs: InlineRefInput[]
   target: ComposerTarget
 }
@@ -81,7 +84,11 @@ export const requestComposerFocus = (target: ComposerTarget | 'active' = 'active
 
 export const requestComposerInsert = (
   text: string,
-  { mode = 'block', target = 'active' }: { mode?: ComposerInsertMode; target?: ComposerTarget | 'active' } = {}
+  {
+    intent,
+    mode = 'block',
+    target = 'active'
+  }: { intent?: ComposerInsertIntent; mode?: ComposerInsertMode; target?: ComposerTarget | 'active' } = {}
 ) => {
   const trimmed = text.trim()
 
@@ -89,7 +96,7 @@ export const requestComposerInsert = (
     return
   }
 
-  dispatch<InsertDetail>(INSERT_EVENT, { mode, target: resolve(target), text: trimmed })
+  dispatch<InsertDetail>(INSERT_EVENT, { ...(intent ? { intent } : {}), mode, target: resolve(target), text: trimmed })
 }
 
 export const onComposerFocusRequest = (handler: (target: ComposerTarget) => void) =>
@@ -102,10 +109,10 @@ export const onComposerInsertRequest = (handler: (detail: InsertDetail) => void)
  * structured cousin of {@link requestComposerInsert}, used for session links. */
 export const requestComposerInsertRefs = (
   refs: InlineRefInput[],
-  { target = 'active' }: { target?: ComposerTarget | 'active' } = {}
+  { intent, target = 'active' }: { intent?: ComposerInsertIntent; target?: ComposerTarget | 'active' } = {}
 ) => {
   if (refs.length) {
-    dispatch<InsertRefsDetail>(INSERT_REFS_EVENT, { refs, target: resolve(target) })
+    dispatch<InsertRefsDetail>(INSERT_REFS_EVENT, { ...(intent ? { intent } : {}), refs, target: resolve(target) })
   }
 }
 

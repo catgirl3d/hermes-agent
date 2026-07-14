@@ -1445,6 +1445,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # Session DB row deferred to first run_conversation() call.
             # pending_title applied post-first-message (see cli.exec handler).
             current["agent"] = agent
+            _sync_built_agent_with_session_override(current, agent)
             # Baseline for the per-turn config sync; the profile home
             # override is still active here.
             current["config_model_seen"] = _config_model_target()
@@ -1556,6 +1557,32 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 )
 
     threading.Thread(target=_build, daemon=True).start()
+
+
+def _sync_built_agent_with_session_override(session: dict, agent) -> None:
+    """Reconcile a model selection that raced with deferred agent construction."""
+    override = session.get("model_override")
+    if not isinstance(override, dict):
+        return
+
+    model = str(override.get("model") or "")
+    provider = str(override.get("provider") or "")
+    base_url = str(override.get("base_url") or "")
+    api_mode = str(override.get("api_mode") or "")
+    if model == str(getattr(agent, "model", "") or "") and (
+        not provider or provider == str(getattr(agent, "provider", "") or "")
+    ) and (not base_url or base_url == str(getattr(agent, "base_url", "") or "")) and (
+        not api_mode or api_mode == str(getattr(agent, "api_mode", "") or "")
+    ):
+        return
+
+    agent.switch_model(
+        new_model=model,
+        new_provider=provider,
+        api_key=override.get("api_key"),
+        base_url=base_url,
+        api_mode=api_mode,
+    )
 
 
 def agent_build_timing_snapshot() -> dict[str, float]:
@@ -5815,9 +5842,9 @@ def _(rid, params: dict) -> dict:
     resume_started_at = time.perf_counter()
     resume_stage_started_at = resume_started_at
     resume_timing_ms: dict[str, float | str] = {
-        "schema_version": 11.0,
+        "schema_version": 12.0,
         "resume_prewarm_enabled": 0.0,
-        "resume_prewarm_mode": "on_demand",
+        "resume_prewarm_mode": "composer_intent",
     }
     if isinstance(dispatch_queued_at, (int, float)):
         resume_timing_ms["dispatch_queue"] = round(
@@ -6458,6 +6485,29 @@ def _(rid, params: dict) -> dict:
             transport=current_transport() or _stdio_transport,
         ),
     )
+
+
+@method("session.prewarm")
+def _(rid, params: dict) -> dict:
+    """Start agent construction after explicit composer intent, without waiting."""
+    sid = str(params.get("session_id") or "")
+    session, err = _sess_nowait({"session_id": sid}, rid)
+    if err:
+        return err
+    assert session is not None
+
+    if (transport := current_transport()) is not None:
+        session["transport"] = transport
+
+    intent = str(params.get("intent") or "").strip().lower()
+    trigger = {
+        "attachment": "composer_attachment",
+        "text": "composer_text",
+        "voice": "composer_voice",
+    }.get(intent, "composer_intent")
+    session["_agent_build_trigger"] = trigger
+    _start_agent_build(sid, session)
+    return _ok(rid, {"accepted": True, "session_id": sid, "trigger": trigger})
 
 
 @method("session.delete")
