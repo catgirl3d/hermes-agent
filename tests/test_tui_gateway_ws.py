@@ -104,18 +104,123 @@ def test_ws_long_handler_skips_default_executor_hop(monkeypatch):
     timing_params = dispatched_requests[0]["params"]
     assert timing_params[server._WS_RECEIVE_TO_ACK_PARAM] >= 0
     assert timing_params[server._WS_ACK_SEND_PARAM] >= 0
-    assert sent[1] == {
-        "jsonrpc": "2.0",
-        "method": "event",
-        "params": {
-            "type": "gateway.request_received",
-            "payload": {
-                "request_id": "resume",
-                "backend_agent_build_active_count": 1.0,
-                "backend_agent_build_active_max_elapsed_ms": 412.5,
-            },
-        },
+    ack_frame = sent[1]
+    assert ack_frame["jsonrpc"] == "2.0"
+    assert ack_frame["method"] == "event"
+    assert ack_frame["params"]["type"] == "gateway.request_received"
+    ack_payload = ack_frame["params"]["payload"]
+    assert ack_payload.pop("backend_ws_event_loop_lag_ms") >= 0
+    assert ack_payload == {
+        "request_id": "resume",
+        "backend_agent_build_active_count": 1.0,
+        "backend_agent_build_active_max_elapsed_ms": 412.5,
     }
+
+
+def test_ws_resume_ack_reports_previous_dispatch(monkeypatch):
+    receive_count = 0
+    sent = []
+
+    monkeypatch.setattr(
+        mcp_startup,
+        "start_background_mcp_discovery",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(server, "agent_build_timing_snapshot", lambda: {})
+
+    def fake_dispatch(req, _transport):
+        if req.get("method") == "config.get":
+            time.sleep(0.02)
+            return {"jsonrpc": "2.0", "id": req["id"], "result": {}}
+        return None
+
+    monkeypatch.setattr(server, "dispatch", fake_dispatch)
+
+    class FakeWS:
+        async def accept(self):
+            pass
+
+        async def send_text(self, line):
+            sent.append(json.loads(line))
+
+        async def receive_text(self):
+            nonlocal receive_count
+            receive_count += 1
+            if receive_count == 1:
+                return json.dumps(
+                    {"id": "config", "method": "config.get", "params": {}}
+                )
+            if receive_count == 2:
+                return json.dumps(
+                    {
+                        "id": "resume",
+                        "method": "session.resume",
+                        "params": {"_transport_timing": True},
+                    }
+                )
+            raise ws_mod._WebSocketDisconnect()
+
+        async def close(self):
+            pass
+
+    asyncio.run(ws_mod.handle_ws(FakeWS()))
+
+    ack_payload = next(
+        frame["params"]["payload"]
+        for frame in sent
+        if frame.get("params", {}).get("type") == "gateway.request_received"
+    )
+    assert ack_payload["backend_ws_previous_method"] == "config.get"
+    assert ack_payload["backend_ws_previous_dispatch_ms"] >= 15
+    assert ack_payload["backend_ws_previous_request_ms"] >= 15
+    assert ack_payload["backend_ws_previous_request_finished_ago_ms"] >= 0
+    assert ack_payload["backend_ws_event_loop_lag_ms"] >= 0
+
+
+def test_ws_resume_ack_reports_event_loop_stall(monkeypatch):
+    receive_count = 0
+    sent = []
+
+    monkeypatch.setattr(
+        mcp_startup,
+        "start_background_mcp_discovery",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(server, "agent_build_timing_snapshot", lambda: {})
+    monkeypatch.setattr(server, "dispatch", lambda _req, _transport: None)
+
+    class FakeWS:
+        async def accept(self):
+            pass
+
+        async def send_text(self, line):
+            sent.append(json.loads(line))
+
+        async def receive_text(self):
+            nonlocal receive_count
+            receive_count += 1
+            if receive_count == 1:
+                time.sleep(0.08)
+                return json.dumps(
+                    {
+                        "id": "resume",
+                        "method": "session.resume",
+                        "params": {"_transport_timing": True},
+                    }
+                )
+            raise ws_mod._WebSocketDisconnect()
+
+        async def close(self):
+            pass
+
+    asyncio.run(ws_mod.handle_ws(FakeWS()))
+
+    ack_payload = next(
+        frame["params"]["payload"]
+        for frame in sent
+        if frame.get("params", {}).get("type") == "gateway.request_received"
+    )
+    assert ack_payload["backend_ws_event_loop_lag_ms"] >= 20
 
 
 def _run_disconnect(monkeypatch, seed):

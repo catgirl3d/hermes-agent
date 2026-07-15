@@ -76,7 +76,11 @@ export const Thread: FC<{
   const messageComponents = useMemo(
     () => ({
       AssistantMessage: () => (
-        <AssistantMessage onBranchInNewChat={onBranchInNewChat} onDismissError={onDismissError} />
+        <AssistantMessage
+          onBranchInNewChat={onBranchInNewChat}
+          onDismissError={onDismissError}
+          traceSessionId={traceSessionId}
+        />
       ),
       SystemMessage,
       UserEditComposer: () => <UserEditComposer cwd={cwd} gateway={gateway} sessionId={sessionId} />,
@@ -84,10 +88,21 @@ export const Thread: FC<{
         <UserMessage
           onCancel={onCancel}
           onRequestRestoreConfirm={onRestoreToMessage ? requestRestoreConfirm : undefined}
+          traceSessionId={traceSessionId}
         />
       )
     }),
-    [cwd, gateway, onBranchInNewChat, onCancel, onDismissError, onRestoreToMessage, requestRestoreConfirm, sessionId]
+    [
+      cwd,
+      gateway,
+      onBranchInNewChat,
+      onCancel,
+      onDismissError,
+      onRestoreToMessage,
+      requestRestoreConfirm,
+      sessionId,
+      traceSessionId
+    ]
   )
 
   const emptyPlaceholder = intro ? (

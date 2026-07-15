@@ -24,6 +24,7 @@ export interface RuntimeAdapterSyncMetrics {
 
 interface IncrementalExternalStoreRuntimeOptions {
   onAdapterSync?: (metrics: RuntimeAdapterSyncMetrics) => void
+  onAdapterSyncStart?: (metrics: Pick<RuntimeAdapterSyncMetrics, 'messageCount'>) => void
 }
 
 const shallowEqual = (a: object, b: object): boolean => {
@@ -199,14 +200,19 @@ export function useIncrementalExternalStoreRuntime<T extends ThreadMessage>(
 ): AssistantRuntime {
   const [runtime] = useState(() => new IncrementalExternalStoreRuntimeCore(store as ExternalStoreAdapter))
   const onAdapterSyncRef = useRef(options.onAdapterSync)
+  const onAdapterSyncStartRef = useRef(options.onAdapterSyncStart)
   onAdapterSyncRef.current = options.onAdapterSync
+  onAdapterSyncStartRef.current = options.onAdapterSyncStart
 
   useEffect(() => {
+    const messageCount = store.messageRepository?.messages.length ?? store.messages?.length ?? 0
+
+    onAdapterSyncStartRef.current?.({ messageCount })
     const startedAt = performance.now()
     runtime.setAdapter(store as ExternalStoreAdapter)
     onAdapterSyncRef.current?.({
       durationMs: Math.round((performance.now() - startedAt) * 10) / 10,
-      messageCount: store.messageRepository?.messages.length ?? store.messages?.length ?? 0
+      messageCount
     })
   }, [runtime, store])
 

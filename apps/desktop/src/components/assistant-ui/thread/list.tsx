@@ -9,6 +9,7 @@ import {
   type ReactNode,
   useCallback,
   useEffect,
+  useInsertionEffect,
   useLayoutEffect,
   useRef,
   useState
@@ -16,7 +17,13 @@ import {
 import { useStickToBottom } from 'use-stick-to-bottom'
 
 import { useI18n } from '@/i18n'
-import { markActiveSessionSwitchTrace } from '@/lib/session-switch-trace'
+import {
+  activeSessionSwitchTraceRequestId,
+  elapsedSinceActiveSessionSwitchStage,
+  markActiveSessionSwitchTrace,
+  markActiveSessionSwitchTraceForRequest,
+  measureRenderCommitPhases
+} from '@/lib/session-switch-trace'
 import { cn } from '@/lib/utils'
 import {
   onScrollToBottomRequest,
@@ -28,6 +35,7 @@ import {
 import { isSecondaryWindow } from '@/store/windows'
 
 import { MessageRenderBoundary } from '../message-render-boundary'
+
 import { firstVisibleGroupIndex } from './render-window'
 
 type ThreadMessageComponents = ComponentProps<typeof ThreadPrimitive.MessageByIndex>['components']
@@ -99,6 +107,17 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   sessionKey,
   traceSessionId = null
 }) => {
+  const renderStartedAt = performance.now()
+  let renderBodyFinishedAt = renderStartedAt
+  const traceRequestId = activeSessionSwitchTraceRequestId(traceSessionId)
+
+  const runtimeSyncStartToRenderStartMs = elapsedSinceActiveSessionSwitchStage(
+    traceSessionId,
+    'runtime-adapter-sync-started',
+    renderStartedAt,
+    traceRequestId
+  )
+
   const messageSignature = useAuiState(s =>
     s.thread.messages
       .map((message, index) => `${index}:${message.id}:${message.role}:${message.content?.length ?? 1}`)
@@ -129,11 +148,16 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
 
   const hiddenCount = firstVisible
   const visibleGroups = hiddenCount > 0 ? groups.slice(hiddenCount) : groups
+
   const mountedMessageCount = visibleGroups.reduce(
     (count, group) => count + (group.kind === 'turn' ? group.indices.length : 1),
     0
   )
+
   const restoreFromBottomRef = useRef<number | null>(null)
+  const lastLayoutTraceKeyRef = useRef<string | null>(null)
+  const insertionCommitRef = useRef<{ at: number; traceKey: string } | null>(null)
+  const traceKey = `${traceRequestId ?? 'inactive'}:${traceSessionId ?? ''}:${sessionKey ?? ''}:${messageSignature}`
   // Secondary windows (new-session scratch, subagent watch, cmd-click pop-out)
   // hide the titlebar tool cluster + session header, but the OS traffic lights
   // still sit in the top-left, so reserve the titlebar gap above the transcript.
@@ -195,14 +219,39 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   useEffect(() => onThreadEditClose(endEditHold), [endEditHold])
   useEffect(() => () => endEditHold(), [endEditHold])
 
+  useInsertionEffect(() => {
+    if (traceRequestId !== undefined) {
+      insertionCommitRef.current = { at: performance.now(), traceKey }
+    }
+  })
+
   useLayoutEffect(() => {
-    markActiveSessionSwitchTrace(traceSessionId, 'thread-message-list-layout-commit', {
+    const layoutCommittedAt = performance.now()
+    const insertionCommit = insertionCommitRef.current
+
+    if (lastLayoutTraceKeyRef.current === traceKey) {
+      return
+    }
+
+    lastLayoutTraceKeyRef.current = traceKey
+
+    const renderCommitPhases =
+      insertionCommit?.traceKey === traceKey
+        ? measureRenderCommitPhases(renderStartedAt, renderBodyFinishedAt, insertionCommit.at, layoutCommittedAt)
+        : undefined
+
+    markActiveSessionSwitchTraceForRequest(traceSessionId, traceRequestId, 'thread-message-list-layout-commit', {
       groupCount: groups.length,
       hiddenGroupCount: hiddenCount,
+      insertionCommitToLayoutMs: renderCommitPhases?.insertionCommitToLayoutMs,
       mountedMessageCount,
+      renderBodyDurationMs: renderCommitPhases?.renderBodyDurationMs,
+      renderToInsertionCommitMs: renderCommitPhases?.renderToInsertionCommitMs,
+      renderToLayoutCommitMs: Math.round((layoutCommittedAt - renderStartedAt) * 10) / 10,
+      runtimeSyncStartToRenderStartMs,
       visibleGroupCount: visibleGroups.length
     })
-  }, [groups.length, hiddenCount, mountedMessageCount, traceSessionId, visibleGroups.length])
+  })
 
   // New run → snap to the latest turn.
   useAuiEvent('thread.runStart', () => void scrollToBottom())
@@ -278,6 +327,8 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
       restoreFromBottomRef.current = null
     }
   }, [scrollRef, renderBudget, visibleTurnLimit])
+
+  renderBodyFinishedAt = performance.now()
 
   return (
     <div

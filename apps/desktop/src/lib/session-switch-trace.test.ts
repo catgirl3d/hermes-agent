@@ -1,9 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
+  activeSessionSwitchTraceRequestId,
   createSessionSwitchTrace,
+  elapsedSinceActiveSessionSwitchStage,
   markActiveSessionSwitchTrace,
+  markActiveSessionSwitchTraceForRequest,
   measureActiveSessionSwitchTrace,
+  measureRenderCommitPhases,
   recordSessionSwitchTransportTiming
 } from './session-switch-trace'
 
@@ -52,6 +56,63 @@ describe('session switch trace', () => {
         ])
       })
     )
+  })
+
+  it('measures elapsed time from an active stage and stops exposing it after completion', () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined)
+    const now = vi.spyOn(performance, 'now')
+
+    now.mockReturnValueOnce(10).mockReturnValueOnce(25)
+    const trace = createSessionSwitchTrace({ requestId: 12, storedSessionId: 'stored-session-elapsed' })
+
+    trace.mark('runtime-adapter-synced')
+
+    expect(elapsedSinceActiveSessionSwitchStage('stored-session-elapsed', 'runtime-adapter-synced', 40.26)).toBe(15.3)
+    expect(elapsedSinceActiveSessionSwitchStage('stored-session-elapsed', 'missing-stage', 40.26)).toBeUndefined()
+
+    now.mockReturnValue(50)
+    trace.complete('cold-resumed')
+
+    expect(elapsedSinceActiveSessionSwitchStage('stored-session-elapsed', 'runtime-adapter-synced', 60)).toBeUndefined()
+    expect(info).toHaveBeenCalledTimes(1)
+  })
+
+  it('gives a repeated resume of the same session a distinct active trace identity', () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined)
+    const first = createSessionSwitchTrace({ requestId: 13, storedSessionId: 'stored-session-retry' })
+
+    expect(activeSessionSwitchTraceRequestId('stored-session-retry')).toBe(13)
+
+    const retry = createSessionSwitchTrace({ requestId: 14, storedSessionId: 'stored-session-retry' })
+
+    expect(activeSessionSwitchTraceRequestId('stored-session-retry')).toBe(14)
+    expect(elapsedSinceActiveSessionSwitchStage('stored-session-retry', 'first-only', 100, 13)).toBeUndefined()
+
+    markActiveSessionSwitchTraceForRequest('stored-session-retry', 13, 'stale-layout-commit')
+    markActiveSessionSwitchTraceForRequest('stored-session-retry', 14, 'current-layout-commit')
+
+    first.complete('superseded')
+    expect(activeSessionSwitchTraceRequestId('stored-session-retry')).toBe(14)
+
+    retry.complete('cold-resumed')
+    expect(activeSessionSwitchTraceRequestId('stored-session-retry')).toBeUndefined()
+
+    const retrySummary = info.mock.calls.map(call => call[0]).find(summary => summary?.requestId === 14)
+
+    expect(retrySummary.stages).toEqual([expect.objectContaining({ name: 'current-layout-commit' })])
+  })
+
+  it('splits render, insertion commit, and layout into non-negative phases', () => {
+    expect(measureRenderCommitPhases(10, 12.04, 20.08, 25.16)).toEqual({
+      insertionCommitToLayoutMs: 5.1,
+      renderBodyDurationMs: 2,
+      renderToInsertionCommitMs: 10.1
+    })
+    expect(measureRenderCommitPhases(10, 9, 8, 7)).toEqual({
+      insertionCommitToLayoutMs: 0,
+      renderBodyDurationMs: 0,
+      renderToInsertionCommitMs: 0
+    })
   })
 
   it('records exact post-response WebSocket send timing', () => {
