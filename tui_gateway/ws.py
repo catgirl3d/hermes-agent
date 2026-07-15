@@ -42,6 +42,7 @@ _log = logging.getLogger(__name__)
 _WS_WRITE_TIMEOUT_S = 10.0
 _WS_LOG_PAYLOAD_PREVIEW = 240
 _JSON_SERIALIZE_TIMING_MARKER = "__hermes_json_serialize_timing__"
+_EVENT_LOOP_LAG_INTERVAL_S = 0.05
 
 # Per-token streaming frames are coalesced: buffered and flushed as a batch on
 # a short timer instead of waking the event loop once per token. A model reply
@@ -404,6 +405,13 @@ async def handle_ws(ws: Any) -> None:
     dispatch_crashes = 0
     send_failures = 0
     disconnect_reason = "not_connected"
+    event_loop_lag_task: asyncio.Task | None = None
+    event_loop_lag_max_ms = 0.0
+    event_loop_lag_next_due = 0.0
+    previous_dispatch_method: str | None = None
+    previous_dispatch_ms: float | None = None
+    previous_request_ms: float | None = None
+    previous_request_finished_at: float | None = None
 
     try:
         await ws.accept()
@@ -414,6 +422,38 @@ async def handle_ws(ws: Any) -> None:
         _log.info("ws accepted peer=%s", peer)
 
         transport = WSTransport(ws, asyncio.get_running_loop(), peer=peer)
+        loop = asyncio.get_running_loop()
+        event_loop_lag_next_due = loop.time() + _EVENT_LOOP_LAG_INTERVAL_S
+
+        async def monitor_event_loop_lag() -> None:
+            nonlocal event_loop_lag_max_ms, event_loop_lag_next_due
+            while True:
+                await asyncio.sleep(_EVENT_LOOP_LAG_INTERVAL_S)
+                now = loop.time()
+                event_loop_lag_max_ms = max(
+                    event_loop_lag_max_ms,
+                    max(0.0, now - event_loop_lag_next_due) * 1000,
+                )
+                event_loop_lag_next_due = now + _EVENT_LOOP_LAG_INTERVAL_S
+
+        event_loop_lag_task = asyncio.create_task(monitor_event_loop_lag())
+
+        def record_previous_request(
+            method: Any,
+            dispatch_ms: float,
+            request_received_at: float,
+        ) -> None:
+            nonlocal previous_dispatch_method
+            nonlocal previous_dispatch_ms
+            nonlocal previous_request_finished_at
+            nonlocal previous_request_ms
+            request_finished_at = time.perf_counter()
+            previous_dispatch_method = method if isinstance(method, str) else None
+            previous_dispatch_ms = dispatch_ms
+            previous_request_ms = (
+                request_finished_at - request_received_at
+            ) * 1000
+            previous_request_finished_at = request_finished_at
 
         # The desktop app and dashboard chat reach the agent through this WS
         # sidecar, NOT through tui_gateway.entry.main() (the stdio TUI path that
@@ -451,6 +491,12 @@ async def handle_ws(ws: Any) -> None:
             try:
                 raw = await ws.receive_text()
                 received_at = time.perf_counter()
+                receive_event_loop_lag_ms = max(
+                    event_loop_lag_max_ms,
+                    max(0.0, loop.time() - event_loop_lag_next_due) * 1000,
+                )
+                event_loop_lag_max_ms = 0.0
+                event_loop_lag_next_due = loop.time() + _EVENT_LOOP_LAG_INTERVAL_S
             except _WebSocketDisconnect as exc:
                 disconnect_reason = (
                     "client_disconnect("
@@ -508,6 +554,33 @@ async def handle_ws(ws: Any) -> None:
                     and req_params.get("_transport_timing") is True
                 ):
                     ack_started_at = time.perf_counter()
+                    ack_payload: dict[str, Any] = {
+                        "request_id": req_id,
+                        "backend_ws_event_loop_lag_ms": round(
+                            receive_event_loop_lag_ms, 2
+                        ),
+                        **server.agent_build_timing_snapshot(),
+                    }
+                    if previous_dispatch_method is not None:
+                        ack_payload["backend_ws_previous_method"] = (
+                            previous_dispatch_method
+                        )
+                    if previous_dispatch_ms is not None:
+                        ack_payload["backend_ws_previous_dispatch_ms"] = round(
+                            previous_dispatch_ms, 2
+                        )
+                    if previous_request_ms is not None:
+                        ack_payload["backend_ws_previous_request_ms"] = round(
+                            previous_request_ms, 2
+                        )
+                    if previous_request_finished_at is not None:
+                        ack_payload[
+                            "backend_ws_previous_request_finished_ago_ms"
+                        ] = round(
+                            max(0.0, received_at - previous_request_finished_at)
+                            * 1000,
+                            2,
+                        )
                     req_params[server._WS_RECEIVE_TO_ACK_PARAM] = (
                         ack_started_at - received_at
                     ) * 1000
@@ -517,10 +590,7 @@ async def handle_ws(ws: Any) -> None:
                             "method": "event",
                             "params": {
                                 "type": "gateway.request_received",
-                                "payload": {
-                                    "request_id": req_id,
-                                    **server.agent_build_timing_snapshot(),
-                                },
+                                "payload": ack_payload,
                             },
                         }
                     )
@@ -532,6 +602,7 @@ async def handle_ws(ws: Any) -> None:
                         send_failures += 1
                         break
 
+                dispatch_started_at = time.perf_counter()
                 if req_method in server._LONG_HANDLERS:
                     # dispatch() only snapshots context and submits these methods
                     # to its own pool. Sending that tiny operation through the
@@ -540,7 +611,13 @@ async def handle_ws(ws: Any) -> None:
                     resp = server.dispatch(req, transport)
                 else:
                     resp = await asyncio.to_thread(server.dispatch, req, transport)
+                current_dispatch_ms = (
+                    time.perf_counter() - dispatch_started_at
+                ) * 1000
             except Exception:
+                current_dispatch_ms = (
+                    time.perf_counter() - dispatch_started_at
+                ) * 1000
                 dispatch_crashes += 1
                 _log.exception(
                     "ws dispatch crash peer=%s id=%s method=%s",
@@ -565,6 +642,9 @@ async def handle_ws(ws: Any) -> None:
                         req_method,
                     )
                     break
+                record_previous_request(
+                    req_method, current_dispatch_ms, received_at
+                )
                 continue
             if resp is not None and not await transport.write_async(resp):
                 disconnect_reason = "send_failed_after_response"
@@ -576,7 +656,15 @@ async def handle_ws(ws: Any) -> None:
                     req_method,
                 )
                 break
+            record_previous_request(req_method, current_dispatch_ms, received_at)
     finally:
+        if event_loop_lag_task is not None:
+            event_loop_lag_task.cancel()
+            try:
+                await event_loop_lag_task
+            except asyncio.CancelledError:
+                pass
+
         reaped_sessions = 0
         detached_sessions = 0
         if transport is not None:

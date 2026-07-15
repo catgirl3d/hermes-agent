@@ -8,7 +8,7 @@ import {
 import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
 import type * as React from 'react'
-import { Profiler, Suspense, useCallback, useMemo, useRef } from 'react'
+import { Profiler, Suspense, useCallback, useLayoutEffect, useMemo, useRef } from 'react'
 import { useLocation } from 'react-router-dom'
 
 import { Thread } from '@/components/assistant-ui/thread'
@@ -32,7 +32,13 @@ import {
   type RuntimeAdapterSyncMetrics,
   useIncrementalExternalStoreRuntime
 } from '@/lib/incremental-external-store-runtime'
-import { markActiveSessionSwitchTrace, measureActiveSessionSwitchTrace } from '@/lib/session-switch-trace'
+import {
+  activeSessionSwitchTraceRequestId,
+  elapsedSinceActiveSessionSwitchStage,
+  markActiveSessionSwitchTrace,
+  markActiveSessionSwitchTraceForRequest,
+  measureActiveSessionSwitchTrace
+} from '@/lib/session-switch-trace'
 import { cn } from '@/lib/utils'
 import type { ComposerAttachment } from '@/store/composer'
 import { $pinnedSessionIds } from '@/store/layout'
@@ -219,9 +225,26 @@ function ChatRuntimeBoundary({
   onThreadMessagesChange,
   traceSessionId
 }: ChatRuntimeBoundaryProps) {
+  const renderStartedAt = performance.now()
+  const traceRequestId = activeSessionSwitchTraceRequestId(traceSessionId)
+
+  const coldViewPublishToRenderStartMs = elapsedSinceActiveSessionSwitchStage(
+    traceSessionId,
+    'cold-view-published',
+    renderStartedAt,
+    traceRequestId
+  )
+
   const { busy, messages } = useStore($sessionViewSnapshot)
   const runtimeMessageCacheRef = useRef(new WeakMap<ChatMessage, ThreadMessage>())
   const toolMergeCacheRef = useRef(createToolMergeCache())
+
+  const layoutCommittedAtRef = useRef<number | null>(null)
+
+  const lastRuntimeLayoutTraceRef = useRef<{
+    adapter: ExternalStoreAdapter<ThreadMessage>
+    requestId: number | undefined
+  } | null>(null)
 
   const runtimeMessageRepository = useMemo(() => {
     let coalescedCount = 0
@@ -282,12 +305,28 @@ function ChatRuntimeBoundary({
 
   const onRuntimeAdapterSync = useCallback(
     ({ durationMs, messageCount }: RuntimeAdapterSyncMetrics) => {
-      markActiveSessionSwitchTrace(traceSessionId, 'runtime-adapter-synced', {
+      const syncFinishedAt = performance.now()
+      const layoutCommittedAt = layoutCommittedAtRef.current
+
+      markActiveSessionSwitchTraceForRequest(traceSessionId, traceRequestId, 'runtime-adapter-synced', {
+        layoutCommitToSyncStartMs:
+          layoutCommittedAt === null
+            ? undefined
+            : Math.round(Math.max(0, syncFinishedAt - durationMs - layoutCommittedAt) * 10) / 10,
         messageCount,
         operationDurationMs: durationMs
       })
     },
-    [traceSessionId]
+    [traceRequestId, traceSessionId]
+  )
+
+  const onRuntimeAdapterSyncStart = useCallback(
+    ({ messageCount }: Pick<RuntimeAdapterSyncMetrics, 'messageCount'>) => {
+      markActiveSessionSwitchTraceForRequest(traceSessionId, traceRequestId, 'runtime-adapter-sync-started', {
+        messageCount
+      })
+    },
+    [traceRequestId, traceSessionId]
   )
 
   const runtimeAdapter = useMemo<ExternalStoreAdapter<ThreadMessage>>(
@@ -306,8 +345,27 @@ function ChatRuntimeBoundary({
     [busy, onCancel, onEdit, onReload, onThreadMessagesChange, runtimeMessageRepository]
   )
 
+  useLayoutEffect(() => {
+    const layoutCommittedAt = performance.now()
+    const lastTrace = lastRuntimeLayoutTraceRef.current
+
+    layoutCommittedAtRef.current = layoutCommittedAt
+
+    if (lastTrace?.adapter === runtimeAdapter && lastTrace.requestId === traceRequestId) {
+      return
+    }
+
+    lastRuntimeLayoutTraceRef.current = { adapter: runtimeAdapter, requestId: traceRequestId }
+    markActiveSessionSwitchTraceForRequest(traceSessionId, traceRequestId, 'runtime-boundary-layout-commit', {
+      coldViewPublishToRenderStartMs,
+      messageCount: messages.length,
+      renderToLayoutCommitMs: Math.round((layoutCommittedAt - renderStartedAt) * 10) / 10
+    })
+  })
+
   const runtime = useIncrementalExternalStoreRuntime<ThreadMessage>(runtimeAdapter, {
-    onAdapterSync: onRuntimeAdapterSync
+    onAdapterSync: onRuntimeAdapterSync,
+    onAdapterSyncStart: onRuntimeAdapterSyncStart
   })
 
   return <AssistantRuntimeProvider runtime={runtime}>{children}</AssistantRuntimeProvider>

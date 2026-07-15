@@ -391,12 +391,19 @@ export interface SessionResumeResponse {
     backend_agent_build_active_max_elapsed_ms?: number
     backend_agent_build_last_duration_ms?: number
     backend_agent_build_last_finished_ago_ms?: number
+    backend_ws_event_loop_lag_ms?: number
+    backend_ws_previous_dispatch_ms?: number
+    backend_ws_previous_method?: string
+    backend_ws_previous_request_finished_ago_ms?: number
+    backend_ws_previous_request_ms?: number
     db_open?: number
     client_message_event_queue?: number
     client_receive_ack_event_queue?: number
     client_receive_ack_to_response?: number
     client_request_receive_ack?: number
+    client_request_receive_ack_renderer_lag?: number
     client_request_receive_ack_transport?: number
+    client_request_receive_ack_unattributed?: number
     client_request_send?: number
     dispatch_queue?: number
     event_loop_queue?: number

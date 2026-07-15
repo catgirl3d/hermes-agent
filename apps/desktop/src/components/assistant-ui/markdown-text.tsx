@@ -18,6 +18,10 @@ import {
   useState
 } from 'react'
 
+import {
+  useMessageRenderTiming,
+  useMessageRenderTimingScope
+} from '@/components/assistant-ui/thread/message-render-timing'
 import { ExpandableBlock } from '@/components/chat/expandable-block'
 import { PreviewAttachment } from '@/components/chat/preview-attachment'
 import { chunkByLines, SyntaxHighlighter } from '@/components/chat/shiki-highlighter'
@@ -435,6 +439,14 @@ function HugeTextFallback({ containerClassName, text }: { containerClassName?: s
 
 function MarkdownTextSurface({ containerClassName, containerProps }: MarkdownTextSurfaceProps) {
   const { status, text } = useMessagePartText()
+  const renderTimingScope = useMessageRenderTimingScope()
+
+  const finishRenderBody = useMessageRenderTiming(
+    renderTimingScope?.traceSessionId ?? null,
+    renderTimingScope?.messageId ?? '',
+    'assistant-markdown'
+  )
+
   const isStreaming = status.type === 'running'
 
   // Keep code parsing enabled while streaming so incomplete fenced blocks still
@@ -553,8 +565,12 @@ function MarkdownTextSurface({ containerClassName, containerProps }: MarkdownTex
   )
 
   if (text.length > MAX_MARKDOWN_CHARS) {
+    finishRenderBody()
+
     return <HugeTextFallback containerClassName={containerClassName} text={text} />
   }
+
+  finishRenderBody()
 
   return (
     <StreamdownTextPrimitive

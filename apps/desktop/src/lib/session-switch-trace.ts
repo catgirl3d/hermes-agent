@@ -23,14 +23,85 @@ interface SessionSwitchTraceOptions {
   storedSessionId: string
 }
 
+interface RenderCommitPhases {
+  renderBodyDurationMs: number
+  renderToInsertionCommitMs: number
+  insertionCommitToLayoutMs: number
+}
+
 const SLOW_SWITCH_MS = 250
 
-const activeTraces = new Map<string, Pick<SessionSwitchTrace, 'mark'>>()
+interface ActiveSessionSwitchTrace extends Pick<SessionSwitchTrace, 'mark'> {
+  markedAtByName: Map<string, number>
+  requestId: number
+}
+
+const activeTraces = new Map<string, ActiveSessionSwitchTrace>()
 
 /** Records a stage from a renderer boundary that does not own the resume hook. */
 export function markActiveSessionSwitchTrace(storedSessionId: string | null, name: string, fields?: TraceFields): void {
   if (storedSessionId) {
     activeTraces.get(storedSessionId)?.mark(name, fields)
+  }
+}
+
+/** Records a renderer stage only if it still belongs to the active resume attempt. */
+export function markActiveSessionSwitchTraceForRequest(
+  storedSessionId: string | null,
+  requestId: number | undefined,
+  name: string,
+  fields?: TraceFields
+): void {
+  if (!storedSessionId || requestId === undefined) {
+    return
+  }
+
+  const trace = activeTraces.get(storedSessionId)
+
+  if (trace?.requestId === requestId) {
+    trace.mark(name, fields)
+  }
+}
+
+/** Measures scheduler delay from an already-recorded boundary without adding a render-phase side effect. */
+export function elapsedSinceActiveSessionSwitchStage(
+  storedSessionId: string | null,
+  name: string,
+  endedAt = performance.now(),
+  expectedRequestId?: number
+): number | undefined {
+  if (!storedSessionId) {
+    return undefined
+  }
+
+  const trace = activeTraces.get(storedSessionId)
+
+  if (!trace || (expectedRequestId !== undefined && trace.requestId !== expectedRequestId)) {
+    return undefined
+  }
+
+  const markedAt = trace.markedAtByName.get(name)
+
+  return markedAt === undefined ? undefined : Math.round(Math.max(0, endedAt - markedAt) * 10) / 10
+}
+
+/** Identifies one resume attempt so commit deduplication cannot leak across retries. */
+export function activeSessionSwitchTraceRequestId(storedSessionId: string | null): number | undefined {
+  return storedSessionId ? activeTraces.get(storedSessionId)?.requestId : undefined
+}
+
+export function measureRenderCommitPhases(
+  renderStartedAt: number,
+  renderBodyFinishedAt: number,
+  insertionCommittedAt: number,
+  layoutCommittedAt: number
+): RenderCommitPhases {
+  const duration = (from: number, to: number) => Math.round(Math.max(0, to - from) * 10) / 10
+
+  return {
+    renderBodyDurationMs: duration(renderStartedAt, renderBodyFinishedAt),
+    renderToInsertionCommitMs: duration(renderStartedAt, insertionCommittedAt),
+    insertionCommitToLayoutMs: duration(insertionCommittedAt, layoutCommittedAt)
   }
 }
 
@@ -93,6 +164,7 @@ export function createSessionSwitchTrace({
 }: SessionSwitchTraceOptions): SessionSwitchTrace {
   const startedAt = performance.now()
   const stages: Array<{ atMs: number; name: string } & TraceFields> = []
+  const markedAtByName = new Map<string, number>()
   let completed = false
   let previousStageAt = startedAt
 
@@ -111,10 +183,11 @@ export function createSessionSwitchTrace({
     delete stageFields.name
     delete stageFields.sincePreviousStageMs
     previousStageAt = markedAt
+    markedAtByName.set(name, markedAt)
     stages.push({ atMs, sincePreviousStageMs, name, ...stageFields })
   }
 
-  const activeTrace = { mark }
+  const activeTrace = { mark, markedAtByName, requestId }
   activeTraces.set(storedSessionId, activeTrace)
 
   return {
@@ -125,13 +198,16 @@ export function createSessionSwitchTrace({
       }
 
       completed = true
+
       if (activeTraces.get(storedSessionId) === activeTrace) {
         activeTraces.delete(storedSessionId)
       }
 
       const elapsedMs = Math.round((performance.now() - startedAt) * 10) / 10
+
       const session =
         storedSessionId.length <= 12 ? storedSessionId : `${storedSessionId.slice(0, 5)}…${storedSessionId.slice(-6)}`
+
       const summary = {
         elapsedMs,
         outcome,
@@ -140,6 +216,7 @@ export function createSessionSwitchTrace({
         stages,
         ...fields
       }
+
       const log = elapsedMs >= SLOW_SWITCH_MS ? console.warn : console.info
 
       console.groupCollapsed(`[session-switch #${requestId}] ${outcome} ${elapsedMs}ms`)
