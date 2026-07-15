@@ -6,9 +6,8 @@ import {
   type ThreadMessage
 } from '@assistant-ui/react'
 import { useStore } from '@nanostores/react'
-import { useQuery } from '@tanstack/react-query'
 import type * as React from 'react'
-import { Profiler, Suspense, useCallback, useLayoutEffect, useMemo, useRef } from 'react'
+import { lazy, Profiler, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useLocation } from 'react-router-dom'
 
 import { Thread } from '@/components/assistant-ui/thread'
@@ -18,13 +17,12 @@ import { PromptOverlays } from '@/components/prompt-overlays'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { ErrorState } from '@/components/ui/error-state'
-import { getGlobalModelOptions, type HermesGateway } from '@/hermes'
+import type { HermesGateway } from '@/hermes'
 import { useI18n } from '@/i18n'
 import type { ChatMessage } from '@/lib/chat-messages'
 import {
   coalesceToolOnlyAssistants,
   createToolMergeCache,
-  quickModelOptions,
   sessionTitle,
   toRuntimeMessage
 } from '@/lib/chat-runtime'
@@ -46,7 +44,6 @@ import { $petActive } from '@/store/pet'
 import { $petOverlayActive } from '@/store/pet-overlay'
 import { $gatewaySwapTarget } from '@/store/profile'
 import {
-  $contextSuggestions,
   $currentCwd,
   $currentModel,
   $currentProvider,
@@ -67,7 +64,6 @@ import {
   sessionPinId
 } from '@/store/session'
 import { isSecondaryWindow, isWatchWindow } from '@/store/windows'
-import type { ModelOptionsResponse } from '@/types/hermes'
 
 import { routeSessionId } from '../routes'
 import { titlebarHeaderBaseClass, titlebarHeaderShadowClass, titlebarHeaderTitleClass } from '../shell/titlebar'
@@ -75,7 +71,6 @@ import type { ToolResultPruneResponse } from '../types'
 
 import { ChatDropOverlay } from './chat-drop-overlay'
 import { ChatSwapOverlay } from './chat-swap-overlay'
-import { ChatBar, ChatBarFallback } from './composer'
 import { requestComposerInsert, requestComposerInsertRefs } from './composer/focus'
 import { droppedFileInlineRefs, type SessionDragPayload, sessionInlineRef } from './composer/inline-refs'
 import type { ChatBarState } from './composer/types'
@@ -85,6 +80,8 @@ import { useFileDropZone } from './hooks/use-file-drop-zone'
 import { ScrollToBottomButton } from './scroll-to-bottom-button'
 import { SessionActionsMenu } from './sidebar/session-actions-menu'
 import { threadLoadingState } from './thread-loading'
+
+const LazyChatBar = lazy(() => import('./composer').then(module => ({ default: module.ChatBar })))
 
 interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   gateway: HermesGateway | null
@@ -417,7 +414,6 @@ export function ChatView({
   const prewarmOnIntent = useComposerIntentPrewarm({ gateway, sessionId: activeSessionId })
   const awaitingResponse = useStore($sessionViewAwaitingResponse)
   const busy = useStore($sessionViewBusy)
-  const contextSuggestions = useStore($contextSuggestions)
   const currentCwd = useStore($currentCwd)
   const currentModel = useStore($currentModel)
   const currentProvider = useStore($currentProvider)
@@ -480,7 +476,25 @@ export function ChatView({
   // Hide the composer in the exhausted error state too: there's no live runtime
   // to send to until a retry rebinds one. Watch windows are pure spectators of a
   // subagent run driven elsewhere — no composer, transcript is read-only.
-  const showChatBar = !routeSessionMismatch && !loadingSession && !resumeExhausted && !isWatchWindow()
+  const watchWindow = isWatchWindow()
+  const showChatBar = !routeSessionMismatch && !loadingSession && !resumeExhausted && !watchWindow
+  const composerScope = selectedSessionId || activeSessionId || '__new__'
+  const [visibleComposerScope, setVisibleComposerScope] = useState<string | null>(null)
+  const composerEverMountedRef = useRef(false)
+  const composerVisible = showChatBar && visibleComposerScope === composerScope
+
+  if (showChatBar) {
+    composerEverMountedRef.current = true
+  }
+
+  useEffect(() => {
+    if (showChatBar) {
+      setVisibleComposerScope(composerScope)
+    }
+  }, [composerScope, showChatBar])
+
+  const composerShouldMount = !watchWindow && !resumeExhausted && (composerEverMountedRef.current || showChatBar)
+
   const threadKey = visibleStoredSessionId || activeSessionId || (isRoutedSessionView ? location.pathname : 'new')
   const traceSessionIdRef = useRef<null | string>(selectedSessionId)
   traceSessionIdRef.current = selectedSessionId
@@ -515,30 +529,6 @@ export function ChatView({
     [busy, loadingSession, messagesEmpty, routeSessionMismatch]
   )
 
-  const modelOptionsQuery = useQuery<ModelOptionsResponse>({
-    queryKey: ['model-options', activeSessionId || 'global'],
-    queryFn: () => {
-      if (!activeSessionId) {
-        return getGlobalModelOptions()
-      }
-
-      if (!gateway) {
-        throw new Error('Hermes gateway unavailable')
-      }
-
-      return gateway.request<ModelOptionsResponse>('model.options', {
-        session_id: activeSessionId,
-        explicit_only: true
-      })
-    },
-    enabled: gatewayOpen
-  })
-
-  const quickModels = useMemo(
-    () => quickModelOptions(modelOptionsQuery.data, currentProvider, currentModel),
-    [currentModel, currentProvider, modelOptionsQuery.data]
-  )
-
   const chatBarState = useMemo<ChatBarState>(
     () => ({
       model: {
@@ -546,21 +536,39 @@ export function ChatView({
         provider: currentProvider,
         canSwitch: gatewayOpen,
         loading: !gatewayOpen || (!currentModel && !currentProvider),
-        modelMenuContent,
-        quickModels
+        modelMenuContent
       },
       tools: {
         enabled: true,
-        label: 'Add context',
-        suggestions: contextSuggestions
+        label: 'Add context'
       },
       voice: {
         enabled: true,
         active: false
       }
     }),
-    [contextSuggestions, currentModel, currentProvider, gatewayOpen, modelMenuContent, quickModels]
+    [currentModel, currentProvider, gatewayOpen, modelMenuContent]
   )
+
+  const composerBindingRef = useRef<{
+    cwd: string
+    focusKey: string | null
+    queueSessionKey: string | null
+    sessionId: string | null
+    state: ChatBarState
+  } | null>(null)
+
+  if (showChatBar) {
+    composerBindingRef.current = {
+      cwd: currentCwd,
+      focusKey: activeSessionId,
+      queueSessionKey: selectedSessionId,
+      sessionId: activeSessionId,
+      state: chatBarState
+    }
+  }
+
+  const composerBinding = composerBindingRef.current
 
   // Drop files anywhere in the conversation area, not just on the composer
   // input. In-app drags (project tree / gutter) carry workspace-relative paths
@@ -594,7 +602,7 @@ export function ChatView({
     requestComposerInsertRefs([sessionInlineRef(session)], { intent: 'attachment', target: 'main' })
   }, [])
 
-  const { dragKind, dropHandlers } = useFileDropZone({ enabled: showChatBar, onDropFiles, onDropSession })
+  const { dragKind, dropHandlers } = useFileDropZone({ enabled: composerVisible, onDropFiles, onDropSession })
 
   return (
     <div
@@ -632,7 +640,7 @@ export function ChatView({
           >
             <Profiler id="session-thread" onRender={onThreadRender}>
               <Thread
-                clampToComposer={showChatBar}
+                clampToComposer={composerVisible}
                 cwd={currentCwd}
                 gateway={gateway}
                 intro={showIntro ? { personality: introPersonality, seed: introSeed } : undefined}
@@ -684,35 +692,42 @@ export function ChatView({
               off-screen instead of floating against the viewport. As a sibling it
               anchors to the outer relative container instead: docked is absolute
               (identical placement), floating resolves against the viewport. Both
-              states stay mounted here, so dock⇄float never remounts the editor. */}
-          {showChatBar && (
-            <Suspense fallback={<ChatBarFallback />}>
-              <ChatBar
-                busy={busy}
-                cwd={currentCwd}
-                disabled={!gatewayOpen}
-                focusKey={activeSessionId}
-                gateway={gateway}
-                maxRecordingSeconds={maxVoiceRecordingSeconds}
-                onAddContextRef={onAddContextRef}
-                onAddUrl={onAddUrl}
-                onAttachDroppedItems={onAttachDroppedItems}
-                onAttachImageBlob={onAttachImageBlob}
-                onCancel={onCancel}
-                onIntent={prewarmOnIntent}
-                onPasteClipboardImage={onPasteClipboardImage}
-                onPickFiles={onPickFiles}
-                onPickFolders={onPickFolders}
-                onPickImages={onPickImages}
-                onRemoveAttachment={onRemoveAttachment}
-                onSteer={onSteer}
-                onSubmit={onSubmit}
-                onTranscribeAudio={onTranscribeAudio}
-                queueSessionKey={selectedSessionId}
-                sessionId={activeSessionId}
-                state={chatBarState}
-              />
-            </Suspense>
+              states stay mounted after the first visible bind, so
+              dock⇄float never remounts its editor. */}
+          {composerShouldMount && composerBinding && (
+            <div
+              aria-hidden={!composerVisible}
+              hidden={!composerVisible}
+              inert={composerVisible ? undefined : true}
+            >
+              <Suspense fallback={null}>
+                <LazyChatBar
+                  busy={composerVisible ? busy : false}
+                  cwd={composerBinding.cwd}
+                  disabled={!composerVisible || !gatewayOpen}
+                  focusKey={composerBinding.focusKey}
+                  gateway={gateway}
+                  maxRecordingSeconds={maxVoiceRecordingSeconds}
+                  onAddContextRef={onAddContextRef}
+                  onAddUrl={onAddUrl}
+                  onAttachDroppedItems={onAttachDroppedItems}
+                  onAttachImageBlob={onAttachImageBlob}
+                  onCancel={onCancel}
+                  onIntent={prewarmOnIntent}
+                  onPasteClipboardImage={onPasteClipboardImage}
+                  onPickFiles={onPickFiles}
+                  onPickFolders={onPickFolders}
+                  onPickImages={onPickImages}
+                  onRemoveAttachment={onRemoveAttachment}
+                  onSteer={onSteer}
+                  onSubmit={onSubmit}
+                  onTranscribeAudio={onTranscribeAudio}
+                  queueSessionKey={composerBinding.queueSessionKey}
+                  sessionId={composerBinding.sessionId}
+                  state={composerBinding.state}
+                />
+              </Suspense>
+            </div>
           )}
         </ChatRuntimeBoundary>
       </Profiler>

@@ -6,12 +6,6 @@ import type { ComposerAttachment } from '@/store/composer'
 import type { DroppedFile } from '../hooks/use-composer-actions'
 import type { ComposerIntent } from '../hooks/use-composer-intent-prewarm'
 
-export interface ContextSuggestion {
-  text: string
-  display: string
-  meta?: string
-}
-
 export interface QuickModelOption {
   provider: string
   providerName: string
@@ -24,11 +18,10 @@ export interface ChatBarState {
     provider: string
     canSwitch: boolean
     loading?: boolean
-    quickModels?: QuickModelOption[]
     /** Reused status-bar dropdown (built with gateway + selectModel upstream). */
     modelMenuContent?: ReactNode
   }
-  tools: { enabled: boolean; label: string; suggestions?: ContextSuggestion[] }
+  tools: { enabled: boolean; label: string }
   voice: { enabled: boolean; active: boolean }
 }
 

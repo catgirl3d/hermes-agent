@@ -1,7 +1,6 @@
 import { atom, computed } from 'nanostores'
 
 import { lastVisibleMessageIsUser } from '@/app/chat/thread-loading'
-import type { ContextSuggestion } from '@/app/types'
 import type { HermesConnection } from '@/global'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { prepareSessionSnapshot, type SessionViewSnapshot } from '@/lib/session-view-snapshot'
@@ -287,7 +286,6 @@ export const $introPersonality = atom('')
 export const $currentPersonality = atom('')
 export const $availablePersonalities = atom<string[]>([])
 export const $introSeed = atom(0)
-export const $contextSuggestions = atom<ContextSuggestion[]>([])
 export const $modelPickerOpen = atom(false)
 export const $sessionPickerOpen = atom(false)
 
@@ -469,7 +467,6 @@ export const setCurrentPersonality = (next: Updater<string>) => {
 }
 export const setAvailablePersonalities = (next: Updater<string[]>) => updateAtom($availablePersonalities, next)
 export const setIntroSeed = (next: Updater<number>) => updateAtom($introSeed, next)
-export const setContextSuggestions = (next: Updater<ContextSuggestion[]>) => updateAtom($contextSuggestions, next)
 export const setModelPickerOpen = (next: Updater<boolean>) => updateAtom($modelPickerOpen, next)
 export const setSessionPickerOpen = (next: Updater<boolean>) => updateAtom($sessionPickerOpen, next)
 
