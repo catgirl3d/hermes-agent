@@ -185,6 +185,10 @@ _LONG_HANDLERS = frozenset(
         "billing.step_up",
         "browser.manage",
         "cli.exec",
+        # Desktop loads the command catalog while mounting the composer. It
+        # reads config and scans skill directories, so cold filesystem/GIL
+        # pressure must not make it block session.resume on the WS reader.
+        "commands.catalog",
         # Completion RPCs run inline on the reader thread by default, but both
         # can block it for seconds: complete.path spawns `git ls-files` and
         # fuzzy-ranks the whole repo (slow on large repos / WSL2 mounts), and
@@ -207,6 +211,9 @@ _LONG_HANDLERS = frozenset(
         "pet.generate",
         "pet.hatch",
         "pet.info",
+        # Polled independently by the floating Desktop pet. Although normally
+        # cheap, it still reads profile config and filesystem metadata.
+        "pet.info.meta",
         "pet.select",
         "pet.thumb",
         "learning.frames",
