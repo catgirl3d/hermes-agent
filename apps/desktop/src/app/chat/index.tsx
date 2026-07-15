@@ -45,6 +45,7 @@ import {
   $introSeed,
   $resumeExhaustedSessionId,
   $selectedStoredSessionId,
+  $sessionViewRuntimeSyncMode,
   $sessions,
   sessionMatchesStoredId,
   sessionPinId
@@ -217,8 +218,10 @@ function ChatRuntimeBoundary({
   const view = useSessionView()
   const busy = useStore(view.$busy)
   const messages = useStore(view.$messages)
+  const runtimeSyncMode = useStore($sessionViewRuntimeSyncMode)
   const runtimeMessageRepository = useRuntimeMessageRepository(messages, traceSessionId)
   const layoutCommittedAtRef = useRef<number | null>(null)
+  const layoutSyncedRequestIdRef = useRef<number | undefined>(undefined)
 
   const lastRuntimeLayoutTraceRef = useRef<{
     adapter: ExternalStoreAdapter<ThreadMessage>
@@ -230,6 +233,10 @@ function ChatRuntimeBoundary({
       const syncFinishedAt = performance.now()
       const layoutCommittedAt = layoutCommittedAtRef.current
 
+      if (runtimeSyncMode === 'layout') {
+        layoutSyncedRequestIdRef.current = traceRequestId
+      }
+
       markActiveSessionSwitchTraceForRequest(traceSessionId, traceRequestId, 'runtime-adapter-synced', {
         layoutCommitToSyncStartMs:
           layoutCommittedAt === null
@@ -239,7 +246,7 @@ function ChatRuntimeBoundary({
         operationDurationMs: durationMs
       })
     },
-    [traceRequestId, traceSessionId]
+    [runtimeSyncMode, traceRequestId, traceSessionId]
   )
 
   const onRuntimeAdapterSyncStart = useCallback(
@@ -285,9 +292,15 @@ function ChatRuntimeBoundary({
     })
   })
 
+  const pendingRuntimeSyncMode =
+    runtimeSyncMode === 'layout' && traceRequestId !== undefined && layoutSyncedRequestIdRef.current !== traceRequestId
+      ? 'layout'
+      : 'passive'
+
   const runtime = useIncrementalExternalStoreRuntime<ThreadMessage>(runtimeAdapter, {
     onAdapterSync: onRuntimeAdapterSync,
-    onAdapterSyncStart: onRuntimeAdapterSyncStart
+    onAdapterSyncStart: onRuntimeAdapterSyncStart,
+    syncMode: pendingRuntimeSyncMode
   })
 
   return <AssistantRuntimeProvider runtime={runtime}>{children}</AssistantRuntimeProvider>

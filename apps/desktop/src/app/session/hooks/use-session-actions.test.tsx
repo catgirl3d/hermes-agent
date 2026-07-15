@@ -331,6 +331,7 @@ describe('resumeSession failure recovery', () => {
     await act(async () => pendingResume!)
 
     expect($sessionViewSnapshot.get()).toMatchObject({
+      runtimeSyncMode: 'layout',
       runtimeSessionId: 'runtime-target',
       storedSessionId: 'stored-1'
     })

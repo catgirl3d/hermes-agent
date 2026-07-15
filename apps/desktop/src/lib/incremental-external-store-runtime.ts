@@ -13,7 +13,7 @@ import {
   type ThreadMessage,
   useRuntimeAdapters
 } from '@assistant-ui/react'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
 const EMPTY_ARRAY = Object.freeze([])
 
@@ -25,6 +25,7 @@ export interface RuntimeAdapterSyncMetrics {
 interface IncrementalExternalStoreRuntimeOptions {
   onAdapterSync?: (metrics: RuntimeAdapterSyncMetrics) => void
   onAdapterSyncStart?: (metrics: Pick<RuntimeAdapterSyncMetrics, 'messageCount'>) => void
+  syncMode?: 'layout' | 'passive'
 }
 
 const shallowEqual = (a: object, b: object): boolean => {
@@ -201,20 +202,39 @@ export function useIncrementalExternalStoreRuntime<T extends ThreadMessage>(
   const [runtime] = useState(() => new IncrementalExternalStoreRuntimeCore(store as ExternalStoreAdapter))
   const onAdapterSyncRef = useRef(options.onAdapterSync)
   const onAdapterSyncStartRef = useRef(options.onAdapterSyncStart)
+  const syncedStoreRef = useRef<ExternalStoreAdapter | null>(null)
   onAdapterSyncRef.current = options.onAdapterSync
   onAdapterSyncStartRef.current = options.onAdapterSyncStart
 
-  useEffect(() => {
-    const messageCount = store.messageRepository?.messages.length ?? store.messages?.length ?? 0
+  const syncAdapter = useCallback((nextStore: ExternalStoreAdapter) => {
+    if (syncedStoreRef.current === nextStore) {
+      return
+    }
+
+    const messageCount = nextStore.messageRepository?.messages.length ?? nextStore.messages?.length ?? 0
 
     onAdapterSyncStartRef.current?.({ messageCount })
+
     const startedAt = performance.now()
-    runtime.setAdapter(store as ExternalStoreAdapter)
+    runtime.setAdapter(nextStore)
+    syncedStoreRef.current = nextStore
     onAdapterSyncRef.current?.({
       durationMs: Math.round((performance.now() - startedAt) * 10) / 10,
       messageCount
     })
-  }, [runtime, store])
+  }, [runtime])
+
+  useLayoutEffect(() => {
+    if (options.syncMode === 'layout') {
+      syncAdapter(store as ExternalStoreAdapter)
+    }
+  }, [options.syncMode, store, syncAdapter])
+
+  useEffect(() => {
+    if (options.syncMode !== 'layout') {
+      syncAdapter(store as ExternalStoreAdapter)
+    }
+  }, [options.syncMode, store, syncAdapter])
 
   const { modelContext } = useRuntimeAdapters() ?? {}
 
