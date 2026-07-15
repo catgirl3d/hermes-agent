@@ -235,11 +235,13 @@ function ChatRuntimeBoundary({
     traceRequestId
   )
 
-  const { busy, messages } = useStore($sessionViewSnapshot)
+  const sessionViewSnapshot = useStore($sessionViewSnapshot)
+  const { busy, messages, runtimeSyncMode } = sessionViewSnapshot
   const runtimeMessageCacheRef = useRef(new WeakMap<ChatMessage, ThreadMessage>())
   const toolMergeCacheRef = useRef(createToolMergeCache())
 
   const layoutCommittedAtRef = useRef<number | null>(null)
+  const layoutSyncedSnapshotRef = useRef<typeof sessionViewSnapshot | null>(null)
 
   const lastRuntimeLayoutTraceRef = useRef<{
     adapter: ExternalStoreAdapter<ThreadMessage>
@@ -308,6 +310,10 @@ function ChatRuntimeBoundary({
       const syncFinishedAt = performance.now()
       const layoutCommittedAt = layoutCommittedAtRef.current
 
+      if (runtimeSyncMode === 'layout') {
+        layoutSyncedSnapshotRef.current = sessionViewSnapshot
+      }
+
       markActiveSessionSwitchTraceForRequest(traceSessionId, traceRequestId, 'runtime-adapter-synced', {
         layoutCommitToSyncStartMs:
           layoutCommittedAt === null
@@ -317,7 +323,7 @@ function ChatRuntimeBoundary({
         operationDurationMs: durationMs
       })
     },
-    [traceRequestId, traceSessionId]
+    [runtimeSyncMode, sessionViewSnapshot, traceRequestId, traceSessionId]
   )
 
   const onRuntimeAdapterSyncStart = useCallback(
@@ -363,9 +369,13 @@ function ChatRuntimeBoundary({
     })
   })
 
+  const pendingRuntimeSyncMode =
+    runtimeSyncMode === 'layout' && layoutSyncedSnapshotRef.current !== sessionViewSnapshot ? 'layout' : 'passive'
+
   const runtime = useIncrementalExternalStoreRuntime<ThreadMessage>(runtimeAdapter, {
     onAdapterSync: onRuntimeAdapterSync,
-    onAdapterSyncStart: onRuntimeAdapterSyncStart
+    onAdapterSyncStart: onRuntimeAdapterSyncStart,
+    syncMode: pendingRuntimeSyncMode
   })
 
   return <AssistantRuntimeProvider runtime={runtime}>{children}</AssistantRuntimeProvider>

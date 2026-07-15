@@ -324,7 +324,7 @@ export const $sessionViewBusy = computed($sessionViewSnapshot, snapshot => snaps
 export const $sessionViewAwaitingResponse = computed($sessionViewSnapshot, snapshot => snapshot.awaitingResponse)
 
 function patchSessionViewSnapshot(patch: Partial<SessionViewSnapshot>): void {
-  $sessionViewSnapshot.set({ ...$sessionViewSnapshot.get(), ...patch })
+  $sessionViewSnapshot.set({ ...$sessionViewSnapshot.get(), ...patch, runtimeSyncMode: 'passive' })
 }
 
 /** Atomically publishes the coherent chat view, then updates compatibility mirrors. */

@@ -6,8 +6,8 @@ import { deleteSession, getSessionMessages, setSessionArchived } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
-import { prepareSessionSnapshot } from '@/lib/session-view-snapshot'
 import { createSessionSwitchTrace } from '@/lib/session-switch-trace'
+import { prepareSessionSnapshot } from '@/lib/session-view-snapshot'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { clearQueuedPrompts } from '@/store/composer-queue'
 import { $pinnedSessionIds } from '@/store/layout'
@@ -21,8 +21,8 @@ import {
   $currentProvider,
   $currentReasoningEffort,
   $newChatWorkspaceTarget,
-  $sessionViewSnapshot,
   $sessions,
+  $sessionViewSnapshot,
   $yoloActive,
   type NewChatWorkspaceTarget,
   publishSessionViewSnapshot,
@@ -729,9 +729,12 @@ export function useSessionActions({
           }),
           storedSessionId
         )
+
         activeSessionIdRef.current = resumed.session_id
         busyRef.current = resumedState.busy
-        publishSessionViewSnapshot(prepareSessionSnapshot(resumed.session_id, resumedState))
+        publishSessionViewSnapshot(
+          prepareSessionSnapshot(resumed.session_id, resumedState, { runtimeSyncMode: 'layout' })
+        )
         trace.mark('cold-view-published', { messageCount: resumedMessages.length })
         completeAfterNextPaint('cold-resumed', { messageCount: resumedMessages.length, profileSwitch })
       } catch (err) {
