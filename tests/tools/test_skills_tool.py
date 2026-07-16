@@ -1381,3 +1381,73 @@ class TestSkillViewCollisionDetection:
         result = json.loads(raw)
         assert result["success"] is True
         assert "LOCAL BODY" in result["content"]
+
+
+def test_bundled_hermes_agent_skill_is_modularized():
+    repo_skills_dir = Path(__file__).resolve().parents[2] / "skills"
+    expected_references = {
+        "references/cli.md",
+        "references/config.md",
+        "references/context-files.md",
+        "references/contributor.md",
+        "references/cron.md",
+        "references/curator.md",
+        "references/gateway.md",
+        "references/kanban.md",
+        "references/native-mcp.md",
+        "references/security-privacy.md",
+        "references/slash-commands.md",
+        "references/spawning.md",
+        "references/surfaces.md",
+        "references/troubleshooting.md",
+        "references/voice.md",
+        "references/webhooks.md",
+        "references/windows.md",
+    }
+
+    with patch("tools.skills_tool.SKILLS_DIR", repo_skills_dir):
+        result = json.loads(skill_view("hermes-agent"))
+
+    assert result["success"] is True
+    assert len(result["content"]) < 10_000
+    assert result["linked_files"] is not None
+
+    references = {
+        path.replace("\\", "/") for path in result["linked_files"].get("references", [])
+    }
+    assert references == expected_references
+    assert result["content"].strip()
+    assert "skill_view(name=\"hermes-agent\", file_path=\"references/cli.md\")" in result["content"]
+    assert "skill_view(name=\"hermes-agent\", file_path=\"references/gateway.md\")" in result["content"]
+    assert "skill_view(name=\"hermes-agent\", file_path=\"references/cron.md\")" in result["content"]
+
+
+def test_bundled_hermes_agent_all_topic_files_load():
+    repo_skills_dir = Path(__file__).resolve().parents[2] / "skills"
+    expected_references = [
+        "references/cli.md",
+        "references/config.md",
+        "references/context-files.md",
+        "references/contributor.md",
+        "references/cron.md",
+        "references/curator.md",
+        "references/gateway.md",
+        "references/kanban.md",
+        "references/native-mcp.md",
+        "references/security-privacy.md",
+        "references/slash-commands.md",
+        "references/spawning.md",
+        "references/surfaces.md",
+        "references/troubleshooting.md",
+        "references/voice.md",
+        "references/webhooks.md",
+        "references/windows.md",
+    ]
+
+    with patch("tools.skills_tool.SKILLS_DIR", repo_skills_dir):
+        for file_path in expected_references:
+            result = json.loads(skill_view("hermes-agent", file_path=file_path))
+
+            assert result["success"] is True, file_path
+            assert result["file"].replace("\\", "/") == file_path
+            assert result["content"].strip(), file_path

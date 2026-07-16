@@ -113,3 +113,39 @@ class TestQuietModeCacheIsolation:
         explains why the bug only hit Gateway."""
         model_tools.get_tool_definitions(quiet_mode=False)
         assert len(model_tools._tool_defs_cache) == 0
+
+    def test_explicit_tool_search_policy_has_its_own_cache_key(self, monkeypatch):
+        """Different frozen Tool Search policies must not alias the same
+        cached tool surface."""
+        from tools.tool_search import ToolSearchConfig
+
+        calls = []
+
+        def _fake_compute(
+            enabled_toolsets=None,
+            disabled_toolsets=None,
+            quiet_mode=False,
+            skip_tool_search_assembly=False,
+            tool_search_policy=None,
+        ):
+            calls.append(tool_search_policy)
+            suffix = "deferred" if getattr(tool_search_policy, "defer_core_tools", False) else "visible"
+            return [{"type": "function", "function": {"name": suffix}}]
+
+        monkeypatch.setattr(model_tools, "_compute_tool_definitions", _fake_compute)
+
+        default_policy = ToolSearchConfig.from_raw({"enabled": "on"})
+        deferred_policy = ToolSearchConfig.from_raw({
+            "enabled": "on",
+            "defer_core_tools": True,
+        })
+
+        first = model_tools.get_tool_definitions(quiet_mode=True, tool_search_policy=default_policy)
+        second = model_tools.get_tool_definitions(quiet_mode=True, tool_search_policy=deferred_policy)
+        third = model_tools.get_tool_definitions(quiet_mode=True, tool_search_policy=default_policy)
+
+        assert first[0]["function"]["name"] == "visible"
+        assert second[0]["function"]["name"] == "deferred"
+        assert third[0]["function"]["name"] == "visible"
+        assert len(calls) == 2
+        assert len(model_tools._tool_defs_cache) == 2
