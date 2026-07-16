@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import type { ChatMessage, ChatMessagePart } from './chat-messages'
 import {
@@ -8,10 +8,194 @@ import {
   mergeFinalAssistantText,
   preserveLocalAssistantErrors,
   reasoningPart,
+  reconcilePrunedChatMessages,
   renderMediaTags,
   toChatMessages,
   upsertToolPart
 } from './chat-messages'
+
+describe('reconcilePrunedChatMessages', () => {
+  it('updates backend tool truth while preserving client metadata and hidden branches', () => {
+    const stored = [
+      { role: 'user' as const, content: 'run tests', timestamp: 1 },
+      {
+        role: 'assistant' as const,
+        content: 'Running.',
+        timestamp: 2,
+        tool_calls: [{ id: 'call-1', function: { name: 'terminal', arguments: '{"command":"pytest"}' } }]
+      },
+      {
+        role: 'tool' as const,
+        tool_call_id: 'call-1',
+        tool_name: 'terminal',
+        content: 'full terminal output',
+        timestamp: 3
+      },
+      { role: 'assistant' as const, content: 'Finished.', timestamp: 4 }
+    ]
+
+    const [baseUser, baseAssistant] = toChatMessages(stored)
+    const user: ChatMessage = { ...baseUser, attachmentRefs: ['@file:test.py'] }
+
+    const assistantTool = baseAssistant.parts.find(
+      (part): part is Extract<ChatMessagePart, { type: 'tool-call' }> => part.type === 'tool-call'
+    )
+
+    expect(assistantTool).toBeTruthy()
+
+    const assistant: ChatMessage = {
+      ...baseAssistant,
+      branchGroupId: 'branch:user-1',
+      pending: true,
+      parts: baseAssistant.parts.map(part =>
+        part === assistantTool ? ({ ...part, clientDisplayState: 'expanded' } as typeof part) : part
+      )
+    }
+
+    const hiddenBranch: ChatMessage = {
+      branchGroupId: 'branch:user-1',
+      hidden: true,
+      id: 'hidden-assistant',
+      parts: [{ type: 'text', text: 'Previous branch answer.' }],
+      role: 'assistant'
+    }
+
+    const next = toChatMessages([
+      stored[0],
+      stored[1],
+      { ...stored[2], content: '[terminal] errors and output tail' },
+      stored[3]
+    ]).map((message, index) => ({ ...message, id: `backend-${index}` }))
+
+    const reconciled = reconcilePrunedChatMessages(next, [user, hiddenBranch, assistant])
+
+    expect(reconciled).toHaveLength(3)
+    expect(reconciled[0]).toBe(user)
+    expect(reconciled[1]).toBe(hiddenBranch)
+    expect(reconciled[2]).not.toBe(assistant)
+    expect(reconciled[2]).toMatchObject({
+      branchGroupId: 'branch:user-1',
+      id: assistant.id,
+      pending: true
+    })
+
+    const reconciledTool = reconciled[2].parts.find(
+      (part): part is Extract<ChatMessagePart, { type: 'tool-call' }> => part.type === 'tool-call'
+    )
+
+    expect(reconciledTool?.result).toContain('errors and output tail')
+    expect(reconciledTool).toMatchObject({ clientDisplayState: 'expanded' })
+  })
+
+  it('preserves renderer-owned system notes without ordinal-merging backend system rows into them', () => {
+    const localNote: ChatMessage = {
+      id: 'local-note',
+      parts: [{ type: 'text', text: 'steer:focus on tests' }],
+      rendererOwned: true,
+      role: 'system'
+    }
+
+    const backendSystem: ChatMessage = {
+      id: 'backend-system',
+      parts: [{ type: 'text', text: 'Backend policy' }],
+      role: 'system'
+    }
+
+    const currentUser: ChatMessage = {
+      id: 'current-user',
+      parts: [{ type: 'text', text: 'Run tests' }],
+      role: 'user'
+    }
+
+    const nextSystem: ChatMessage = {
+      id: 'next-system',
+      parts: [{ type: 'text', text: 'Backend policy updated' }],
+      role: 'system'
+    }
+
+    const nextUser: ChatMessage = {
+      id: 'next-user',
+      parts: [{ type: 'text', text: 'Run tests' }],
+      role: 'user'
+    }
+
+    const reconciled = reconcilePrunedChatMessages(
+      [nextSystem, nextUser],
+      [localNote, backendSystem, currentUser]
+    )
+
+    expect(reconciled[0]).toBe(localNote)
+    expect(reconciled[1]).toMatchObject({
+      id: 'backend-system',
+      parts: [{ type: 'text', text: 'Backend policy updated' }]
+    })
+    expect(reconciled.map(message => message.id)).not.toContain('next-system')
+  })
+
+  it('reuses unselected tool payloads without serializing message parts', () => {
+    const previous: ChatMessage = {
+      id: 'previous',
+      parts: [
+        { type: 'text', text: 'Checking.' },
+        {
+          type: 'tool-call',
+          toolCallId: 'terminal-call',
+          toolName: 'terminal',
+          args: {},
+          argsText: '{}',
+          result: 'full terminal output'
+        },
+        {
+          type: 'tool-call',
+          toolCallId: 'read-call',
+          toolName: 'read_file',
+          args: {},
+          argsText: '{}',
+          result: { content: 'x'.repeat(100_000) }
+        }
+      ],
+      role: 'assistant'
+    }
+
+    const next: ChatMessage = {
+      id: 'backend',
+      parts: [
+        { type: 'text', text: 'Checking.' },
+        {
+          type: 'tool-call',
+          toolCallId: 'terminal-call',
+          toolName: 'terminal',
+          args: {},
+          argsText: '{}',
+          result: '[terminal] output tail'
+        },
+        {
+          type: 'tool-call',
+          toolCallId: 'read-call',
+          toolName: 'read_file',
+          args: {},
+          argsText: '{}',
+          result: { content: 'x'.repeat(100_000) }
+        }
+      ],
+      role: 'assistant'
+    }
+
+    const stringify = vi.spyOn(JSON, 'stringify')
+
+    const [reconciled] = reconcilePrunedChatMessages(
+      [next],
+      [previous],
+      new Set(['terminal'])
+    )
+
+    expect(stringify).not.toHaveBeenCalled()
+    stringify.mockRestore()
+    expect(reconciled.parts[0]).toBe(previous.parts[0])
+    expect(reconciled.parts[1]).not.toBe(previous.parts[1])
+    expect(reconciled.parts[2]).toBe(previous.parts[2])
+  })
+})
 
 describe('toChatMessages', () => {
   it('keeps a turn with interleaved tool-only rows in a single bubble', () => {
@@ -225,6 +409,35 @@ describe('interleaved reasoning/text coalescing', () => {
 })
 
 describe('preserveLocalAssistantErrors', () => {
+  it('preserves renderer-owned notes at their backend-message anchor', () => {
+    const before: ChatMessage = {
+      id: 'before',
+      parts: [{ text: 'before', type: 'text' }],
+      role: 'assistant'
+    }
+
+    const note: ChatMessage = {
+      id: 'local-note',
+      parts: [{ text: 'steer:focus', type: 'text' }],
+      rendererOwned: true,
+      role: 'system'
+    }
+
+    const after: ChatMessage = {
+      id: 'after',
+      parts: [{ text: 'after', type: 'text' }],
+      role: 'assistant'
+    }
+
+    const merged = preserveLocalAssistantErrors(
+      [{ ...before }, { ...after }],
+      [before, note, after]
+    )
+
+    expect(merged.map(message => message.id)).toEqual(['before', 'local-note', 'after'])
+    expect(merged[1]).toBe(note)
+  })
+
   it('preserves a local user+error pair when hydration omits the failed turn', () => {
     const nextMessages: ChatMessage[] = [
       {

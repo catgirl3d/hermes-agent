@@ -1699,6 +1699,31 @@ export const en: Translations = {
       hideTabBar: 'Hide tab bar',
       openInNewTab: 'Open in new tab',
       openInSplit: 'Open in split',
+      cleanToolOutputs: 'Clean tool outputs',
+      cleanToolOutputsChoose: 'Choose which tool outputs to compact',
+      cleanToolOutputsCodeWarning:
+        'File/code compaction is lossy. It can reduce answer quality or force the model to read files again.',
+      cleanToolOutputsConfirm: 'Clean context',
+      cleanToolOutputsDone: 'Context cleaned',
+      cleanToolOutputsFailed: 'Could not clean tool outputs',
+      cleanToolOutputsNoop: 'No old tool outputs are large enough to clean.',
+      cleanToolOutputsKinds: {
+        bounded_excerpt: 'bounded head + tail',
+        file_structure: 'lossy outline or head + tail',
+        terminal_tail: 'output tail; structured errors when available',
+        web_fields: 'top 5 result fields'
+      },
+      cleanToolOutputsPreview: (resultCount, argumentCount, tokens) =>
+        `Will compact ${resultCount} old result(s) and ${argumentCount} call payload(s), saving about ${tokens} tokens.`,
+      cleanToolOutputsProtected: turns => `The last ${turns} conversation turns stay verbatim.`,
+      cleanToolOutputsStale: 'The session changed. Review the refreshed preview and confirm again.',
+      cleanToolOutputsToggle: name => `Compact ${name} outputs`,
+      cleanToolOutputsToolMeta: (resultCount, argumentCount, tokens, policy) =>
+        `${resultCount} result(s) + ${argumentCount} call payload(s) · about ${tokens} tokens · ${policy}`,
+      cleanToolOutputsTitle: 'Clean tool outputs?',
+      cleanToolOutputsUpdating: 'Updating preview…',
+      cleanToolOutputsWarning:
+        'This rewrites the current session history and causes one prompt-cache miss. It cannot be undone.',
       copyIdFailed: 'Could not copy session ID',
       actionsFor: title => `Actions for ${title}`,
       sessionActions: 'Session actions',
