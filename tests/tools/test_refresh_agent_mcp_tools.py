@@ -98,6 +98,30 @@ def test_refresh_passes_agent_toolset_filters(monkeypatch):
     assert seen["disabled_toolsets"] == ["messaging"]
 
 
+def test_refresh_passes_agent_frozen_tool_search_policy(monkeypatch):
+    """MCP refresh must rebuild with the session's original Tool Search policy."""
+    from tools.tool_search import ToolSearchConfig
+
+    agent = _agent(["read_file"])
+    agent._tool_search_policy = ToolSearchConfig.from_raw({
+        "enabled": "on",
+        "defer_core_tools": True,
+    })
+    seen = {}
+
+    import model_tools
+
+    def _capture(**kw):
+        seen.update(kw)
+        return [_tool("read_file")]
+
+    monkeypatch.setattr(model_tools, "get_tool_definitions", _capture)
+
+    mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert seen["tool_search_policy"] == agent._tool_search_policy
+
+
 def test_refresh_preserves_memory_provider_and_context_engine_tools(monkeypatch):
     """B1 regression: a rebuild must NOT drop post-build-injected tools.
 

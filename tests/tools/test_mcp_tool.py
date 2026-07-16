@@ -738,6 +738,125 @@ class TestToolHandler:
         finally:
             _servers.pop("test_srv", None)
 
+    def test_search_like_text_result_drops_placeholder_metadata(self):
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        raw = (
+            "Title: US senator and Trump ally Lindsey Graham dies after 'brief and sudden illness' - BBC News\n"
+            "URL: https://www.bbc.co.uk/news/articles/cvgj25j6nmeo\n"
+            "Published: 2026-07-12T06:24:17.000Z\n"
+            "Author: N/A\n"
+            "Highlights:\n"
+            "US senator and Trump ally Lindsey Graham dies after 'brief and sudden illness' - BBC News\n"
+            "...\n"
+            "12 July 2026, 07:24 BST\n"
+            "...\n"
+            "Republican Senator Lindsey Graham, a close ally of US President Donald Trump, has died at the age of 71.\n"
+            "\n"
+            "Title: Republican Lindsey Graham dies at 71: World leaders, US politicians react | Politics News | Al Jazeera\n"
+            "URL: https://www.aljazeera.com/news/2026/7/12/republican-lindsey-graham-dies-at-71-world-leaders-us-politicians-react\n"
+            "Published: 2026-07-12T13:08:55.000Z\n"
+            "Author: Elizabeth Melimopoulos\n"
+            "Highlights:\n"
+            "Republican Lindsey Graham dies at 71: World leaders, US politicians react | Politics News | Al Jazeera\n"
+            "...\n"
+            "World leaders and politicians pay tribute after the death of Republican Senator Lindsey Graham."
+        )
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=_make_call_result(raw, is_error=False)
+        )
+        server = _make_mock_server("test_srv", session=mock_session)
+        _servers["test_srv"] = server
+
+        try:
+            handler = _make_tool_handler("test_srv", "web_search_exa", 120)
+            with self._patch_mcp_loop():
+                result = json.loads(handler({"query": "alpha"}))
+            assert result["result"] == (
+                "Title: US senator and Trump ally Lindsey Graham dies after 'brief and sudden illness' - BBC News\n"
+                "URL: https://www.bbc.co.uk/news/articles/cvgj25j6nmeo\n"
+                "Published: 2026-07-12T06:24:17.000Z\n"
+                "Highlights:\n"
+                "12 July 2026, 07:24 BST\n"
+                "Republican Senator Lindsey Graham, a close ally of US President Donald Trump, has died at the age of 71.\n\n"
+                "Title: Republican Lindsey Graham dies at 71: World leaders, US politicians react | Politics News | Al Jazeera\n"
+                "URL: https://www.aljazeera.com/news/2026/7/12/republican-lindsey-graham-dies-at-71-world-leaders-us-politicians-react\n"
+                "Published: 2026-07-12T13:08:55.000Z\n"
+                "Author: Elizabeth Melimopoulos\n"
+                "Highlights:\n"
+                "World leaders and politicians pay tribute after the death of Republican Senator Lindsey Graham."
+            )
+        finally:
+            _servers.pop("test_srv", None)
+
+    def test_non_search_tool_keeps_same_text_payload(self):
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        raw = (
+            "Title: First\n"
+            "URL: https://a.example\n"
+            "Published: N/A\n"
+            "Author: N/A\n"
+            "Highlights: Alpha\n"
+            "---"
+        )
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=_make_call_result(raw, is_error=False)
+        )
+        server = _make_mock_server("test_srv", session=mock_session)
+        _servers["test_srv"] = server
+
+        try:
+            handler = _make_tool_handler("test_srv", "fetch_page", 120)
+            with self._patch_mcp_loop():
+                result = json.loads(handler({}))
+            assert result["result"] == raw
+        finally:
+            _servers.pop("test_srv", None)
+
+    def test_search_like_text_result_preserves_structured_content(self):
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        raw = (
+            "Title: Speech to Text - GroqDocs\n"
+            "URL: https://console.groq.com/docs/speech-to-text\n"
+            "Published: N/A\n"
+            "Author: N/A\n"
+            "Highlights:\n"
+            "Groq API is designed to provide fast speech-to-text solution available."
+        )
+        block = SimpleNamespace(text=raw)
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=SimpleNamespace(
+                content=[block],
+                isError=False,
+                structuredContent={"items": [{"url": "https://console.groq.com/docs/speech-to-text"}]},
+            )
+        )
+        server = _make_mock_server("test_srv", session=mock_session)
+        _servers["test_srv"] = server
+
+        try:
+            handler = _make_tool_handler("test_srv", "web_search_exa", 120)
+            with self._patch_mcp_loop():
+                result = json.loads(handler({"query": "alpha"}))
+            assert result == {
+                "result": (
+                    "Title: Speech to Text - GroqDocs\n"
+                    "URL: https://console.groq.com/docs/speech-to-text\n"
+                    "Highlights:\n"
+                    "Groq API is designed to provide fast speech-to-text solution available."
+                ),
+                "structuredContent": {
+                    "items": [{"url": "https://console.groq.com/docs/speech-to-text"}]
+                },
+            }
+        finally:
+            _servers.pop("test_srv", None)
+
     def test_mcp_error_result(self):
         from tools.mcp_tool import _make_tool_handler, _servers
 
