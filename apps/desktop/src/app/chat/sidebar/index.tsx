@@ -32,6 +32,7 @@ import { normalizeSessionSource, sessionSourceLabel } from '@/lib/session-source
 import { cn } from '@/lib/utils'
 import { $cronJobs } from '@/store/cron'
 import { $bindings } from '@/store/keybinds'
+import { $sidebarOpen } from '@/store/layout'
 import {
   $dismissedAutoProjectIds,
   $panesFlipped,
@@ -246,9 +247,7 @@ interface ChatSidebarContentsProps extends ChatSidebarProps {
 
 export const ChatSidebar = memo(function ChatSidebar(props: ChatSidebarProps) {
   const sidebarOpen = useStore($sidebarOpen)
-  // Collapsed-but-overlay-mounted → render the full sidebar, not just the nav rail.
-  const sidebarOverlayMounted = useStore($sidebarOverlayMounted)
-  const contentVisible = sidebarOpen || sidebarOverlayMounted
+  const contentVisible = sidebarOpen
   const panesFlipped = useStore($panesFlipped)
 
   return (

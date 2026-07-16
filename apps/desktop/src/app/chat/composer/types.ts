@@ -4,12 +4,7 @@ import type { SubmitTextOptions } from '@/app/session/hooks/use-prompt-actions/u
 import type { HermesGateway } from '@/hermes'
 
 import type { DroppedFile } from '../hooks/use-composer-actions'
-
-export interface ContextSuggestion {
-  text: string
-  display: string
-  meta?: string
-}
+import type { ComposerIntent } from '../hooks/use-composer-intent-prewarm'
 
 export interface QuickModelOption {
   provider: string
@@ -23,11 +18,10 @@ export interface ChatBarState {
     provider: string
     canSwitch: boolean
     loading?: boolean
-    quickModels?: QuickModelOption[]
     /** Reused status-bar dropdown (built with gateway + selectModel upstream). */
     modelMenuContent?: ReactNode
   }
-  tools: { enabled: boolean; label: string; suggestions?: ContextSuggestion[] }
+  tools: { enabled: boolean; label: string }
   voice: { enabled: boolean; active: boolean }
 }
 
@@ -46,6 +40,7 @@ export interface ChatBarProps {
   onAddUrl?: (url: string) => void
   onAttachImageBlob?: (blob: Blob) => Promise<boolean | void> | boolean | void
   onAttachDroppedItems?: (candidates: DroppedFile[]) => Promise<boolean | void> | boolean | void
+  onIntent?: (intent: ComposerIntent) => void
   onPasteClipboardImage?: (opts?: { silent?: boolean }) => Promise<boolean> | void
   onPickFiles?: () => void
   onPickFolders?: () => void
