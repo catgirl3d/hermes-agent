@@ -488,6 +488,68 @@ describe('resumeSession failure recovery', () => {
     expect(getSessionMessages).not.toHaveBeenCalled()
   })
 
+  it('records the post-paint wait that completes a cold-resume trace', async () => {
+    const frameCallbacks: FrameRequestCallback[] = []
+
+    const requestAnimationFrame = vi.spyOn(window, 'requestAnimationFrame').mockImplementation(callback => {
+      frameCallbacks.push(callback)
+
+      return frameCallbacks.length
+    })
+
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined)
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'session.resume') {
+        return {
+          session_id: 'runtime-1',
+          resumed: params?.session_id,
+          messages: [{ role: 'user', text: 'restored prompt' }],
+          info: {}
+        } as never
+      }
+
+      return {} as never
+    })
+
+    await runResume(requestGateway)
+    expect(requestAnimationFrame).toHaveBeenCalled()
+
+    const flushAnimationFrame = async () => {
+      const callbacks = frameCallbacks.splice(0)
+      expect(callbacks).not.toHaveLength(0)
+
+      await act(async () => callbacks.forEach(callback => callback(performance.now())))
+    }
+
+    await flushAnimationFrame()
+    await flushAnimationFrame()
+
+    expect(info).toHaveBeenCalledWith(
+      expect.objectContaining({
+        outcome: 'cold-resumed',
+        stages: expect.arrayContaining([
+          expect.objectContaining({ name: 'cold-view-published' }),
+          expect.objectContaining({ name: 'paint-wait-start', rafCount: 2, waitMethod: 'double-raf' }),
+          expect.objectContaining({
+            name: 'paint-raf-1',
+            rafCount: 1,
+            sincePreviousStageMs: expect.any(Number),
+            waitDurationMs: expect.any(Number),
+            waitMethod: 'double-raf'
+          }),
+          expect.objectContaining({
+            name: 'paint-raf-2',
+            rafCount: 2,
+            sincePreviousStageMs: expect.any(Number),
+            waitDurationMs: expect.any(Number),
+            waitMethod: 'double-raf'
+          })
+        ])
+      })
+    )
+  })
+
   it('arms the failure latch when resume succeeds with an empty transcript for a non-empty stored session', async () => {
     setSessions([storedSession({ message_count: 4 })])
 

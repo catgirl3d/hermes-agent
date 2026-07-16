@@ -6,7 +6,7 @@ import {
 } from '@assistant-ui/react'
 import { useStore } from '@nanostores/react'
 import type * as React from 'react'
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { lazy, Profiler, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useLocation } from 'react-router-dom'
 
 import { Thread } from '@/components/assistant-ui/thread'
@@ -20,7 +20,16 @@ import { TitleMenuTrigger } from '@/components/ui/title-menu-trigger'
 import type { HermesGateway } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { sessionTitle } from '@/lib/chat-runtime'
-import { useIncrementalExternalStoreRuntime } from '@/lib/incremental-external-store-runtime'
+import {
+  type RuntimeAdapterSyncMetrics,
+  useIncrementalExternalStoreRuntime
+} from '@/lib/incremental-external-store-runtime'
+import {
+  activeSessionSwitchTraceRequestId,
+  elapsedSinceActiveSessionSwitchStage,
+  markActiveSessionSwitchTrace,
+  markActiveSessionSwitchTraceForRequest
+} from '@/lib/session-switch-trace'
 import { cn } from '@/lib/utils'
 import type { ComposerAttachment } from '@/store/composer'
 import { $pinnedSessionIds } from '@/store/layout'
@@ -173,6 +182,7 @@ interface ChatRuntimeBoundaryProps {
   onEdit: (message: AppendMessage) => Promise<void>
   onReload: (parentId: string | null) => Promise<void>
   onThreadMessagesChange: (messages: readonly ThreadMessage[]) => void
+  traceSessionId: null | string
 }
 
 /**
@@ -190,13 +200,61 @@ function ChatRuntimeBoundary({
   onCancel,
   onEdit,
   onReload,
-  onThreadMessagesChange
+  onThreadMessagesChange,
+  traceSessionId
 }: ChatRuntimeBoundaryProps) {
+  const renderStartedAt = performance.now()
+  const traceRequestId = activeSessionSwitchTraceRequestId(traceSessionId)
+
+  const coldViewPublishToRenderStartMs = elapsedSinceActiveSessionSwitchStage(
+    traceSessionId,
+    'cold-view-published',
+    renderStartedAt,
+    traceRequestId
+  )
+
   const view = useSessionView()
   const busy = useStore(view.$busy)
   const messages = useStore(view.$messages)
   const runtimeSyncMode = useStore($sessionViewRuntimeSyncMode)
-  const runtimeMessageRepository = useRuntimeMessageRepository(messages)
+  const runtimeMessageRepository = useRuntimeMessageRepository(messages, traceSessionId)
+  const layoutCommittedAtRef = useRef<number | null>(null)
+  const layoutSyncedRequestIdRef = useRef<number | undefined>(undefined)
+
+  const lastRuntimeLayoutTraceRef = useRef<{
+    adapter: ExternalStoreAdapter<ThreadMessage>
+    requestId: number | undefined
+  } | null>(null)
+
+  const onRuntimeAdapterSync = useCallback(
+    ({ durationMs, messageCount }: RuntimeAdapterSyncMetrics) => {
+      const syncFinishedAt = performance.now()
+      const layoutCommittedAt = layoutCommittedAtRef.current
+
+      if (runtimeSyncMode === 'layout') {
+        layoutSyncedRequestIdRef.current = traceRequestId
+      }
+
+      markActiveSessionSwitchTraceForRequest(traceSessionId, traceRequestId, 'runtime-adapter-synced', {
+        layoutCommitToSyncStartMs:
+          layoutCommittedAt === null
+            ? undefined
+            : Math.round(Math.max(0, syncFinishedAt - durationMs - layoutCommittedAt) * 10) / 10,
+        messageCount,
+        operationDurationMs: durationMs
+      })
+    },
+    [runtimeSyncMode, traceRequestId, traceSessionId]
+  )
+
+  const onRuntimeAdapterSyncStart = useCallback(
+    ({ messageCount }: Pick<RuntimeAdapterSyncMetrics, 'messageCount'>) => {
+      markActiveSessionSwitchTraceForRequest(traceSessionId, traceRequestId, 'runtime-adapter-sync-started', {
+        messageCount
+      })
+    },
+    [traceRequestId, traceSessionId]
+  )
 
   const runtimeAdapter = useMemo<ExternalStoreAdapter<ThreadMessage>>(
     () => ({
@@ -214,8 +272,33 @@ function ChatRuntimeBoundary({
     [busy, onCancel, onEdit, onReload, onThreadMessagesChange, runtimeMessageRepository]
   )
 
+  useLayoutEffect(() => {
+    const layoutCommittedAt = performance.now()
+    const lastTrace = lastRuntimeLayoutTraceRef.current
+
+    layoutCommittedAtRef.current = layoutCommittedAt
+
+    if (lastTrace?.adapter === runtimeAdapter && lastTrace.requestId === traceRequestId) {
+      return
+    }
+
+    lastRuntimeLayoutTraceRef.current = { adapter: runtimeAdapter, requestId: traceRequestId }
+    markActiveSessionSwitchTraceForRequest(traceSessionId, traceRequestId, 'runtime-boundary-layout-commit', {
+      coldViewPublishToRenderStartMs,
+      messageCount: messages.length,
+      renderToLayoutCommitMs: Math.round((layoutCommittedAt - renderStartedAt) * 10) / 10
+    })
+  })
+
+  const pendingRuntimeSyncMode =
+    runtimeSyncMode === 'layout' && traceRequestId !== undefined && layoutSyncedRequestIdRef.current !== traceRequestId
+      ? 'layout'
+      : 'passive'
+
   const runtime = useIncrementalExternalStoreRuntime<ThreadMessage>(runtimeAdapter, {
-    syncMode: runtimeSyncMode
+    onAdapterSync: onRuntimeAdapterSync,
+    onAdapterSyncStart: onRuntimeAdapterSyncStart,
+    syncMode: pendingRuntimeSyncMode
   })
 
   return <AssistantRuntimeProvider runtime={runtime}>{children}</AssistantRuntimeProvider>
@@ -354,6 +437,39 @@ export function ChatView({
   const composerShouldMount = !watchWindow && !resumeExhausted && (composerEverMountedRef.current || showChatBar)
 
   const threadKey = visibleStoredSessionId || activeSessionId || (isRoutedSessionView ? location.pathname : 'new')
+  const traceSessionIdRef = useRef<null | string>(selectedSessionId)
+  traceSessionIdRef.current = selectedSessionId
+
+  const onThreadRender = useCallback<React.ProfilerOnRenderCallback>(
+    (_id, phase, actualDuration, baseDuration) => {
+      markActiveSessionSwitchTrace(traceSessionIdRef.current, 'thread-react-commit', {
+        actualDurationMs: Math.round(actualDuration * 10) / 10,
+        baseDurationMs: Math.round(baseDuration * 10) / 10,
+        busy,
+        loadingSession,
+        messagesEmpty,
+        phase,
+        routeSessionMismatch
+      })
+    },
+    [busy, loadingSession, messagesEmpty, routeSessionMismatch]
+  )
+
+  const onRuntimeBoundaryRender = useCallback<React.ProfilerOnRenderCallback>(
+    (_id, phase, actualDuration, baseDuration) => {
+      markActiveSessionSwitchTrace(traceSessionIdRef.current, 'runtime-react-commit', {
+        actualDurationMs: Math.round(actualDuration * 10) / 10,
+        baseDurationMs: Math.round(baseDuration * 10) / 10,
+        busy,
+        loadingSession,
+        messagesEmpty,
+        phase,
+        routeSessionMismatch
+      })
+    },
+    [busy, loadingSession, messagesEmpty, routeSessionMismatch]
+  )
+
   const chatBarState = useMemo<ChatBarState>(
     () => ({
       model: {
@@ -469,30 +585,35 @@ export function ChatView({
           stalling to timeout. */}
       <PromptOverlays sessionId={activeSessionId} />
 
-      <ChatRuntimeBoundary
-        onCancel={onCancel}
-        onEdit={onEdit}
-        onReload={onReload}
-        onThreadMessagesChange={onThreadMessagesChange}
-      >
+      <Profiler id="chat-runtime-boundary" onRender={onRuntimeBoundaryRender}>
+        <ChatRuntimeBoundary
+          onCancel={onCancel}
+          onEdit={onEdit}
+          onReload={onReload}
+          onThreadMessagesChange={onThreadMessagesChange}
+          traceSessionId={selectedSessionId}
+        >
           <div
             className="relative min-h-0 max-w-full flex-1 overflow-hidden bg-(--ui-chat-surface-background) contain-[layout_paint]"
             data-slot="composer-bounds"
             {...dropHandlers}
           >
-            <Thread
-              clampToComposer={showChatBar}
-              cwd={currentCwd}
-              gateway={gateway}
-              intro={showIntro ? { personality: introPersonality, seed: introSeed } : undefined}
-              loading={threadLoading}
-              onBranchInNewChat={onBranchInNewChat}
-              onCancel={onCancel}
-              onDismissError={onDismissError}
-              onRestoreToMessage={onRestoreToMessage}
-              sessionId={activeSessionId}
-              sessionKey={threadKey}
-            />
+            <Profiler id="session-thread" onRender={onThreadRender}>
+              <Thread
+                clampToComposer={composerVisible}
+                cwd={currentCwd}
+                gateway={gateway}
+                intro={showIntro ? { personality: introPersonality, seed: introSeed } : undefined}
+                loading={threadLoading}
+                onBranchInNewChat={onBranchInNewChat}
+                onCancel={onCancel}
+                onDismissError={onDismissError}
+                onRestoreToMessage={onRestoreToMessage}
+                sessionId={activeSessionId}
+                sessionKey={threadKey}
+                traceSessionId={selectedSessionId}
+              />
+            </Profiler>
             {resumeExhausted && routedSessionId && (
               <div className="absolute inset-0 z-10 grid place-items-center bg-(--ui-chat-surface-background) px-8 py-10">
                 <ErrorState
@@ -568,7 +689,8 @@ export function ChatView({
               </Suspense>
             </div>
           )}
-      </ChatRuntimeBoundary>
+        </ChatRuntimeBoundary>
+      </Profiler>
     </div>
   )
 }
