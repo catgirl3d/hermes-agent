@@ -46,8 +46,6 @@ import {
   $sessions,
   sessionMatchesStoredId,
   sessionPinId,
-  setAwaitingResponse,
-  setBusy,
   setCurrentBranch,
   setCurrentCwd,
   setCurrentModel,
@@ -76,7 +74,6 @@ import { CRON_ROUTE, routeSessionId, sessionRoute, SETTINGS_ROUTE, syncWorkspace
 import { SessionPickerOverlay } from '../session-picker-overlay'
 import { SessionSwitcher } from '../session-switcher'
 import { useBackgroundQueueDrain } from '../session/hooks/use-background-queue-drain'
-import { useContextSuggestions } from '../session/hooks/use-context-suggestions'
 import { useCwdActions } from '../session/hooks/use-cwd-actions'
 import { useHermesConfig } from '../session/hooks/use-hermes-config'
 import { useMessageStream } from '../session/hooks/use-message-stream'
@@ -186,15 +183,11 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     runtimeIdByStoredSessionIdRef,
     selectedStoredSessionIdRef,
     sessionStateByRuntimeIdRef,
-    syncSessionStateToView,
     updateSessionState
   } = useSessionStateCache({
     activeSessionId,
     busyRef,
-    selectedStoredSessionId,
-    setAwaitingResponse,
-    setBusy,
-    setMessages
+    selectedStoredSessionId
   })
 
   const { connectionRef, gatewayRef, requestGateway } = useGatewayRequest()
@@ -360,15 +353,6 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     selectedStoredSessionId
   })
 
-  // Composer @-mention context suggestions (files/dirs under the cwd).
-  useContextSuggestions({
-    activeSessionId,
-    activeSessionIdRef,
-    currentCwd,
-    gatewayState,
-    requestGateway
-  })
-
   // Expose the restart handler to the preview pane contribution (module
   // boundary crossed via atom — contrib-panes can't import this file).
   useEffect(() => {
@@ -402,7 +386,6 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     selectedStoredSessionId,
     selectedStoredSessionIdRef,
     sessionStateByRuntimeIdRef,
-    syncSessionStateToView,
     updateSessionState
   })
 

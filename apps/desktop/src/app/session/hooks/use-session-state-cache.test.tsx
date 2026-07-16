@@ -16,6 +16,7 @@ import {
   setCurrentProvider,
   setCurrentReasoningEffort,
   setCurrentServiceTier,
+  setMessages,
   setTurnStartedAt
 } from '@/store/session'
 
@@ -35,10 +36,7 @@ function Harness({ activeSessionId, onReady, selectedStoredSessionId }: HarnessP
   const cache = useSessionStateCache({
     activeSessionId,
     busyRef,
-    selectedStoredSessionId,
-    setAwaitingResponse: () => undefined,
-    setBusy: () => undefined,
-    setMessages: () => undefined
+    selectedStoredSessionId
   })
 
   onReady(cache)
@@ -232,12 +230,7 @@ function ViewHarness({ activeSessionId, onReady }: ViewHarnessProps) {
   const cache = useSessionStateCache({
     activeSessionId,
     busyRef,
-    selectedStoredSessionId: null,
-    setAwaitingResponse: () => undefined,
-    setBusy: () => undefined,
-    // Wire the published view back into the real $messages atom the flush
-    // reads from, so the round-trip matches production.
-    setMessages: messages => $messages.set(messages)
+    selectedStoredSessionId: null
   })
 
   onReady(cache)
@@ -248,11 +241,11 @@ function ViewHarness({ activeSessionId, onReady }: ViewHarnessProps) {
 describe('useSessionStateCache — cross-thread error isolation', () => {
   afterEach(() => {
     cleanup()
-    $messages.set([])
+    setMessages([])
   })
 
   it('does not leak a failed turn into another thread on switch', () => {
-    $messages.set([])
+    setMessages([])
     let cache!: Cache
     const { rerender } = render(<ViewHarness activeSessionId="thread-A" onReady={c => (cache = c)} />)
 
@@ -291,7 +284,7 @@ describe('useSessionStateCache — cross-thread error isolation', () => {
   })
 
   it('still preserves a same-session local error a heartbeat dropped', () => {
-    $messages.set([])
+    setMessages([])
     let cache!: Cache
     render(<ViewHarness activeSessionId="thread-A" onReady={c => (cache = c)} />)
 
@@ -305,7 +298,7 @@ describe('useSessionStateCache — cross-thread error isolation', () => {
     })
 
     // A local error lands in the view (e.g. failAssistantMessage wrote it).
-    $messages.set([userMessage('user-a', 'do the thing'), assistantError('assistant-a-error', 'OpenRouter 403')])
+    setMessages([userMessage('user-a', 'do the thing'), assistantError('assistant-a-error', 'OpenRouter 403')])
 
     // A later same-session heartbeat carries cached state that lost the error.
     act(() => {
