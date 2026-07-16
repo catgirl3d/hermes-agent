@@ -159,6 +159,7 @@ import {
   writeSandboxMarker
 } from './windows-sandbox-fallback'
 import { installWindowsSystemCaTrust } from './windows-system-ca'
+import { appIconPaths, windowsAppUserModelId } from './windows-branding'
 import { readWindowsUserEnvVar } from './windows-user-env'
 import { isPackagedInstallPath as isPackagedInstallPathUnderRoots } from './workspace-cwd'
 import { readWslWindowsClipboardImage } from './wsl-clipboard-image'
@@ -566,11 +567,12 @@ const WINDOW_BUTTON_POSITION = {
 // (pure + unit-testable); computeNativeOverlayWidth() applies it per platform.
 // It's only the pre-layout fallback — the renderer measures the exact overlay
 // width live via the Window Controls Overlay API.
-const APP_ICON_PATHS = [
-  path.join(APP_ROOT, 'public', 'apple-touch-icon.png'),
-  path.join(APP_ROOT, 'dist', 'apple-touch-icon.png'),
-  path.join(unpackedPathFor(APP_ROOT), 'dist', 'apple-touch-icon.png')
-]
+const APP_ICON_PATHS = appIconPaths({
+  appRoot: APP_ROOT,
+  isWindows: IS_WINDOWS,
+  resourcesPath: process.resourcesPath,
+  unpackedAppRoot: unpackedPathFor(APP_ROOT)
+})
 
 let rendererTitleBarTheme = null
 const terminalSessions = new Map()
@@ -843,6 +845,11 @@ function previewFileMetadata(filePath, mimeType) {
 
 app.setName(APP_NAME)
 
+// Dev Electron must not claim the packaged app's AUMID. Otherwise Windows
+// registers node_modules/electron as the handler for Hermes and uses its stock
+// icon for the production app's taskbar group.
+const WINDOWS_APP_USER_MODEL_ID = windowsAppUserModelId(IS_PACKAGED)
+
 // Windows toast notifications silently no-op unless an AppUserModelID is set:
 // `new Notification().show()` returns without error and nothing appears. The
 // AUMID must match the installed Start Menu shortcut's AUMID, which
@@ -851,7 +858,7 @@ app.setName(APP_NAME)
 // need this, so gate it on Windows. (Fixes: desktop approval/turn notifications
 // never firing on Windows.)
 if (IS_WINDOWS) {
-  app.setAppUserModelId('com.nousresearch.hermes')
+  app.setAppUserModelId(WINDOWS_APP_USER_MODEL_ID)
 }
 
 // Seed the native About panel with the live Hermes version. This is refreshed
@@ -5310,6 +5317,7 @@ function openOauthLoginWindow(baseUrl, { silent = false } = {}) {
         height: 720,
         title: silent ? 'Connecting to Hermes Cloud agent…' : 'Sign in to Hermes gateway',
         autoHideMenuBar: true,
+        icon: getAppIconPath(),
         // Silent cascade: start HIDDEN. The auto-SSO 302 chain completes in
         // well under a second, so the window normally never needs to show. We
         // only reveal it as a fallback if the cascade DOESN'T complete quickly
@@ -5659,6 +5667,7 @@ function openPortalLoginWindow() {
         height: 720,
         title: 'Sign in to Hermes Cloud',
         autoHideMenuBar: true,
+        icon: getAppIconPath(),
         webPreferences: {
           contextIsolation: true,
           nodeIntegration: false,
@@ -7260,6 +7269,7 @@ function petOverlayUrl() {
 }
 
 function spawnPetOverlayWindow(bounds) {
+  const icon = getAppIconPath()
   const win = new BrowserWindow({
     width: Math.max(80, Math.round(bounds?.width || 220)),
     height: Math.max(80, Math.round(bounds?.height || 220)),
@@ -7272,6 +7282,7 @@ function spawnPetOverlayWindow(bounds) {
     minimizable: false,
     maximizable: false,
     fullscreenable: false,
+    icon,
     // Windows/Linux need this so the helper window does not get its own
     // taskbar/alt-tab entry. On macOS, cmd-tab is app-level and this can make
     // the whole app look like it vanished when the only newly-created visible
