@@ -40,6 +40,7 @@ import type { ModelOptionsResponse } from '@/types/hermes'
 
 import { routeSessionId } from '../routes'
 import { titlebarHeaderBaseClass, titlebarHeaderShadowClass, titlebarHeaderTitleClass } from '../shell/titlebar'
+import type { ToolResultPruneResponse } from '../types'
 
 import { ChatDropOverlay } from './chat-drop-overlay'
 import { ChatSwapOverlay } from './chat-swap-overlay'
@@ -61,6 +62,8 @@ interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   modelMenuContent?: React.ReactNode
   onToggleSelectedPin: () => void
   onDeleteSelectedSession: () => void
+  onApplyToolResultPrune?: (preview: ToolResultPruneResponse) => Promise<ToolResultPruneResponse>
+  onPreviewToolResultPrune?: (toolNames?: string[]) => Promise<ToolResultPruneResponse>
   onCancel: () => Promise<void> | void
   onAddContextRef: (refText: string, label?: string, detail?: string) => void
   onAddUrl: (url: string) => void
@@ -86,16 +89,22 @@ interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
 
 interface ChatHeaderProps {
   activeSessionId: null | string
+  busy: boolean
   isRoutedSessionView: boolean
+  onApplyToolResultPrune?: (preview: ToolResultPruneResponse) => Promise<ToolResultPruneResponse>
   onDeleteSelectedSession: () => void
+  onPreviewToolResultPrune?: (toolNames?: string[]) => Promise<ToolResultPruneResponse>
   onToggleSelectedPin: () => void
   selectedSessionId: null | string
 }
 
 function ChatHeader({
   activeSessionId,
+  busy,
   isRoutedSessionView,
+  onApplyToolResultPrune,
   onDeleteSelectedSession,
+  onPreviewToolResultPrune,
   onToggleSelectedPin,
   selectedSessionId
 }: ChatHeaderProps) {
@@ -134,8 +143,10 @@ function ChatHeader({
       >
         <SessionActionsMenu
           align="start"
+          onApplyToolResultPrune={!busy && activeSessionId ? onApplyToolResultPrune : undefined}
           onDelete={selectedSessionId ? onDeleteSelectedSession : undefined}
           onPin={selectedSessionId ? onToggleSelectedPin : undefined}
+          onPreviewToolResultPrune={!busy && activeSessionId ? onPreviewToolResultPrune : undefined}
           pinned={selectedIsPinned}
           sessionId={selectedSessionId || activeSessionId || ''}
           sideOffset={8}
@@ -207,6 +218,7 @@ export function ChatView({
   modelMenuContent,
   onToggleSelectedPin,
   onDeleteSelectedSession,
+  onApplyToolResultPrune,
   onCancel,
   onAddContextRef,
   onAddUrl,
@@ -215,6 +227,7 @@ export function ChatView({
   onBranchInNewChat,
   maxVoiceRecordingSeconds,
   onPasteClipboardImage,
+  onPreviewToolResultPrune,
   onPickFiles,
   onPickFolders,
   onPickImages,
@@ -415,8 +428,11 @@ export function ChatView({
       {isPrimary && (
         <ChatHeader
           activeSessionId={activeSessionId}
+          busy={busy}
           isRoutedSessionView={isRoutedSessionView}
+          onApplyToolResultPrune={onApplyToolResultPrune}
           onDeleteSelectedSession={onDeleteSelectedSession}
+          onPreviewToolResultPrune={onPreviewToolResultPrune}
           onToggleSelectedPin={onToggleSelectedPin}
           selectedSessionId={selectedSessionId}
         />

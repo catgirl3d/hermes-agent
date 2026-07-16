@@ -1,7 +1,7 @@
 import type * as React from 'react'
 
 import type { ChatMessage } from '@/lib/chat-messages'
-import type { UsageStats } from '@/types/hermes'
+import type { SessionMessage, UsageStats } from '@/types/hermes'
 
 export interface ContextSuggestion {
   text: string
@@ -66,6 +66,40 @@ export interface SessionTitleResponse {
   // to be applied on the first turn (see tui_gateway session.title handler).
   pending?: boolean
   session_key?: string
+}
+
+export interface ToolResultPruneResponse {
+  after_bytes: number
+  after_tokens: number
+  applied: boolean
+  before_bytes: number
+  before_tokens: number
+  changed: boolean
+  duplicate_results: number
+  excerpted_results: number
+  history_version: number
+  messages?: SessionMessage[]
+  protected_messages: number
+  protected_turns: number
+  pruned_results: number
+  saved_bytes: number
+  saved_tokens: number
+  selected_tool_names: string[]
+  selection_hash: string
+  session_id: string
+  status: 'preview' | 'pruned' | 'unchanged'
+  tools: ToolResultPruneTool[]
+  truncated_tool_calls: number
+}
+
+export interface ToolResultPruneTool {
+  argument_count: number
+  compact_kind: 'bounded_excerpt' | 'file_structure' | 'terminal_tail' | 'web_fields'
+  default_selected: boolean
+  estimated_saved_tokens: number
+  name: string
+  result_count: number
+  selected: boolean
 }
 
 export interface HandoffRequestResponse {

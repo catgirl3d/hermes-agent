@@ -5324,6 +5324,245 @@ def test_slash_exec_r7_read_commands_use_metadata_mirror_flag_on(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_tool_result_prune_requires_preview_then_persists_in_place(monkeypatch):
+    original = []
+    for turn in range(7):
+        original.extend(
+            [
+                {"role": "user", "content": f"request {turn}"},
+                {"role": "tool", "tool_call_id": f"call-{turn}", "content": "x" * 500},
+            ]
+        )
+        if turn == 2:
+            original.append(
+                {
+                    "role": "user",
+                    "content": "[System: The active model for this chat has changed to test.]",
+                }
+            )
+
+    class _Compressor:
+        def __init__(self):
+            self.calls = 0
+
+        def prune_tool_results(self, messages, *, protect_tail_count, tool_names=None):
+            self.calls += 1
+            # Five real user exchanges plus the user-role system pivot between
+            # them. The pivot must not consume a protected turn slot.
+            assert protect_tail_count == 11
+            selected = {"terminal"} if tool_names is None else tool_names
+            result = [dict(message) for message in messages]
+            result[1]["content"] = "[terminal] old output"
+            return result, {
+                "changed": True,
+                "pruned_results": 1,
+                "duplicate_results": 0,
+                "excerpted_results": 0,
+                "truncated_tool_calls": 0,
+                "before_bytes": 1000,
+                "after_bytes": 400,
+                "saved_bytes": 600,
+                "before_tokens": 250,
+                "after_tokens": 100,
+                "saved_tokens": 150,
+                "selected_tool_names": sorted(selected),
+                "tools": [],
+            }
+
+    agent = types.SimpleNamespace(
+        context_compressor=_Compressor(),
+        session_id="session-key",
+        _last_flushed_db_idx=99,
+        _flushed_db_message_ids={123},
+        _flushed_db_message_session_id="session-key",
+    )
+    session = _session(agent=agent, history=original, history_version=7)
+    server._sessions["sid"] = session
+
+    class _Db:
+        def __init__(self):
+            self.replacements = []
+
+        def replace_messages(self, session_id, messages, active_only=False):
+            self.replacements.append((session_id, list(messages), active_only))
+
+    class _DbContext:
+        def __init__(self, db):
+            self.db = db
+
+        def __enter__(self):
+            return self.db
+
+        def __exit__(self, *_args):
+            return False
+
+    db = _Db()
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
+    monkeypatch.setattr(server, "_session_db", lambda _session: _DbContext(db))
+
+    try:
+        preview = server.handle_request(
+            {
+                "id": "preview",
+                "method": "session.prune_tool_results",
+                "params": {"session_id": "sid"},
+            }
+        )["result"]
+
+        assert preview["status"] == "preview"
+        assert preview["history_version"] == 7
+        assert preview["protected_turns"] == 5
+        assert preview["pruned_results"] == 1
+        assert preview["selected_tool_names"] == ["terminal"]
+        assert session["history"] == original
+        assert db.replacements == []
+
+        mismatched = server.handle_request(
+            {
+                "id": "mismatched-selection",
+                "method": "session.prune_tool_results",
+                "params": {
+                    "session_id": "sid",
+                    "confirm": True,
+                    "history_version": preview["history_version"],
+                    "selection_hash": preview["selection_hash"],
+                    "tool_names": [],
+                },
+            }
+        )
+        assert mismatched["error"]["code"] == 4090
+        assert db.replacements == []
+
+        applied = server.handle_request(
+            {
+                "id": "apply",
+                "method": "session.prune_tool_results",
+                "params": {
+                    "session_id": "sid",
+                    "confirm": True,
+                    "history_version": preview["history_version"],
+                    "selection_hash": preview["selection_hash"],
+                    "tool_names": preview["selected_tool_names"],
+                },
+            }
+        )["result"]
+
+        assert applied["applied"] is True
+        assert applied["history_version"] == 8
+        assert session["session_key"] == "session-key"
+        assert session["history"][1]["content"] == "[terminal] old output"
+        assert db.replacements == [("session-key", session["history"], True)]
+        assert agent._last_flushed_db_idx == len(session["history"])
+        assert agent._flushed_db_message_ids == set()
+        assert agent.context_compressor.calls == 1
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_tool_result_prune_rejects_stale_confirmation(monkeypatch):
+    class _Compressor:
+        def prune_tool_results(self, messages, *, protect_tail_count, tool_names=None):
+            result = [dict(message) for message in messages]
+            result[0]["content"] = "pruned"
+            return result, {
+                "changed": True,
+                "pruned_results": 1,
+                "duplicate_results": 0,
+                "excerpted_results": 0,
+                "truncated_tool_calls": 0,
+                "before_bytes": 500,
+                "after_bytes": 100,
+                "saved_bytes": 400,
+                "before_tokens": 125,
+                "after_tokens": 25,
+                "saved_tokens": 100,
+                "selected_tool_names": sorted(tool_names or []),
+                "tools": [],
+            }
+
+    history = [{"role": "tool", "content": "x" * 500}]
+    session = _session(
+        agent=types.SimpleNamespace(context_compressor=_Compressor()),
+        history=history,
+        history_version=3,
+    )
+    server._sessions["sid"] = session
+
+    try:
+        preview = server.handle_request(
+            {
+                "id": "preview",
+                "method": "session.prune_tool_results",
+                "params": {"session_id": "sid"},
+            }
+        )["result"]
+        session["history_version"] = 4
+
+        response = server.handle_request(
+            {
+                "id": "apply",
+                "method": "session.prune_tool_results",
+                "params": {
+                    "session_id": "sid",
+                    "confirm": True,
+                    "history_version": preview["history_version"],
+                    "selection_hash": preview["selection_hash"],
+                    "tool_names": preview["selected_tool_names"],
+                },
+            }
+        )
+
+        assert response["error"]["code"] == 4090
+        assert session["history"] == history
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_tool_result_prune_rejects_if_turn_starts_after_preview(monkeypatch):
+    history = [{"role": "tool", "content": "x" * 500}]
+    session = _session(history=history, history_version=3)
+    server._sessions["sid"] = session
+    selection_hash = server._tool_result_prune_selection_hash({"terminal"})
+
+    def _racing_preview(active_session, _tool_names=None):
+        # prompt.submit and notification paths claim running under this same
+        # history lock. Simulate that claim after the handler's initial guard
+        # but before its destructive write section.
+        with active_session["history_lock"]:
+            active_session["running"] = True
+        return (
+            [{"role": "tool", "content": "pruned"}],
+            {
+                "changed": True,
+                "history_version": 3,
+                "selected_tool_names": ["terminal"],
+                "selection_hash": selection_hash,
+            },
+            3,
+        )
+
+    monkeypatch.setattr(server, "_preview_tool_result_prune", _racing_preview)
+    try:
+        response = server.handle_request(
+            {
+                "id": "apply",
+                "method": "session.prune_tool_results",
+                "params": {
+                    "session_id": "sid",
+                    "confirm": True,
+                    "history_version": 3,
+                    "selection_hash": selection_hash,
+                    "tool_names": ["terminal"],
+                },
+            }
+        )
+
+        assert response["error"]["code"] == 4009
+        assert session["history"] == history
+    finally:
+        server._sessions.pop("sid", None)
+
+
 def test_prompt_submit_sets_approval_session_key(monkeypatch):
     from tools.approval import get_current_session_key
 
