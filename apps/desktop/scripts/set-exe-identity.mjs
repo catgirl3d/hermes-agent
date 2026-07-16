@@ -35,39 +35,33 @@
 // (after-pack.mjs) swallows the rejection so a stamp failure never fails an
 // otherwise-good build (worst case: stock icon, not a broken app).
 
-import { resolve, join } from 'node:path'
+import { resolve } from 'node:path'
 import { existsSync } from 'node:fs'
 
 import { rcedit } from 'rcedit'
 
+import { rceditOptionsForHermes } from './exe-identity-options.mjs'
 import { isMain } from './utils.mjs'
 
 // Stamp the Hermes icon + identity onto `exe`. Resolves on success, throws on
 // failure. `desktopRoot` defaults to this script's package root so the icon and
 // the rcedit dependency resolve regardless of cwd.
-async function stampExeIdentity(exe, desktopRoot = resolve(import.meta.dirname, '..')) {
+async function stampExeIdentity(exe, desktopRoot = resolve(import.meta.dirname, '..'), editResources = rcedit) {
   if (!exe || !existsSync(exe)) {
     throw new Error(`target exe not found: ${exe}`)
   }
 
-  // Icon lives at apps/desktop/assets/icon.ico
-  const icon = join(desktopRoot, 'assets', 'icon.ico')
-  if (!existsSync(icon)) {
-    throw new Error(`icon not found: ${icon}`)
+  const options = rceditOptionsForHermes(desktopRoot)
+
+  // Icon lives at apps/desktop/assets/icon.ico.
+  if (!existsSync(options.icon)) {
+    throw new Error(`icon not found: ${options.icon}`)
   }
 
   console.log(`[set-exe-identity] stamping ${exe}`)
-  console.log(`[set-exe-identity] icon: ${icon}`)
+  console.log(`[set-exe-identity] icon: ${options.icon}`)
 
-  await rcedit(exe, {
-    icon,
-    'version-string': {
-      ProductName: 'Hermes',
-      FileDescription: 'Hermes',
-      CompanyName: 'Nous Research',
-      LegalCopyright: 'Copyright (c) 2026 Nous Research'
-    }
-  })
+  await editResources(exe, options)
 
   console.log('[set-exe-identity] done — Hermes icon + identity stamped')
 }
