@@ -3,26 +3,26 @@ import { createContext, useContext } from 'react'
 
 import type { ChatMessage } from '@/lib/chat-messages'
 import {
-  $activeSessionId,
-  $awaitingResponse,
-  $busy,
   $currentCwd,
   $currentFastMode,
   $currentModel,
   $currentProvider,
   $currentReasoningEffort,
-  $lastVisibleMessageIsUser,
-  $messages,
-  $messagesEmpty,
-  $selectedStoredSessionId
+  $sessionViewActiveSessionId,
+  $sessionViewAwaitingResponse,
+  $sessionViewBusy,
+  $sessionViewLastVisibleMessageIsUser,
+  $sessionViewMessages,
+  $sessionViewMessagesEmpty,
+  $sessionViewStoredSessionId
 } from '@/store/session'
 
 /**
  * SESSION VIEW — the store surface a ChatView renders from. The PRIMARY view
- * is the app's classic global atoms (route-driven active session, untouched
- * fast path). A session TILE provides the same shape computed from its
- * session's slice of `$sessionStates`, so the identical ChatView tree renders
- * either — one chat surface, N sessions on screen.
+ * reads identity, transcript, and run state from the visible session snapshot.
+ * A session TILE provides the same shape computed from its session's slice of
+ * `$sessionStates`, so the identical ChatView tree renders either — one chat
+ * surface, N sessions on screen.
  *
  * Everything is atoms (not values) so subscription granularity survives:
  * ChatView subscribes only to the coarse edges; `$messages` stays boundary-
@@ -46,18 +46,18 @@ export interface SessionView {
 
 export const PRIMARY_SESSION_VIEW: SessionView = {
   kind: 'primary',
-  $awaitingResponse,
-  $busy,
+  $awaitingResponse: $sessionViewAwaitingResponse,
+  $busy: $sessionViewBusy,
   $cwd: $currentCwd,
   $fast: $currentFastMode,
-  $lastVisibleIsUser: $lastVisibleMessageIsUser,
-  $messages,
-  $messagesEmpty,
+  $lastVisibleIsUser: $sessionViewLastVisibleMessageIsUser,
+  $messages: $sessionViewMessages,
+  $messagesEmpty: $sessionViewMessagesEmpty,
   $model: $currentModel,
   $provider: $currentProvider,
   $reasoningEffort: $currentReasoningEffort,
-  $runtimeId: $activeSessionId,
-  $storedId: $selectedStoredSessionId
+  $runtimeId: $sessionViewActiveSessionId,
+  $storedId: $sessionViewStoredSessionId
 }
 
 const SessionViewContext = createContext<SessionView>(PRIMARY_SESSION_VIEW)
