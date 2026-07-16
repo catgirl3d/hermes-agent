@@ -13,9 +13,18 @@ import {
   type ThreadMessage,
   useRuntimeAdapters
 } from '@assistant-ui/react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 const EMPTY_ARRAY = Object.freeze([])
+
+export interface RuntimeAdapterSyncMetrics {
+  durationMs: number
+  messageCount: number
+}
+
+interface IncrementalExternalStoreRuntimeOptions {
+  onAdapterSync?: (metrics: RuntimeAdapterSyncMetrics) => void
+}
 
 const shallowEqual = (a: object, b: object): boolean => {
   const aKeys = Object.keys(a)
@@ -185,13 +194,21 @@ class IncrementalExternalStoreRuntimeCore extends BaseAssistantRuntimeCore {
 }
 
 export function useIncrementalExternalStoreRuntime<T extends ThreadMessage>(
-  store: ExternalStoreAdapter<T>
+  store: ExternalStoreAdapter<T>,
+  options: IncrementalExternalStoreRuntimeOptions = {}
 ): AssistantRuntime {
   const [runtime] = useState(() => new IncrementalExternalStoreRuntimeCore(store as ExternalStoreAdapter))
+  const onAdapterSyncRef = useRef(options.onAdapterSync)
+  onAdapterSyncRef.current = options.onAdapterSync
 
   useEffect(() => {
+    const startedAt = performance.now()
     runtime.setAdapter(store as ExternalStoreAdapter)
-  })
+    onAdapterSyncRef.current?.({
+      durationMs: Math.round((performance.now() - startedAt) * 10) / 10,
+      messageCount: store.messageRepository?.messages.length ?? store.messages?.length ?? 0
+    })
+  }, [runtime, store])
 
   const { modelContext } = useRuntimeAdapters() ?? {}
 

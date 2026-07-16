@@ -10,6 +10,7 @@ interface UseComposerDropArgs {
   cwd: ChatBarProps['cwd']
   insertInlineRefs: (refs: InlineRefInput[]) => boolean
   onAttachDroppedItems: ChatBarProps['onAttachDroppedItems']
+  onIntent: ChatBarProps['onIntent']
   requestMainFocus: () => void
 }
 
@@ -24,6 +25,7 @@ export function useComposerDrop({
   cwd,
   insertInlineRefs,
   onAttachDroppedItems,
+  onIntent,
   requestMainFocus
 }: UseComposerDropArgs) {
   const [dragActive, setDragActive] = useState(false)
@@ -83,6 +85,8 @@ export function useComposerDrop({
       return
     }
 
+    onIntent?.('attachment')
+
     // In-app drags (project tree / gutter) are workspace-relative paths the
     // gateway resolves directly, so they stay inline @file:/@line: refs. OS
     // drops are absolute local paths a remote gateway can't read (and images
@@ -124,6 +128,8 @@ export function useComposerDrop({
     if (!candidates.length) {
       return
     }
+
+    onIntent?.('attachment')
 
     event.preventDefault()
     event.stopPropagation()
