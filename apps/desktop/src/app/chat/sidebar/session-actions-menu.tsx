@@ -1,4 +1,5 @@
 import { useStore } from '@nanostores/react'
+import { isJsonRpcGatewayError } from '@hermes/shared'
 import type * as React from 'react'
 import { useEffect, useRef, useState } from 'react'
 
@@ -9,8 +10,10 @@ import {
   treeTabCloseTargets
 } from '@/components/pane-shell/tree/store'
 import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
 import { Codicon } from '@/components/ui/codicon'
 import { ColorSwatches } from '@/components/ui/color-swatches'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import {
   ContextMenu,
   ContextMenuContent,
@@ -43,6 +46,7 @@ import {
 import { Input } from '@/components/ui/input'
 import { renameSession } from '@/hermes'
 import { useI18n } from '@/i18n'
+import { compactNumber } from '@/lib/format'
 import { triggerHaptic } from '@/lib/haptics'
 import { PROFILE_SWATCHES } from '@/lib/profile-color'
 import { exportSession } from '@/lib/session-export'
@@ -60,7 +64,7 @@ import { $sessionColorOverrides, setSessionColorOverride } from '@/store/session
 import { $sessionTiles, openSessionTile } from '@/store/session-states'
 import { canOpenSessionWindow, openSessionInNewWindow } from '@/store/windows'
 
-import type { SessionTitleResponse } from '../../types'
+import type { SessionTitleResponse, ToolResultPruneResponse } from '../../types'
 
 // Rename a session, preferring the gateway's session.title RPC over REST.
 //
@@ -128,6 +132,8 @@ interface SessionActions {
   /** The MAIN tab's escape hatch: hide the zone's tab bar (it sticky-shows
    *  once a tab is ever gained; this is the explicit off switch). */
   onHideTabBar?: () => void
+  onApplyToolResultPrune?: (preview: ToolResultPruneResponse) => Promise<ToolResultPruneResponse>
+  onPreviewToolResultPrune?: (toolNames?: string[]) => Promise<ToolResultPruneResponse>
 }
 
 type MenuItem = typeof DropdownMenuItem | typeof ContextMenuItem
@@ -156,6 +162,7 @@ const CONTEXT_KIT: MenuKit = {
   SubContent: ContextMenuSubContent,
   SubTrigger: ContextMenuSubTrigger
 }
+const PRUNE_PREVIEW_DEBOUNCE_MS = 200
 
 interface ItemSpec {
   className?: string
@@ -199,13 +206,43 @@ function useSessionActions({
   onClose,
   onHideTabBar,
   surface = 'row',
-  tabPaneId
+  tabPaneId,
+  onApplyToolResultPrune,
+  onPreviewToolResultPrune
 }: SessionActions) {
   const { t } = useI18n()
   const r = t.sidebar.row
   const [renameOpen, setRenameOpen] = useState(false)
   const tiles = useStore($sessionTiles)
   const selectedStoredSessionId = useStore($selectedStoredSessionId)
+  const [prunePreview, setPrunePreview] = useState<ToolResultPruneResponse | null>(null)
+  const [prunePreviewError, setPrunePreviewError] = useState<string | null>(null)
+  const [prunePreviewLoading, setPrunePreviewLoading] = useState(false)
+  const [selectedToolNames, setSelectedToolNames] = useState<Set<string>>(new Set())
+  const prunePreviewRequestRef = useRef(0)
+  const prunePreviewTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const sessionIdRef = useRef(sessionId)
+  sessionIdRef.current = sessionId
+
+  useEffect(() => {
+    if (prunePreviewTimerRef.current) {
+      clearTimeout(prunePreviewTimerRef.current)
+      prunePreviewTimerRef.current = null
+    }
+
+    prunePreviewRequestRef.current += 1
+    setPrunePreview(null)
+    setPrunePreviewError(null)
+    setPrunePreviewLoading(false)
+    setSelectedToolNames(new Set())
+
+    return () => {
+      if (prunePreviewTimerRef.current) {
+        clearTimeout(prunePreviewTimerRef.current)
+        prunePreviewTimerRef.current = null
+      }
+    }
+  }, [sessionId])
 
   // Already showing as a tab somewhere (a tile, or loaded in main — main IS
   // a tab): offering "Open in new tab" again is noise.
@@ -287,7 +324,31 @@ function useSessionActions({
         triggerHaptic('selection')
         void exportSession(sessionId, { profile, title })
       }
-    })
+    }),
+    ...(onPreviewToolResultPrune && onApplyToolResultPrune
+      ? [
+          spec({
+            disabled: !sessionId,
+            icon: 'clear-all',
+            label: r.cleanToolOutputs,
+            onSelect: () => {
+              const requestedSessionId = sessionId
+              const requestId = prunePreviewRequestRef.current + 1
+              prunePreviewRequestRef.current = requestId
+
+              triggerHaptic('selection')
+              void onPreviewToolResultPrune()
+                .then(preview => {
+                  if (prunePreviewRequestRef.current === requestId && sessionIdRef.current === requestedSessionId) {
+                    setPrunePreview(preview)
+                    setSelectedToolNames(new Set(preview.selected_tool_names))
+                  }
+                })
+                .catch(err => notifyError(err, r.cleanToolOutputsFailed))
+            }
+          })
+        ]
+      : [])
   ]
 
   // TAB — close verbs that act on the strip (tabs only; a row isn't a tab).
@@ -435,7 +496,186 @@ function useSessionActions({
     />
   )
 
-  return { renameDialog, renderItems }
+  const pruneDialog = (
+    <ConfirmDialog
+      confirmDisabled={
+        prunePreviewLoading ||
+        Boolean(prunePreviewError) ||
+        selectedToolNames.size === 0 ||
+        !prunePreview?.changed
+      }
+      confirmFromDialogKeyDown={false}
+      confirmLabel={prunePreview?.changed ? r.cleanToolOutputsConfirm : t.common.done}
+      contentClassName="flex min-h-[20rem] flex-col"
+      description={
+        prunePreview ? (
+          <span className="grid gap-2 text-left">
+            <span>
+              {prunePreview.changed
+                ? r.cleanToolOutputsPreview(
+                    prunePreview.pruned_results,
+                    prunePreview.truncated_tool_calls,
+                    compactNumber(prunePreview.saved_tokens)
+                  )
+                : r.cleanToolOutputsNoop}
+            </span>
+            <span>{r.cleanToolOutputsProtected(prunePreview.protected_turns)}</span>
+            {prunePreview.tools.some(
+              tool => tool.compact_kind === 'file_structure' && selectedToolNames.has(tool.name)
+            ) ? (
+              <span className="font-medium text-destructive">{r.cleanToolOutputsCodeWarning}</span>
+            ) : null}
+            {prunePreview.changed ? <span>{r.cleanToolOutputsWarning}</span> : null}
+          </span>
+        ) : undefined
+      }
+      destructive={Boolean(prunePreview?.changed)}
+      doneLabel={r.cleanToolOutputsDone}
+      onClose={() => {
+        if (prunePreviewTimerRef.current) {
+          clearTimeout(prunePreviewTimerRef.current)
+          prunePreviewTimerRef.current = null
+        }
+
+        prunePreviewRequestRef.current += 1
+        setPrunePreview(null)
+        setPrunePreviewError(null)
+        setPrunePreviewLoading(false)
+        setSelectedToolNames(new Set())
+      }}
+      onConfirm={async () => {
+        if (!prunePreview?.changed || !onApplyToolResultPrune) {
+          return
+        }
+
+        try {
+          await onApplyToolResultPrune(prunePreview)
+        } catch (err) {
+          const message = err instanceof Error ? err.message : ''
+
+          const conflict =
+            isJsonRpcGatewayError(err, 4090) ||
+            /history changed after preview|tool selection changed after preview/i.test(message)
+
+          if (!conflict || !onPreviewToolResultPrune) {
+            throw err
+          }
+
+          const requestId = prunePreviewRequestRef.current + 1
+          prunePreviewRequestRef.current = requestId
+          setPrunePreviewLoading(true)
+          setPrunePreviewError(null)
+
+          try {
+            const refreshed = await onPreviewToolResultPrune([...selectedToolNames].sort())
+
+            if (prunePreviewRequestRef.current === requestId) {
+              setPrunePreview(refreshed)
+              setSelectedToolNames(new Set(refreshed.selected_tool_names))
+            }
+          } finally {
+            if (prunePreviewRequestRef.current === requestId) {
+              setPrunePreviewLoading(false)
+            }
+          }
+
+          throw new Error(r.cleanToolOutputsStale)
+        }
+      }}
+      open={Boolean(prunePreview)}
+      title={r.cleanToolOutputsTitle}
+    >
+      {prunePreview ? (
+        <div className="flex min-h-0 flex-1 flex-col gap-2">
+          <div className="text-xs font-medium text-(--ui-text-secondary)">{r.cleanToolOutputsChoose}</div>
+          <div className="min-h-0 flex-1 overflow-y-auto py-0.5">
+            {prunePreview.tools.map(tool => {
+              const checked = selectedToolNames.has(tool.name)
+
+              return (
+                <label
+                  className="flex cursor-pointer items-start gap-2 py-1.5 text-xs hover:text-foreground"
+                  key={tool.name}
+                >
+                  <Checkbox
+                    aria-label={r.cleanToolOutputsToggle(tool.name)}
+                    checked={checked}
+                    onCheckedChange={value => {
+                      if (!onPreviewToolResultPrune) {
+                        return
+                      }
+
+                      const next = new Set(selectedToolNames)
+
+                      if (value === true) {
+                        next.add(tool.name)
+                      } else {
+                        next.delete(tool.name)
+                      }
+
+                      const requestId = prunePreviewRequestRef.current + 1
+                      prunePreviewRequestRef.current = requestId
+                      setSelectedToolNames(next)
+                      setPrunePreviewLoading(true)
+                      setPrunePreviewError(null)
+
+                      if (prunePreviewTimerRef.current) {
+                        clearTimeout(prunePreviewTimerRef.current)
+                      }
+
+                      prunePreviewTimerRef.current = setTimeout(() => {
+                        prunePreviewTimerRef.current = null
+                        void onPreviewToolResultPrune([...next].sort())
+                          .then(preview => {
+                            if (prunePreviewRequestRef.current === requestId) {
+                              setPrunePreview(preview)
+                              setSelectedToolNames(new Set(preview.selected_tool_names))
+                            }
+                          })
+                          .catch(err => {
+                            if (prunePreviewRequestRef.current === requestId) {
+                              setPrunePreviewError(
+                                err instanceof Error ? err.message : r.cleanToolOutputsFailed
+                              )
+                            }
+                          })
+                          .finally(() => {
+                            if (prunePreviewRequestRef.current === requestId) {
+                              setPrunePreviewLoading(false)
+                            }
+                          })
+                      }, PRUNE_PREVIEW_DEBOUNCE_MS)
+                    }}
+                  />
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate font-mono text-[0.6875rem]">{tool.name}</span>
+                    <span className="block text-(--ui-text-tertiary)">
+                      {r.cleanToolOutputsToolMeta(
+                        tool.result_count,
+                        tool.argument_count,
+                        compactNumber(tool.estimated_saved_tokens),
+                        r.cleanToolOutputsKinds[tool.compact_kind]
+                      )}
+                    </span>
+                  </span>
+                </label>
+              )
+            })}
+          </div>
+          <div
+            aria-live="polite"
+            className={
+              prunePreviewError ? 'min-h-4 text-xs text-destructive' : 'min-h-4 text-xs text-(--ui-text-tertiary)'
+            }
+          >
+            {prunePreviewError ?? (prunePreviewLoading ? r.cleanToolOutputsUpdating : '')}
+          </div>
+        </div>
+      ) : null}
+    </ConfirmDialog>
+  )
+
+  return { pruneDialog, renameDialog, renderItems }
 }
 
 interface SessionActionsMenuProps
@@ -445,7 +685,7 @@ interface SessionActionsMenuProps
 
 export function SessionActionsMenu({ children, align = 'end', sideOffset = 6, ...actions }: SessionActionsMenuProps) {
   const { t } = useI18n()
-  const { renameDialog, renderItems } = useSessionActions(actions)
+  const { pruneDialog, renameDialog, renderItems } = useSessionActions(actions)
   const [open, setOpen] = useState(false)
 
   return (
@@ -462,6 +702,7 @@ export function SessionActionsMenu({ children, align = 'end', sideOffset = 6, ..
         </DropdownMenuContent>
       </DropdownMenu>
       {renameDialog}
+      {pruneDialog}
     </>
   )
 }
@@ -472,7 +713,7 @@ interface SessionContextMenuProps extends SessionActions {
 
 export function SessionContextMenu({ children, ...actions }: SessionContextMenuProps) {
   const { t } = useI18n()
-  const { renameDialog, renderItems } = useSessionActions(actions)
+  const { pruneDialog, renameDialog, renderItems } = useSessionActions(actions)
 
   return (
     <>
@@ -483,6 +724,7 @@ export function SessionContextMenu({ children, ...actions }: SessionContextMenuP
         </ContextMenuContent>
       </ContextMenu>
       {renameDialog}
+      {pruneDialog}
     </>
   )
 }
