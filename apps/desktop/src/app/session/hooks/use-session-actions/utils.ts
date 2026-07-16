@@ -73,7 +73,7 @@ const _chatMessageFieldsExhaustive: {
   [K in Exclude<keyof ChatMessage, (typeof COMPARED_FIELDS)[number] | (typeof IGNORED_FIELDS)[number]>]: never
 } = {}
 
-const COMPARED_FIELDS = ['id', 'role', 'pending', 'error', 'hidden', 'branchGroupId'] as const
+const COMPARED_FIELDS = ['id', 'role', 'pending', 'error', 'hidden', 'rendererOwned', 'branchGroupId'] as const
 const IGNORED_FIELDS = ['timestamp', 'attachmentRefs', 'parts'] as const
 
 // Compile-time check: every ChatMessagePart discriminant must be handled by
@@ -214,14 +214,16 @@ export function reconcileResumeMessages(nextMessages: ChatMessage[], previousMes
     const previousImages = embeddedImageUrls(previousText)
 
     if (!previousImages.length || embeddedImageUrls(chatMessageText(preserved)).length) {
-      return preserved
+      return chatMessagesEquivalent(preserved, previous) ? previous : preserved
     }
 
     if (nextText !== previousVisibleText) {
       return preserved
     }
 
-    return withAppendedText(preserved, previousImages.map(url => `\n${url}`).join(''))
+    const withImages = withAppendedText(preserved, previousImages.map(url => `\n${url}`).join(''))
+
+    return chatMessagesEquivalent(withImages, previous) ? previous : withImages
   })
 }
 
@@ -359,12 +361,56 @@ type SessionRuntimeStatePatch = Partial<
   >
 >
 
-export function applyRuntimeInfo(info: SessionRuntimeInfo | undefined): SessionRuntimeStatePatch | null {
+export function prepareRuntimeInfo(info: SessionRuntimeInfo | undefined): SessionRuntimeStatePatch | null {
   if (!info) {
     return null
   }
 
   const sessionState: SessionRuntimeStatePatch = {}
+
+  if (typeof info.model === 'string') {
+    sessionState.model = info.model
+  }
+
+  if (typeof info.provider === 'string') {
+    sessionState.provider = info.provider
+  }
+
+  if (info.cwd) {
+    sessionState.cwd = info.cwd
+  }
+
+  if (info.branch !== undefined) {
+    sessionState.branch = info.branch || ''
+  }
+
+  if (typeof info.personality === 'string') {
+    sessionState.personality = normalizePersonalityValue(info.personality)
+  }
+
+  if (typeof info.reasoning_effort === 'string') {
+    sessionState.reasoningEffort = info.reasoning_effort
+  }
+
+  if (typeof info.service_tier === 'string') {
+    sessionState.serviceTier = info.service_tier
+  }
+
+  if (typeof info.fast === 'boolean') {
+    sessionState.fast = info.fast
+  }
+
+  if (typeof info.yolo === 'boolean') {
+    sessionState.yolo = info.yolo
+  }
+
+  return sessionState
+}
+
+export function applyRuntimeInfoEffects(info: SessionRuntimeInfo | undefined): void {
+  if (!info) {
+    return
+  }
 
   reportBackendContract(info.desktop_contract)
 
@@ -378,55 +424,28 @@ export function applyRuntimeInfo(info: SessionRuntimeInfo | undefined): SessionR
 
   reportInstallMethodWarning(info.install_warning)
 
-  if (typeof info.model === 'string') {
-    setCurrentModel(info.model)
-    sessionState.model = info.model
-  }
-
-  if (typeof info.provider === 'string') {
-    setCurrentProvider(info.provider)
-    sessionState.provider = info.provider
-  }
-
-  if (info.cwd) {
-    setCurrentCwd(info.cwd)
-    sessionState.cwd = info.cwd
-  }
-
-  if (info.branch !== undefined) {
-    setCurrentBranch(info.branch || '')
-    sessionState.branch = info.branch || ''
-  }
-
-  if (typeof info.personality === 'string') {
-    const personality = normalizePersonalityValue(info.personality)
-    setCurrentPersonality(personality)
-    sessionState.personality = personality
-  }
-
-  if (typeof info.reasoning_effort === 'string') {
-    setCurrentReasoningEffort(info.reasoning_effort)
-    sessionState.reasoningEffort = info.reasoning_effort
-  }
-
-  if (typeof info.service_tier === 'string') {
-    setCurrentServiceTier(info.service_tier)
-    sessionState.serviceTier = info.service_tier
-  }
-
-  if (typeof info.fast === 'boolean') {
-    setCurrentFastMode(info.fast)
-    sessionState.fast = info.fast
-  }
-
-  if (typeof info.yolo === 'boolean') {
-    setYoloActive(info.yolo)
-    sessionState.yolo = info.yolo
-  }
-
   if (info.usage) {
     setCurrentUsage(current => ({ ...current, ...info.usage }))
   }
+}
+
+export function applyRuntimeInfo(info: SessionRuntimeInfo | undefined): SessionRuntimeStatePatch | null {
+  const sessionState = prepareRuntimeInfo(info)
+  applyRuntimeInfoEffects(info)
+
+  if (!sessionState) {
+    return null
+  }
+
+  if (sessionState.model !== undefined) setCurrentModel(sessionState.model)
+  if (sessionState.provider !== undefined) setCurrentProvider(sessionState.provider)
+  if (sessionState.cwd !== undefined) setCurrentCwd(sessionState.cwd)
+  if (sessionState.branch !== undefined) setCurrentBranch(sessionState.branch)
+  if (sessionState.personality !== undefined) setCurrentPersonality(sessionState.personality)
+  if (sessionState.reasoningEffort !== undefined) setCurrentReasoningEffort(sessionState.reasoningEffort)
+  if (sessionState.serviceTier !== undefined) setCurrentServiceTier(sessionState.serviceTier)
+  if (sessionState.fast !== undefined) setCurrentFastMode(sessionState.fast)
+  if (sessionState.yolo !== undefined) setYoloActive(sessionState.yolo)
 
   return sessionState
 }
