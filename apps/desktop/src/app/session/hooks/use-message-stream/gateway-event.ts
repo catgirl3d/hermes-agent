@@ -6,12 +6,14 @@ import { readActiveTerminal } from '@/app/right-sidebar/terminal/buffer'
 import { closeAgentTerminalByProc } from '@/app/right-sidebar/terminal/terminals'
 import { burstVibeHearts } from '@/components/chat/vibe-hearts'
 import { translateNow } from '@/i18n'
+import { logAgentBuildTimingEvent } from '@/lib/agent-build-trace'
 import { type GatewayEventPayload, textPart } from '@/lib/chat-messages'
 import { coerceGatewayText, coerceThinkingText, normalizePersonalityValue } from '@/lib/chat-runtime'
 import { playCompletionSound } from '@/lib/completion-sound'
 import { resolveGatewayEventSessionId } from '@/lib/gateway-events'
 import { triggerHaptic } from '@/lib/haptics'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
+import { recordSessionSwitchTransportTiming } from '@/lib/session-switch-trace'
 import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
 import { clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
 import { setSessionCompacting } from '@/store/compaction'
@@ -155,6 +157,18 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
     (event: RpcEvent) => {
       const payload = event.payload as GatewayEventPayload | undefined
       const explicitSid = event.session_id || ''
+
+      if (event.type === 'gateway.transport_timing') {
+        recordSessionSwitchTransportTiming(event.payload)
+
+        return
+      }
+
+      if (event.type === 'agent.build_timing') {
+        logAgentBuildTimingEvent(event)
+
+        return
+      }
 
       const route = resolveGatewayEventSessionId({
         activeSessionId: activeSessionIdRef.current,

@@ -1404,6 +1404,7 @@ def test_history_to_messages_renders_multimodal_content():
 
 def test_session_resume_uses_parent_lineage_for_display(monkeypatch):
     captured = {}
+    scheduled_builds = []
 
     class FakeDB:
         def get_session(self, target):
@@ -1427,6 +1428,11 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch):
 
     monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
     monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(
+        server,
+        "_git_branch_for_cwd",
+        lambda _cwd: (_ for _ in ()).throw(AssertionError("cold resume must not probe git")),
+    )
     monkeypatch.setattr(server, "_set_session_context", lambda target: [])
     monkeypatch.setattr(server, "_clear_session_context", lambda tokens: None)
     monkeypatch.setattr(
@@ -1442,12 +1448,26 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch):
     monkeypatch.setattr(
         server, "_init_session", lambda sid, key, agent, history, cols=80, **_kwargs: None
     )
-    # The deferred pre-warm timer is neutered module-wide by the autouse
-    # _neuter_agent_prewarm_timer fixture; this test only asserts the
-    # returned display history.
+    # Capture any accidental speculative build. Deferred resume must leave agent
+    # construction to the first operation that actually needs it. The module-wide
+    # prewarm fixture is overridden here so this test observes the call directly.
+    monkeypatch.setattr(
+        server,
+        "_schedule_agent_build",
+        lambda sid, delay: scheduled_builds.append((sid, delay)),
+    )
 
     resp = server.handle_request(
-        {"id": "1", "method": "session.resume", "params": {"session_id": "tip"}}
+        {
+            "id": "1",
+            "method": "session.resume",
+            "params": {
+                "session_id": "tip",
+                "source": "desktop",
+                server._WS_RECEIVE_TO_ACK_PARAM: 0.75,
+                server._WS_ACK_SEND_PARAM: 1.25,
+            },
+        }
     )
 
     assert resp["result"]["messages"] == [
@@ -1455,6 +1475,378 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch):
         {"role": "assistant", "text": "root answer"},
     ]
     assert captured["canonical_history_calls"] == ["tip"]
+    timing = _assert_resume_timing(
+        resp["result"], ws_receive_to_ack=0.75, ws_ack_send=1.25
+    )
+    assert timing["history_read"] >= 0
+    assert timing["message_transport"] >= 0
+    assert timing["reopen"] >= 0
+    assert timing["resume_info"] >= 0
+    assert scheduled_builds == []
+
+
+def test_session_resume_dispatch_records_thread_pool_queue_start(monkeypatch):
+    responses = []
+
+    class ImmediatePool:
+        def submit(self, fn):
+            fn()
+
+    monkeypatch.setattr(server, "_pool", ImmediatePool())
+    monkeypatch.setitem(
+        server._methods,
+        "session.resume",
+        lambda rid, params: server._ok(
+            rid,
+            {
+                "backend_timing_ms": {
+                    "_handler_finished_perf": time.perf_counter(),
+                },
+                "has_queue_timestamp": isinstance(
+                    params.get(server._DISPATCH_QUEUED_AT_PARAM), float
+                )
+            },
+        ),
+    )
+
+    result = server.dispatch(
+        {"id": "resume", "method": "session.resume", "params": {}},
+        transport=types.SimpleNamespace(write=responses.append),
+    )
+
+    assert result is None
+    assert responses[0]["result"]["has_queue_timestamp"] is True
+    timing = responses[0]["result"]["backend_timing_ms"]
+    assert "_handler_finished_perf" not in timing
+    assert timing["handler_to_write"] >= 0
+
+
+def _assert_resume_timing(result: dict, *, ws_receive_to_ack: float, ws_ack_send: float) -> dict:
+    timing = result["backend_timing_ms"]
+    assert timing["schema_version"] == 12.0
+    assert timing["resume_prewarm_enabled"] == 0.0
+    assert timing["resume_prewarm_mode"] == "composer_intent"
+    assert timing["handler_total"] >= 0
+    assert timing["ws_receive_to_ack"] == ws_receive_to_ack
+    assert timing["ws_ack_send"] == ws_ack_send
+    return timing
+
+
+def test_session_resume_defers_agent_build_until_demand(monkeypatch):
+    scheduled = []
+    cap_sweeps = []
+    sid = "runtime-tui-resume"
+    server._sessions[sid] = {"agent": None, "lazy": False}
+    monkeypatch.setattr(
+        server,
+        "_schedule_agent_build",
+        lambda session_id, delay: scheduled.append((session_id, delay)),
+    )
+    monkeypatch.setattr(
+        server,
+        "_schedule_session_cap_enforcement",
+        lambda: cap_sweeps.append(True),
+    )
+
+    try:
+        server._handle_resume_response_after_write(
+            {
+                "result": {
+                    "resumed": "stored-session",
+                    "session_id": sid,
+                }
+            }
+        )
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert scheduled == []
+    assert cap_sweeps == [True]
+
+
+def test_session_resume_live_reuse_includes_backend_timing(monkeypatch):
+    target = "live-stored-session"
+    runtime_sid = "live-runtime-session"
+
+    class FakeDB:
+        def get_session(self, session_id):
+            return {"id": session_id}
+
+        def get_session_by_title(self, session_id):
+            return None
+
+        def resolve_resume_session_id(self, session_id):
+            return session_id
+
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
+    monkeypatch.setattr(server, "_session_info", lambda _agent: {"model": "live-model"})
+
+    server._sessions[runtime_sid] = {
+        "agent": types.SimpleNamespace(model="live-model"),
+        "history": [{"role": "assistant", "content": "already live"}],
+        "history_lock": threading.Lock(),
+        "running": False,
+        "session_key": target,
+        "created_at": 123.0,
+    }
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.resume",
+                "params": {
+                    "session_id": target,
+                    server._WS_RECEIVE_TO_ACK_PARAM: 0.5,
+                    server._WS_ACK_SEND_PARAM: 1.5,
+                },
+            }
+        )
+    finally:
+        server._sessions.pop(runtime_sid, None)
+
+    assert resp["result"]["session_id"] == runtime_sid
+    timing = _assert_resume_timing(
+        resp["result"], ws_receive_to_ack=0.5, ws_ack_send=1.5
+    )
+    assert timing["live_lookup"] >= 0
+
+
+def test_session_resume_lazy_watch_includes_backend_timing(monkeypatch):
+    target = "lazy-stored-session"
+
+    class FakeDB:
+        def get_session(self, session_id):
+            return {"id": session_id, "cwd": "E:/workspace/lazy"}
+
+        def get_session_by_title(self, session_id):
+            return None
+
+        def reopen_session(self, session_id):
+            pass
+
+        def get_resume_conversations(self, session_id):
+            history = [{"role": "assistant", "content": "watch history"}]
+            return history, history
+
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
+    monkeypatch.setattr(
+        server, "_claim_active_session_slot", lambda *args, **kwargs: (None, None)
+    )
+    monkeypatch.setattr(server, "_claim_or_reuse_live", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_child_run_active", lambda _target: False)
+    monkeypatch.setattr(
+        server, "_deferred_session_record", lambda *args, **kwargs: {"created_at": 321.0}
+    )
+    monkeypatch.setattr(server, "_lazy_resume_info", lambda cwd, **kwargs: {"cwd": cwd})
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+
+    resp = server.handle_request(
+        {
+            "id": "1",
+            "method": "session.resume",
+            "params": {
+                "session_id": target,
+                "lazy": True,
+                "source": "desktop",
+                server._WS_RECEIVE_TO_ACK_PARAM: 0.6,
+                server._WS_ACK_SEND_PARAM: 1.6,
+            },
+        }
+    )
+
+    assert resp["result"]["status"] == "idle"
+    timing = _assert_resume_timing(
+        resp["result"], ws_receive_to_ack=0.6, ws_ack_send=1.6
+    )
+    assert timing["history_read"] >= 0
+    assert timing["record_prepare"] >= 0
+    assert timing["live_register"] >= 0
+    assert timing["resume_info"] >= 0
+
+
+def test_session_resume_claim_or_reuse_live_includes_backend_timing(monkeypatch):
+    target = "deferred-stored-session"
+    reused_session = {
+        "agent": types.SimpleNamespace(model="reuse-model"),
+        "history": [{"role": "assistant", "content": "reused live history"}],
+        "history_lock": threading.Lock(),
+        "running": False,
+        "session_key": target,
+        "created_at": 456.0,
+    }
+
+    class FakeDB:
+        def get_session(self, session_id):
+            return {"id": session_id, "cwd": "E:/workspace/deferred"}
+
+        def get_session_by_title(self, session_id):
+            return None
+
+        def resolve_resume_session_id(self, session_id):
+            return session_id
+
+        def reopen_session(self, session_id):
+            pass
+
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
+    monkeypatch.setattr(
+        server, "_claim_active_session_slot", lambda *args, **kwargs: (None, None)
+    )
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(
+        server,
+        "_resume_histories",
+        lambda db, session_id: (
+            [{"role": "user", "content": "raw history"}],
+            [{"role": "assistant", "content": "display history"}],
+        ),
+    )
+    monkeypatch.setattr(
+        server, "_deferred_session_record", lambda *args, **kwargs: {"created_at": 456.0}
+    )
+    monkeypatch.setattr(
+        server,
+        "_claim_or_reuse_live",
+        lambda *args, **kwargs: ("reused-runtime-session", reused_session),
+    )
+    monkeypatch.setattr(server, "_session_info", lambda _agent: {"model": "reuse-model"})
+
+    resp = server.handle_request(
+        {
+            "id": "1",
+            "method": "session.resume",
+            "params": {
+                "session_id": target,
+                "source": "desktop",
+                server._WS_RECEIVE_TO_ACK_PARAM: 0.7,
+                server._WS_ACK_SEND_PARAM: 1.7,
+            },
+        }
+    )
+
+    assert resp["result"]["session_id"] == "reused-runtime-session"
+    timing = _assert_resume_timing(
+        resp["result"], ws_receive_to_ack=0.7, ws_ack_send=1.7
+    )
+    assert timing["record_prepare"] >= 0
+    assert timing["live_register"] >= 0
+
+
+def test_prompt_submit_starts_deferred_agent_build(monkeypatch):
+    sid = "runtime-demand-build"
+    starts = []
+    session = {
+        "history": [],
+        "history_lock": threading.Lock(),
+        "lazy": False,
+        "running": False,
+        "session_key": "stored-demand-build",
+        "transport": None,
+    }
+
+    class ImmediateThread:
+        def __init__(self, target=None, daemon=None):  # noqa: ARG002
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_start_inflight_turn", lambda *_args: None)
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda *_args: None)
+    monkeypatch.setattr(server, "_persist_branch_seed", lambda *_args: None)
+    monkeypatch.setattr(
+        server,
+        "_start_agent_build",
+        lambda session_id, target: starts.append((session_id, target)),
+    )
+    monkeypatch.setattr(server, "_wait_agent", lambda *_args: None)
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda *_args: None)
+    monkeypatch.setattr(server.threading, "Thread", ImmediateThread)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "prompt",
+                "method": "prompt.submit",
+                "params": {"session_id": sid, "text": "hello"},
+            }
+        )
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert resp["result"]["status"] == "streaming"
+    assert starts == [(sid, session)]
+    assert session["_agent_build_trigger"] == "prompt_submit"
+
+
+def test_session_prewarm_starts_nonblocking_build_from_composer_intent(monkeypatch):
+    sid = "runtime-composer-intent"
+    current_transport = object()
+    session = {
+        "agent": None,
+        "agent_ready": threading.Event(),
+        "session_key": "stored-composer-intent",
+        "transport": object(),
+    }
+    starts = []
+    server._sessions[sid] = session
+    monkeypatch.setattr(
+        server,
+        "_start_agent_build",
+        lambda session_id, target: starts.append((session_id, target)),
+    )
+    monkeypatch.setattr(server, "current_transport", lambda: current_transport)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "prewarm",
+                "method": "session.prewarm",
+                "params": {"session_id": sid, "intent": "voice"},
+            }
+        )
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert resp["result"] == {
+        "accepted": True,
+        "session_id": sid,
+        "trigger": "composer_voice",
+    }
+    assert starts == [(sid, session)]
+    assert session["_agent_build_trigger"] == "composer_voice"
+    assert session["transport"] is current_transport
+
+
+def test_process_status_rpcs_do_not_start_deferred_agent_build(monkeypatch):
+    sid = "runtime-process-status"
+    session = {
+        "agent": None,
+        "agent_ready": threading.Event(),
+        "session_key": "stored-process-status",
+    }
+    server._sessions[sid] = session
+    monkeypatch.setattr(
+        server,
+        "_start_agent_build",
+        lambda *_args, **_kwargs: pytest.fail("process status RPC must not build agent"),
+    )
+    monkeypatch.setattr(server, "_session_processes", lambda target: [])
+
+    try:
+        listed = server.handle_request(
+            {"id": "list", "method": "process.list", "params": {"session_id": sid}}
+        )
+        killed = server.handle_request(
+            {"id": "kill", "method": "process.kill", "params": {"session_id": sid}}
+        )
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert listed["result"] == {"processes": []}
+    assert killed["error"]["code"] == 4012
+    assert session.get("agent_build_started") is None
 
 
 def test_session_resume_follows_compression_tip(monkeypatch, tmp_path):
@@ -1577,7 +1969,17 @@ def test_session_resume_passes_stored_runtime_to_agent(monkeypatch):
     # overrides reach _make_agent, info comes from _session_info). The deferred
     # default restores the same overrides via _start_agent_build off-thread.
     resp = server.handle_request(
-        {"id": "1", "method": "session.resume", "params": {"session_id": "stored-session", "eager_build": True}}
+        {
+            "id": "1",
+            "method": "session.resume",
+            "params": {
+                "session_id": "stored-session",
+                "eager_build": True,
+                "source": "desktop",
+                server._WS_RECEIVE_TO_ACK_PARAM: 0.8,
+                server._WS_ACK_SEND_PARAM: 1.8,
+            },
+        }
     )
 
     assert resp["result"]["info"] == {"model": "gpt-5.4", "provider": "openai-codex"}
@@ -1590,6 +1992,12 @@ def test_session_resume_passes_stored_runtime_to_agent(monkeypatch):
     assert captured["provider_override"] == "openai-codex"
     assert captured["reasoning_config_override"] == {"enabled": True, "effort": "high"}
     assert captured["service_tier_override"] == "priority"
+    timing = _assert_resume_timing(
+        resp["result"], ws_receive_to_ack=0.8, ws_ack_send=1.8
+    )
+    assert timing["agent_build"] >= 0
+    assert timing["session_init"] >= 0
+    assert timing["resume_info"] >= 0
     runtime_sid = resp["result"]["session_id"]
     assert server._sessions[runtime_sid]["model_override"] == captured["model_override"]
 
@@ -10736,6 +11144,17 @@ def test_start_agent_build_passes_session_model_override(
     no global config, no build-then-switch.
     """
     captured = {}
+    emitted = []
+    reconciled = []
+
+    class FakeAgent:
+        model = "claude-sonnet-4.6"
+        provider = "anthropic"
+        base_url = ""
+        api_mode = ""
+
+        def switch_model(self, **_kwargs):
+            raise AssertionError("matching build must not switch model")
 
     class FakeWorker:
         def __init__(self, *_a, **_k):
@@ -10746,7 +11165,8 @@ def test_start_agent_build_passes_session_model_override(
 
     def fake_make_agent(sid, key, session_id=None, session_db=None, **kwargs):
         captured.update(kwargs)
-        return types.SimpleNamespace(model="claude-sonnet-4.6")
+        captured["build_timing"] = server.agent_build_timing_snapshot()
+        return FakeAgent()
 
     monkeypatch.setattr(server, "_set_session_context", lambda target: [])
     monkeypatch.setattr(server, "_clear_session_context", lambda tokens: None)
@@ -10754,11 +11174,23 @@ def test_start_agent_build_passes_session_model_override(
     monkeypatch.setattr(server, "_SlashWorker", FakeWorker)
     monkeypatch.setattr(server, "_attach_worker", lambda *a, **k: None)
     monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
-    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, session_id, payload=None: emitted.append(
+            (event, session_id, payload)
+        ),
+    )
     monkeypatch.setattr(server, "_session_info", lambda *a, **k: {})
     monkeypatch.setattr(server, "_start_notification_poller", lambda *a, **k: None)
     monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **k: None)
     monkeypatch.setattr(server, "_probe_config_health", lambda *_a: None)
+    original_sync = server._sync_built_agent_with_session_override
+    monkeypatch.setattr(
+        server,
+        "_sync_built_agent_with_session_override",
+        lambda target, agent: (reconciled.append((target, agent)), original_sync(target, agent))[1],
+    )
 
     sid = "build-sid"
     override = {"model": "claude-sonnet-4.6", "provider": "anthropic"}
@@ -10771,6 +11203,7 @@ def test_start_agent_build_passes_session_model_override(
         "model_override": override,
         "create_reasoning_override": reasoning,
         "create_service_tier_override": service_tier_override,
+        "_agent_build_trigger": "prompt_submit",
     }
     server._sessions[sid] = session
     try:
@@ -10779,7 +11212,30 @@ def test_start_agent_build_passes_session_model_override(
         assert captured.get("model_override") == override
         assert captured.get("reasoning_config_override") == reasoning
         assert captured.get("service_tier_override") == service_tier_override
+        assert captured["build_timing"]["backend_agent_build_active_count"] >= 1
         assert session["agent"].model == "claude-sonnet-4.6"
+        assert reconciled == [(session, session["agent"])]
+        deadline = time.time() + 1
+        while len([item for item in emitted if item[0] == "agent.build_timing"]) < 2:
+            assert time.time() < deadline, "build timing finish event did not arrive"
+            time.sleep(0.01)
+        build_events = [item for item in emitted if item[0] == "agent.build_timing"]
+        assert build_events[0] == (
+            "agent.build_timing",
+            sid,
+            {
+                "phase": "started",
+                "trigger": "prompt_submit",
+                "stored_session_id": "k1",
+            },
+        )
+        assert build_events[1][1] == sid
+        assert build_events[1][2]["phase"] == "finished"
+        assert build_events[1][2]["trigger"] == "prompt_submit"
+        assert build_events[1][2]["duration_ms"] >= 0
+        assert build_events[1][2]["success"] is True
+        assert build_events[1][2]["error_type"] is None
+        assert build_events[1][2]["stored_session_id"] == "k1"
     finally:
         server._sessions.clear()
 
@@ -11064,6 +11520,52 @@ def test_subscription_upgrade_requires_action_surfaces_recovery(monkeypatch):
     assert res["status"] == "requires_action"
     assert res["recovery_url"].startswith("https://portal.example")
     assert res["idempotency_key"]  # minted when the caller omits one
+def test_built_agent_reconciles_model_override_changed_during_build():
+    switched = []
+
+    class Agent:
+        model = "old-model"
+        provider = "old-provider"
+        base_url = "https://old.example"
+        api_mode = "old-mode"
+
+        def switch_model(self, **kwargs):
+            switched.append(kwargs)
+            self.model = kwargs["new_model"]
+            self.provider = kwargs["new_provider"]
+            self.base_url = kwargs["base_url"]
+            self.api_mode = kwargs["api_mode"]
+
+    agent = Agent()
+    session = {
+        "model_override": {
+            "model": "new-model",
+            "provider": "new-provider",
+            "base_url": "https://new.example",
+            "api_key": "new-key",
+            "api_mode": "new-mode",
+        }
+    }
+
+    server._sync_built_agent_with_session_override(session, agent)
+
+    assert switched == [
+        {
+            "new_model": "new-model",
+            "new_provider": "new-provider",
+            "api_key": "new-key",
+            "base_url": "https://new.example",
+            "api_mode": "new-mode",
+        }
+    ]
+    assert (agent.model, agent.provider, agent.base_url, agent.api_mode) == (
+        "new-model",
+        "new-provider",
+        "https://new.example",
+        "new-mode",
+    )
+
+
 # ── _get_usage active_subagents (TUI status-bar ⛓ indicator) ──────────────
 # Mirrors the classic CLI status bar: _get_usage embeds a live count of
 # background/async subagents from tools.async_delegation.active_count() so the
