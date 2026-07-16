@@ -3,16 +3,16 @@ import { createContext, useContext } from 'react'
 
 import type { ChatMessage } from '@/lib/chat-messages'
 import {
-  $activeSessionId,
-  $awaitingResponse,
-  $busy,
   $currentCwd,
   $currentModel,
   $currentProvider,
-  $lastVisibleMessageIsUser,
-  $messages,
-  $messagesEmpty,
-  $selectedStoredSessionId
+  $sessionViewActiveSessionId,
+  $sessionViewAwaitingResponse,
+  $sessionViewBusy,
+  $sessionViewLastVisibleMessageIsUser,
+  $sessionViewMessages,
+  $sessionViewMessagesEmpty,
+  $sessionViewStoredSessionId
 } from '@/store/session'
 
 /**
@@ -42,16 +42,16 @@ export interface SessionView {
 
 export const PRIMARY_SESSION_VIEW: SessionView = {
   kind: 'primary',
-  $awaitingResponse,
-  $busy,
+  $awaitingResponse: $sessionViewAwaitingResponse,
+  $busy: $sessionViewBusy,
   $cwd: $currentCwd,
-  $lastVisibleIsUser: $lastVisibleMessageIsUser,
-  $messages,
-  $messagesEmpty,
+  $lastVisibleIsUser: $sessionViewLastVisibleMessageIsUser,
+  $messages: $sessionViewMessages,
+  $messagesEmpty: $sessionViewMessagesEmpty,
   $model: $currentModel,
   $provider: $currentProvider,
-  $runtimeId: $activeSessionId,
-  $storedId: $selectedStoredSessionId
+  $runtimeId: $sessionViewActiveSessionId,
+  $storedId: $sessionViewStoredSessionId
 }
 
 const SessionViewContext = createContext<SessionView>(PRIMARY_SESSION_VIEW)

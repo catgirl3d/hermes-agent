@@ -500,7 +500,7 @@ function SourceView({ filePath, language, text }: { filePath: string; language: 
       event.stopPropagation()
       // Insert into and focus the SAME composer — 'active' — so a tile that owns
       // focus keeps it instead of the ref landing in a tile but main stealing focus.
-      requestComposerInsertRefs([ref])
+      requestComposerInsertRefs([ref], { intent: 'attachment' })
       requestComposerFocus('active')
     }
 

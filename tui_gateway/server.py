@@ -181,6 +181,10 @@ _LONG_HANDLERS = frozenset(
         "billing.step_up",
         "browser.manage",
         "cli.exec",
+        # Desktop loads the command catalog while mounting the composer. It
+        # reads config and scans skill directories, so cold filesystem/GIL
+        # pressure must not make it block session.resume on the WS reader.
+        "commands.catalog",
         # Completion RPCs run inline on the reader thread by default, but both
         # can block it for seconds: complete.path spawns `git ls-files` and
         # fuzzy-ranks the whole repo (slow on large repos / WSL2 mounts), and
@@ -203,6 +207,9 @@ _LONG_HANDLERS = frozenset(
         "pet.generate",
         "pet.hatch",
         "pet.info",
+        # Polled independently by the floating Desktop pet. Although normally
+        # cheap, it still reads profile config and filesystem metadata.
+        "pet.info.meta",
         "pet.select",
         "pet.thumb",
         "learning.frames",
@@ -741,6 +748,7 @@ def _close_session_by_id(sid: str, *, end_reason: str = "tui_close") -> bool:
         session = _sessions.pop(sid, None)
     if session is None:
         return False
+    _cancel_scheduled_agent_build(session)
     # The session is already out of _sessions here, so downstream teardown
     # (e.g. _finalize_session's per-session async-delegation interrupt) can't
     # recover its live id by scanning the dict — stamp it on the record.
@@ -894,13 +902,19 @@ def _reap_idle_sessions() -> None:
 def _max_live_sessions() -> int:
     try:
         from hermes_cli.active_sessions import coerce_max_concurrent_sessions
+        from hermes_cli.config import DEFAULT_CONFIG
 
         cfg = _load_cfg() or {}
-        raw = cfg.get("max_live_sessions")
-        if raw is None:
+        if "max_live_sessions" in cfg:
+            # An explicit 0/null is the documented opt-out; do not replace it
+            # with the shipped default below.
+            raw = cfg["max_live_sessions"]
+        else:
             gateway_cfg = cfg.get("gateway")
             if isinstance(gateway_cfg, dict):
-                raw = gateway_cfg.get("max_live_sessions")
+                raw = gateway_cfg.get("max_live_sessions", DEFAULT_CONFIG["max_live_sessions"])
+            else:
+                raw = DEFAULT_CONFIG["max_live_sessions"]
         coerced = coerce_max_concurrent_sessions(raw, key="max_live_sessions")
         return int(coerced) if coerced else 0
     except Exception:
@@ -1289,7 +1303,9 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
             except Exception as exc:
                 resp = _err(req.get("id"), -32000, f"handler error: {exc}")
             if resp is not None:
-                t.write(resp)
+                written = t.write(resp)
+                if written and method == "session.resume":
+                    _handle_resume_response_after_write(resp)
 
         _pool.submit(lambda: ctx.run(run))
 
@@ -1331,6 +1347,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
     with lock:
         if ready.is_set() or session.get("agent_build_started"):
             return
+        _cancel_scheduled_agent_build(session)
         session["agent_build_started"] = True
         # An upgrading lazy session is now genuinely mid-construction — restore
         # its "still starting" eviction exemption.
@@ -1395,6 +1412,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # Session DB row deferred to first run_conversation() call.
             # pending_title applied post-first-message (see cli.exec handler).
             current["agent"] = agent
+            _sync_built_agent_with_session_override(current, agent)
             # Baseline for the per-turn config sync; the profile home
             # override is still active here.
             current["config_model_seen"] = _config_model_target()
@@ -1483,6 +1501,32 @@ def _start_agent_build(sid: str, session: dict) -> None:
             ready.set()
 
     threading.Thread(target=_build, daemon=True).start()
+
+
+def _sync_built_agent_with_session_override(session: dict, agent) -> None:
+    """Reconcile a model selection that raced with deferred agent construction."""
+    override = session.get("model_override")
+    if not isinstance(override, dict):
+        return
+
+    model = str(override.get("model") or "")
+    provider = str(override.get("provider") or "")
+    base_url = str(override.get("base_url") or "")
+    api_mode = str(override.get("api_mode") or "")
+    if model == str(getattr(agent, "model", "") or "") and (
+        not provider or provider == str(getattr(agent, "provider", "") or "")
+    ) and (not base_url or base_url == str(getattr(agent, "base_url", "") or "")) and (
+        not api_mode or api_mode == str(getattr(agent, "api_mode", "") or "")
+    ):
+        return
+
+    agent.switch_model(
+        new_model=model,
+        new_provider=provider,
+        api_key=override.get("api_key"),
+        base_url=base_url,
+        api_mode=api_mode,
+    )
 
 
 def _sess_nowait(params, rid):
@@ -5568,12 +5612,18 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"verification": {"status": "unknown", "evidence": None}})
 
 
-def _lazy_resume_info(cwd: str, *, model: str = "", provider: str = "") -> dict:
+def _lazy_resume_info(
+    cwd: str,
+    *,
+    branch: str | None = None,
+    model: str = "",
+    provider: str = "",
+) -> dict:
     """session.info for a not-yet-built session (the shape session.create
     returns). tools/skills land later when the deferred build emits session.info."""
     info = {
         "cwd": cwd,
-        "branch": _git_branch_for_cwd(cwd),
+        "branch": _git_branch_for_cwd(cwd) if branch is None else branch,
         "model": model or _resolve_model(),
         "tools": {},
         "skills": {},
@@ -5660,16 +5710,54 @@ def _claim_or_reuse_live(
 
 def _schedule_agent_build(sid: str, delay: float = 0.05) -> None:
     """Pre-warm a deferred session's agent off the response path (session.create
-    and cold resume both build through here; _sess() also builds on demand)."""
+    and deferred resume both build here; _sess() also builds on demand)."""
 
     def _run():
-        session = _sessions.get(sid)
-        if session is not None:
-            _start_agent_build(sid, session)
+        with _sessions_lock:
+            session = _sessions.get(sid)
+            # A newer schedule superseded this timer, or teardown removed the
+            # session before the deferred build fired.
+            if session is None or session.get("agent_build_timer") is not timer:
+                return
+            session.pop("agent_build_timer", None)
+        _start_agent_build(sid, session)
 
     timer = threading.Timer(delay, _run)
     timer.daemon = True
+    with _sessions_lock:
+        session = _sessions.get(sid)
+        if session is None:
+            return
+        _cancel_scheduled_agent_build(session)
+        session["agent_build_timer"] = timer
     timer.start()
+
+
+def _handle_resume_response_after_write(resp: dict) -> None:
+    """Run post-write housekeeping without speculative agent construction."""
+    result = resp.get("result") if isinstance(resp, dict) else None
+    if not isinstance(result, dict) or not result.get("resumed"):
+        return
+
+    _schedule_session_cap_enforcement()
+
+
+def _cancel_scheduled_agent_build(session: dict) -> None:
+    """Cancel a deferred pre-warm that no longer owns this session record."""
+    timer = session.pop("agent_build_timer", None)
+    if timer is not None:
+        timer.cancel()
+
+
+def _resume_histories(db, session_id: str) -> tuple[list, list]:
+    """Use the one-query SessionDB resume projection, retaining fake-db support."""
+    get_resume_messages = getattr(db, "get_resume_messages", None)
+    if callable(get_resume_messages):
+        return get_resume_messages(session_id)
+    return (
+        db.get_messages_as_conversation(session_id),
+        db.get_messages_as_conversation(session_id, include_ancestors=True),
+    )
 
 
 @method("session.resume")
@@ -5803,6 +5891,7 @@ def _(rid, params: dict) -> dict:
         )
         if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
             return _ok(rid, _reuse_live_payload(*live))
+        _schedule_session_cap_enforcement()  # watch sessions are also live records
         # A delegated child mid-run emits no session events of its own — report
         # its liveness from the relay registry so the window shows a busy turn.
         child_running = _child_run_active(target)
@@ -5829,9 +5918,10 @@ def _(rid, params: dict) -> dict:
     # construction), and every resume caller (desktop + Ink TUI) awaits this RPC
     # before it paints — so building eagerly is the bulk of the multi-second
     # "switching sessions is frozen" latency. Return the full display transcript
-    # immediately and pre-warm the agent on a short timer (the same deferred-
-    # build contract session.create uses); _sess() also builds on demand if the
-    # first prompt beats the timer. A caller that needs the agent built
+    # immediately. Agent construction starts on the first prompt through
+    # prompt.submit -> _start_agent_build, avoiding background contention while
+    # the user switches sessions. A
+    # caller that needs the agent built
     # synchronously (e.g. tests of the build race) passes ``eager_build: true``
     # to fall through to the eager path below. Distinct from the lazy/watch
     # branch above: a normal resume restores the full ancestor history and the
@@ -5849,8 +5939,7 @@ def _(rid, params: dict) -> dict:
         _enable_gateway_prompts()
         try:
             db.reopen_session(target)
-            raw_history = db.get_messages_as_conversation(target)
-            display_history = db.get_messages_as_conversation(target, include_ancestors=True)
+            raw_history, display_history = _resume_histories(db, target)
         except Exception as e:
             if lease is not None:
                 lease.release()
@@ -5882,10 +5971,13 @@ def _(rid, params: dict) -> dict:
         if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
             return _ok(rid, _reuse_live_payload(*live))
 
-        _schedule_agent_build(sid)
-        _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
-
         messages = _history_to_messages(display_history)
+        resume_info = _lazy_resume_info(
+            cwd,
+            branch=str(found.get("git_branch") or ""),
+            model=model_override.get("model") or "",
+            provider=overrides.get("provider_override") or "",
+        )
         return _ok(
             rid,
             {
@@ -5893,11 +5985,7 @@ def _(rid, params: dict) -> dict:
                 "resumed": target,
                 "message_count": len(messages),
                 "messages": messages,
-                "info": _lazy_resume_info(
-                    cwd,
-                    model=model_override.get("model") or "",
-                    provider=overrides.get("provider_override") or "",
-                ),
+                "info": resume_info,
                 "inflight": None,
                 "running": False,
                 "session_key": target,
@@ -5923,10 +6011,7 @@ def _(rid, params: dict) -> dict:
     )
     try:
         db.reopen_session(target)
-        raw_history = db.get_messages_as_conversation(target)
-        display_history = db.get_messages_as_conversation(
-            target, include_ancestors=True
-        )
+        raw_history, display_history = _resume_histories(db, target)
         # The display transcript keeps every row so the user still sees their
         # full history.  The model-fed history is sanitized: a session whose
         # last turn died mid-tool-loop persists a dangling assistant(tool_calls)
@@ -6025,6 +6110,7 @@ def _(rid, params: dict) -> dict:
                 lease.release()
             return _err(rid, 5000, f"resume failed: {e}")
         session = _sessions.get(sid) or {}
+    _schedule_session_cap_enforcement()  # keep eager resume consistent with deferred
     return _ok(
         rid,
         {
@@ -6259,6 +6345,29 @@ def _(rid, params: dict) -> dict:
             transport=current_transport() or _stdio_transport,
         ),
     )
+
+
+@method("session.prewarm")
+def _(rid, params: dict) -> dict:
+    """Start agent construction after explicit composer intent, without waiting."""
+    sid = str(params.get("session_id") or "")
+    session, err = _sess_nowait({"session_id": sid}, rid)
+    if err:
+        return err
+    assert session is not None
+
+    if (transport := current_transport()) is not None:
+        session["transport"] = transport
+
+    intent = str(params.get("intent") or "").strip().lower()
+    trigger = {
+        "attachment": "composer_attachment",
+        "text": "composer_text",
+        "voice": "composer_voice",
+    }.get(intent, "composer_intent")
+    session["_agent_build_trigger"] = trigger
+    _start_agent_build(sid, session)
+    return _ok(rid, {"accepted": True, "session_id": sid, "trigger": trigger})
 
 
 @method("session.delete")
@@ -11806,7 +11915,7 @@ def _session_processes(session: dict) -> list:
 @method("process.list")
 def _(rid, params: dict) -> dict:
     """Session-scoped view of the background process registry (desktop status stack)."""
-    session, err = _sess(params, rid)
+    session, err = _sess_nowait(params, rid)
     if err:
         return err
     try:
@@ -11819,7 +11928,7 @@ def _(rid, params: dict) -> dict:
 def _(rid, params: dict) -> dict:
     """Kill ONE background process — scoped to the caller's session so one
     window can't reap another session's work (unlike process.stop's kill_all)."""
-    session, err = _sess(params, rid)
+    session, err = _sess_nowait(params, rid)
     if err:
         return err
     proc_id = str(params.get("process_id") or "")

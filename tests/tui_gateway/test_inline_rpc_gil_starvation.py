@@ -64,6 +64,8 @@ def capture(server):
 # seconds when the GIL is contended by concurrent agent turns.
 
 FRONTEND_POLLED_RPCS = [
+    "commands.catalog",     # config + skill-directory scan during composer mount
+    "pet.info.meta",        # floating pet metadata — profile config + disk stat
     "session.list",          # loads session list — SQLite query
     "pet.info",              # petdex poll — file/network read
     "process.list",          # background process status — process registry scan
