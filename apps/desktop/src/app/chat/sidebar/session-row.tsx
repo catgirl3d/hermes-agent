@@ -1,5 +1,6 @@
-import { useStore } from '@nanostores/react'
+import type { ReadableAtom } from 'nanostores'
 import type * as React from 'react'
+import { memo, useCallback, useSyncExternalStore } from 'react'
 
 import { startSessionDrag } from '@/app/chat/session-drag'
 import { PlatformAvatar } from '@/app/messaging/platform-icon'
@@ -14,7 +15,7 @@ import { handoffOriginSource, sessionSourceLabel } from '@/lib/session-source'
 import { coarseElapsed } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { $backgroundRunningSessionIds } from '@/store/composer-status'
-import { $attentionSessionIds, $unreadFinishedSessionIds } from '@/store/session'
+import { $attentionSessionIds, $selectedStoredSessionId, $unreadFinishedSessionIds, $workingSessionIds } from '@/store/session'
 import { openSessionTile } from '@/store/session-states'
 import { canOpenSessionWindow, openSessionInNewWindow } from '@/store/windows'
 
@@ -26,8 +27,7 @@ interface SidebarSessionRowProps extends React.ComponentProps<'div'> {
   /** TUI-style tree stem for branched sessions (`└─ ` / `├─ `). */
   branchStem?: string
   isPinned: boolean
-  isSelected: boolean
-  isWorking: boolean
+  showSelection?: boolean
   onArchive: () => void
   onBranch?: () => void
   onDelete: () => void
@@ -47,12 +47,24 @@ function formatAge(seconds: number, r: Translations['sidebar']['row']): string {
   return unit === 'second' ? r.ageNow : `${value}${r[AGE_KEY[unit]]}`
 }
 
-export function SidebarSessionRow({
+type SessionMembershipValue = null | readonly string[] | string
+
+function sessionMembershipIncludes(value: SessionMembershipValue, sessionId: string): boolean {
+  return Array.isArray(value) ? value.includes(sessionId) : value === sessionId
+}
+
+function useSessionMembership<T extends SessionMembershipValue>(store: ReadableAtom<T>, sessionId: string): boolean {
+  const subscribe = useCallback((notify: () => void) => store.listen(notify), [store])
+  const getSnapshot = useCallback(() => sessionMembershipIncludes(store.get(), sessionId), [sessionId, store])
+
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
+}
+
+export const SidebarSessionRow = memo(function SidebarSessionRow({
   session,
   branchStem,
   isPinned,
-  isSelected,
-  isWorking,
+  showSelection = true,
   onArchive,
   onBranch,
   onDelete,
@@ -76,17 +88,13 @@ export function SidebarSessionRow({
   // Telegram thread continued here still reads as Telegram.
   const handoffSource = handoffOriginSource(session.handoff_state, session.handoff_platform)
   const handoffLabel = handoffSource ? (sessionSourceLabel(handoffSource) ?? handoffSource) : null
-  // True when a clarify prompt in this session is waiting on the user.
-  const needsInput = useStore($attentionSessionIds).includes(session.id)
-  // True when the session's most recent turn finished in the background (while
-  // the user was viewing a different session) and hasn't been opened since.
-  const isUnread = useStore($unreadFinishedSessionIds).includes(session.id)
-  // True when a terminal(background=true) process is alive in this session.
-  const hasBackground = useStore($backgroundRunningSessionIds).includes(session.id)
+  const selected = useSessionMembership($selectedStoredSessionId, session.id)
+  const isSelected = showSelection && selected
+  const isWorking = useSessionMembership($workingSessionIds, session.id)
+  const needsInput = useSessionMembership($attentionSessionIds, session.id)
+  const hasBackground = useSessionMembership($backgroundRunningSessionIds, session.id)
+  const isUnread = useSessionMembership($unreadFinishedSessionIds, session.id)
 
-  // Resolve the dot's display state once — the four signals are mutually
-  // exclusive by priority, so threading them as booleans through wrappers just
-  // to collapse them at the leaf is backwards.
   const dotState: SessionDotState = needsInput
     ? 'needs-input'
     : isWorking
@@ -249,7 +257,7 @@ export function SidebarSessionRow({
       </SidebarRowShell>
     </SessionContextMenu>
   )
-}
+})
 
 /** The session's display state for the sidebar lead dot. The call site
  *  resolves this from the four underlying signals (needs-input, working,
