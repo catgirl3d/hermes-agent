@@ -3,6 +3,7 @@ import concurrent.futures
 import contextlib
 import contextvars
 import copy
+import hashlib
 import inspect
 import json
 import logging
@@ -244,6 +245,7 @@ _LONG_HANDLERS = frozenset(
         "setup.status",
         "session.branch",
         "session.compress",
+        "session.prune_tool_results",
         "session.list",
         "session.resume",
         "shell.exec",
@@ -3394,6 +3396,92 @@ def _compress_session_history(
         session["history_version"] = history_version + 1
     usage = _get_usage(agent)
     return len(history) - len(compressed), usage
+
+
+_TOOL_RESULT_PRUNE_KEEP_LAST_TURNS = 5
+_TOOL_RESULT_PRUNE_PREVIEW_CACHE_SIZE = 1
+
+
+def _tool_result_prune_selection_hash(tool_names: set[str] | list[str]) -> str:
+    return hashlib.sha256(
+        json.dumps(sorted(tool_names), separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:16]
+
+
+def _preview_tool_result_prune(
+    session: dict,
+    tool_names: set[str] | None = None,
+) -> tuple[list, dict, int]:
+    """Build a side-effect-free targeted tool-result pruning preview."""
+    from hermes_cli.partial_compress import split_history_for_partial_compress
+
+    with session["history_lock"]:
+        history = list(session.get("history", []))
+        history_version = int(session.get("history_version", 0))
+        if tool_names is not None:
+            cache_key = (
+                history_version,
+                _tool_result_prune_selection_hash(tool_names),
+            )
+            cached = session.get("_tool_result_prune_preview_cache", {}).get(cache_key)
+            if cached is not None:
+                return cached
+
+    # Several gateway/runtime pivots are persisted as role=user because strict
+    # providers reject mid-history system messages. They are not conversation
+    # turns and must not consume one of the five protected user exchanges.
+    boundary_history = [
+        {**message, "role": "system"}
+        if (
+            message.get("role") == "user"
+            and isinstance(message.get("content"), str)
+            and message["content"].startswith("[System:")
+        )
+        else message
+        for message in history
+    ]
+    _head, tail = split_history_for_partial_compress(
+        boundary_history, _TOOL_RESULT_PRUNE_KEEP_LAST_TURNS
+    )
+    # An empty tail means fewer than five complete user exchanges (or no user
+    # turns). In that case the whole transcript is recent and must stay exact.
+    protected_messages = len(tail) if tail else len(history)
+
+    compressor = getattr(session.get("agent"), "context_compressor", None)
+    prune = getattr(compressor, "prune_tool_results", None)
+    if not callable(prune):
+        # Targeted pruning is a deterministic transcript utility, not a plugin
+        # context-engine policy. Keep it available when a custom engine owns
+        # full /compress by falling back to the built-in utility implementation.
+        from agent.context_compressor import ContextCompressor
+
+        prune = ContextCompressor.prune_tool_results
+
+    pruned, stats = prune(
+        history,
+        protect_tail_count=protected_messages,
+        tool_names=tool_names,
+    )
+    selected_tool_names = stats.get("selected_tool_names") or []
+    selection_hash = _tool_result_prune_selection_hash(selected_tool_names)
+    preview = {
+        **stats,
+        "selection_hash": selection_hash,
+        "history_version": history_version,
+        "protected_turns": _TOOL_RESULT_PRUNE_KEEP_LAST_TURNS,
+        "protected_messages": protected_messages,
+    }
+    result = (pruned, preview, history_version)
+    with session["history_lock"]:
+        if int(session.get("history_version", 0)) == history_version:
+            cache = session.setdefault("_tool_result_prune_preview_cache", {})
+            stale_keys = [key for key in cache if key[0] != history_version]
+            for key in stale_keys:
+                cache.pop(key, None)
+            cache[(history_version, selection_hash)] = result
+            while len(cache) > _TOOL_RESULT_PRUNE_PREVIEW_CACHE_SIZE:
+                cache.pop(next(iter(cache)))
+    return result
 
 
 def _sync_session_key_after_compress(
@@ -8665,6 +8753,164 @@ def _(rid, params: dict) -> dict:
             _status_update(sid, "ready")
     except Exception as e:
         return _err(rid, 5005, str(e))
+
+
+@method("session.prune_tool_results")
+def _(rid, params: dict) -> dict:
+    """Preview or apply deterministic pruning of old tool payloads.
+
+    Applying requires the exact ``history_version`` returned by preview. This
+    makes confirmation explicit and prevents a stale dialog from overwriting a
+    turn or another transcript mutation that landed in the meantime.
+    """
+    session, err = _sess(params, rid)
+    if err:
+        return err
+    if session.get("running"):
+        return _err(
+            rid,
+            4009,
+            "session busy — interrupt the current turn before cleaning tool outputs",
+        )
+
+    confirm = params.get("confirm") is True
+    expected_version = params.get("history_version")
+    raw_tool_names = params.get("tool_names")
+    if raw_tool_names is None:
+        tool_names = None
+    elif isinstance(raw_tool_names, list) and all(isinstance(name, str) for name in raw_tool_names):
+        tool_names = {name for name in raw_tool_names if name}
+    else:
+        return _err(rid, 4004, "tool_names must be a list of tool names")
+    if confirm and not isinstance(expected_version, int):
+        return _err(rid, 4004, "preview is required before cleaning tool outputs")
+    expected_selection_hash = params.get("selection_hash")
+    if confirm and not isinstance(expected_selection_hash, str):
+        return _err(rid, 4004, "tool selection preview is required before cleaning tool outputs")
+
+    if confirm:
+        with session["history_lock"]:
+            current_version = int(session.get("history_version", 0))
+            if expected_version != current_version:
+                session.pop("_tool_result_prune_preview_cache", None)
+        if expected_version != current_version:
+            return _err(
+                rid,
+                4090,
+                "session history changed after preview — review the updated estimate and confirm again",
+            )
+        if (
+            tool_names is not None
+            and expected_selection_hash != _tool_result_prune_selection_hash(tool_names)
+        ):
+            return _err(
+                rid,
+                4090,
+                "tool selection changed after preview — review the updated estimate and confirm again",
+            )
+
+    try:
+        pruned, preview, preview_version = _preview_tool_result_prune(session, tool_names)
+    except Exception as exc:
+        return _err(rid, 5005, str(exc))
+
+    sid = params.get("session_id", "")
+    if not confirm:
+        return _ok(
+            rid,
+            {
+                "status": "preview",
+                "session_id": sid,
+                "applied": False,
+                **preview,
+            },
+        )
+
+    if expected_version != preview_version:
+        return _err(
+            rid,
+            4090,
+            "session history changed after preview — review the updated estimate and confirm again",
+        )
+
+    if expected_selection_hash != preview.get("selection_hash"):
+        return _err(
+            rid,
+            4090,
+            "tool selection changed after preview — review the updated estimate and confirm again",
+        )
+
+    if not preview.get("changed"):
+        return _ok(
+            rid,
+            {
+                "status": "unchanged",
+                "session_id": sid,
+                "applied": False,
+                "messages": pruned,
+                **preview,
+            },
+        )
+
+    session_key = session.get("session_key", "")
+    if not session_key:
+        return _err(rid, 4001, "no session key for tool-result pruning")
+
+    with session["history_lock"]:
+        if session.get("running"):
+            return _err(
+                rid,
+                4009,
+                "session became busy after preview — wait for the turn to finish and preview again",
+            )
+        current_version = int(session.get("history_version", 0))
+        if current_version != expected_version:
+            return _err(
+                rid,
+                4090,
+                "session history changed after preview — review the updated estimate and confirm again",
+            )
+
+        # Persist before publishing the in-memory mutation. A failed write must
+        # leave both the live context and the renderer's backend truth intact.
+        _ensure_session_db_row(session)
+        with _session_db(session) as db:
+            if db is None:
+                return _db_unavailable_error(rid, code=5008)
+            try:
+                db.replace_messages(session_key, pruned, active_only=True)
+            except Exception as exc:
+                return _err(rid, 5008, f"failed to persist cleaned tool outputs: {exc}")
+
+        next_version = current_version + 1
+        session["history"] = pruned
+        session["history_version"] = next_version
+        session.pop("_tool_result_prune_preview_cache", None)
+        # A draft branch's copied seed is now fully persisted by replace_messages;
+        # do not append the original seed again on its first prompt.
+        if session.get("parent_session_id"):
+            session["_branch_seed_persisted"] = True
+
+        agent = session.get("agent")
+        if agent is not None:
+            if hasattr(agent, "_last_flushed_db_idx"):
+                agent._last_flushed_db_idx = len(pruned)
+            if hasattr(agent, "_flushed_db_message_ids"):
+                agent._flushed_db_message_ids = set()
+            if hasattr(agent, "_flushed_db_message_session_id"):
+                agent._flushed_db_message_session_id = session_key
+
+    return _ok(
+        rid,
+        {
+            "status": "pruned",
+            "session_id": sid,
+            "applied": True,
+            "history_version": next_version,
+            "messages": pruned,
+            **{key: value for key, value in preview.items() if key != "history_version"},
+        },
+    )
 
 
 @method("session.save")
