@@ -442,6 +442,50 @@ export interface SessionResumeResponse {
   queued?: null | {
     user?: string
   }
+  backend_timing_ms?: {
+    backend_agent_build_active_count?: number
+    backend_agent_build_active_max_elapsed_ms?: number
+    backend_agent_build_last_duration_ms?: number
+    backend_agent_build_last_finished_ago_ms?: number
+    backend_ws_event_loop_lag_ms?: number
+    backend_ws_previous_dispatch_ms?: number
+    backend_ws_previous_method?: string
+    backend_ws_previous_request_finished_ago_ms?: number
+    backend_ws_previous_request_ms?: number
+    db_open?: number
+    client_message_event_queue?: number
+    client_receive_ack_event_queue?: number
+    client_receive_ack_to_response?: number
+    client_request_receive_ack?: number
+    client_request_receive_ack_renderer_lag?: number
+    client_request_receive_ack_transport?: number
+    client_request_receive_ack_unattributed?: number
+    client_request_send?: number
+    dispatch_queue?: number
+    event_loop_queue?: number
+    handler_total?: number
+    handler_to_write?: number
+    history_read?: number
+    json_serialize?: number
+    live_lookup?: number
+    live_register?: number
+    message_transport?: number
+    prompt_setup?: number
+    record_prepare?: number
+    reopen?: number
+    resume_info?: number
+    resume_prewarm_enabled?: number
+    resume_prewarm_mode?: 'composer_intent'
+    client_json_parse?: number
+    response_chars?: number
+    schedule?: number
+    schema_version?: number
+    session_lookup?: number
+    slot_claim?: number
+    tip_resolve?: number
+    ws_ack_send?: number
+    ws_receive_to_ack?: number
+  }
   info?: SessionRuntimeInfo
   message_count: number
   messages: SessionMessage[]
