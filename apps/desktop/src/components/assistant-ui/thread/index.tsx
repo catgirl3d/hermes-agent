@@ -32,6 +32,7 @@ export const Thread: FC<{
   onRestoreToMessage?: (messageId: string, target?: RestoreMessageTarget) => Promise<void> | void
   sessionId?: string | null
   sessionKey?: string | null
+  traceSessionId?: string | null
 }> = ({
   clampToComposer = false,
   cwd = null,
@@ -43,7 +44,8 @@ export const Thread: FC<{
   onDismissError,
   onRestoreToMessage,
   sessionId = null,
-  sessionKey
+  sessionKey,
+  traceSessionId = null
 }) => {
   const { t } = useI18n()
   const copy = t.assistant.thread
@@ -74,7 +76,11 @@ export const Thread: FC<{
   const messageComponents = useMemo(
     () => ({
       AssistantMessage: () => (
-        <AssistantMessage onBranchInNewChat={onBranchInNewChat} onDismissError={onDismissError} />
+        <AssistantMessage
+          onBranchInNewChat={onBranchInNewChat}
+          onDismissError={onDismissError}
+          traceSessionId={traceSessionId}
+        />
       ),
       SystemMessage,
       UserEditComposer: () => <UserEditComposer cwd={cwd} gateway={gateway} sessionId={sessionId} />,
@@ -82,10 +88,21 @@ export const Thread: FC<{
         <UserMessage
           onCancel={onCancel}
           onRequestRestoreConfirm={onRestoreToMessage ? requestRestoreConfirm : undefined}
+          traceSessionId={traceSessionId}
         />
       )
     }),
-    [cwd, gateway, onBranchInNewChat, onCancel, onDismissError, onRestoreToMessage, requestRestoreConfirm, sessionId]
+    [
+      cwd,
+      gateway,
+      onBranchInNewChat,
+      onCancel,
+      onDismissError,
+      onRestoreToMessage,
+      requestRestoreConfirm,
+      sessionId,
+      traceSessionId
+    ]
   )
 
   const emptyPlaceholder = intro ? (
@@ -102,6 +119,7 @@ export const Thread: FC<{
         emptyPlaceholder={emptyPlaceholder}
         loadingIndicator={loading === 'response' ? <ResponseLoadingIndicator /> : <BackgroundResumeNotice />}
         sessionKey={sessionKey}
+        traceSessionId={traceSessionId}
       />
       {loading === 'session' && <CenteredThreadSpinner />}
       <ThreadTimeline />

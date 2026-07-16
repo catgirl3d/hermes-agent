@@ -8,6 +8,7 @@ import { useI18n } from '@/i18n'
 import { type ChatMessage, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
+import { createSessionSwitchTrace } from '@/lib/session-switch-trace'
 import { prepareSessionSnapshot } from '@/lib/session-view-snapshot'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { clearQueuedPrompts } from '@/store/composer-queue'
@@ -468,6 +469,7 @@ export function useSessionActions({
 
       return
     }
+
     navigate(NEW_CHAT_ROUTE)
   }, [navigate, selectedStoredSessionId])
 
@@ -476,6 +478,37 @@ export function useSessionActions({
       usageProbeAbortRef.current?.abort()
       usageProbeAbortRef.current = null
       const requestId = resumeRequestRef.current + 1
+      const trace = createSessionSwitchTrace({ requestId, storedSessionId })
+
+      const completeAfterNextPaint = (...args: Parameters<typeof trace.complete>) => {
+        const startedAt = performance.now()
+
+        const markPaintWaitStage = (name: string, waitMethod: 'double-raf' | 'timeout', rafCount: number) => {
+          trace.mark(name, {
+            waitDurationMs: Math.round((performance.now() - startedAt) * 10) / 10,
+            rafCount,
+            waitMethod
+          })
+        }
+
+        const complete = (name: string, waitMethod: 'double-raf' | 'timeout', rafCount: number) => {
+          markPaintWaitStage(name, waitMethod, rafCount)
+          trace.complete(...args)
+        }
+
+        if (typeof window === 'undefined' || typeof window.requestAnimationFrame !== 'function') {
+          trace.mark('paint-wait-start', { rafCount: 0, waitMethod: 'timeout' })
+          setTimeout(() => complete('paint-wait-finished', 'timeout', 0), 0)
+
+          return
+        }
+
+        trace.mark('paint-wait-start', { rafCount: 2, waitMethod: 'double-raf' })
+        window.requestAnimationFrame(() => {
+          markPaintWaitStage('paint-raf-1', 'double-raf', 1)
+          window.requestAnimationFrame(() => complete('paint-raf-2', 'double-raf', 2))
+        })
+      }
 
       resumeRequestRef.current = requestId
       const resumedSameSelectedSession = selectedStoredSessionIdRef.current === storedSessionId
@@ -529,18 +562,33 @@ export function useSessionActions({
         return { runtimeId, state }
       }
 
+      trace.mark('initial-cache', { warm: takeWarmCache() !== null })
+
       // Swap the single live gateway to this session's profile before any
       // gateway call (no-op when it's already on that profile / single-profile).
       // resolveStoredSession finds the row by id (cheap), so an uncached pasted
       // id loads as fast as a sidebar click instead of hanging on a list scan.
+      const sessionWasInSidebar = $sessions.get().some(session => sessionMatchesStoredId(session, storedSessionId))
+      trace.mark('profile-resolve-start', { sessionWasInSidebar })
       const storedForProfile = await resolveStoredSession(storedSessionId)
       const sessionProfile = storedForProfile?.profile
+      trace.mark('profile-resolve-finished', {
+        profileResolved: Boolean(storedForProfile),
+        sessionWasInSidebar
+      })
 
       if (resumeRequestRef.current !== requestId) {
+        trace.complete('superseded', { phase: 'profile-resolve' })
+
         return
       }
 
+      const profileSwitch =
+        Boolean(sessionProfile?.trim()) &&
+        normalizeProfileKey(sessionProfile) !== normalizeProfileKey($activeGatewayProfile.get())
+      trace.mark('gateway-profile-start', { profileSwitch })
       await ensureGatewayProfile(sessionProfile)
+      trace.mark('gateway-profile-finished', { profileSwitch })
 
       // Re-check after the profile-resolve / gateway-swap awaits above: the
       // cache may have changed, and takeWarmCache re-validates belongs-to and
@@ -598,6 +646,8 @@ export function useSessionActions({
           activeSessionIdRef.current = cachedRuntimeId
           busyRef.current = cachedViewState.busy
           publishSessionViewSnapshot(prepareSessionSnapshot(cachedRuntimeId, cachedViewState))
+          trace.mark('warm-view-published', { messageCount: cachedViewState.messages.length })
+          completeAfterNextPaint('warm-restored', { messageCount: cachedViewState.messages.length, profileSwitch })
           setSessionStartedAt(Date.now())
 
           try {
@@ -756,10 +806,14 @@ export function useSessionActions({
         // session.resume returns the display transcript and binds the runtime id.
         // It is the single successful resume read; REST remains a failure-only
         // fallback so normal session switches do not contend on SQLite.
+        trace.mark('resume-rpc-start')
+        const resumeRpcStartedAt = performance.now()
+
         const resumed = await requestGateway<SessionResumeResponse>('session.resume', {
           session_id: storedSessionId,
           cols: 96,
           source: 'desktop',
+          _transport_timing: true,
           // Watch windows attach lazily (live mirror). Every other cold resume
           // gets the gateway's default deferred build: the RPC returns the
           // transcript immediately instead of blocking the switch on _make_agent
@@ -767,16 +821,107 @@ export function useSessionActions({
           ...(watchWindow ? { lazy: true } : {}),
           ...(sessionProfile ? { profile: sessionProfile } : {})
         })
+
+        const resumeRpcDurationMs = Math.round((performance.now() - resumeRpcStartedAt) * 10) / 10
+        const backendTiming = resumed.backend_timing_ms
+        const backendHandlerMs = backendTiming?.handler_total
+        const backendDispatchQueueMs = backendTiming?.dispatch_queue
+        const backendEventLoopQueueMs = backendTiming?.event_loop_queue
+        const backendHandlerToWriteMs = backendTiming?.handler_to_write
+        const clientJsonParseMs = backendTiming?.client_json_parse
+        const backendJsonSerializeMs = backendTiming?.json_serialize
+
+        const outsideHandlerRoundTripMs =
+          backendHandlerMs === undefined
+            ? undefined
+            : Math.round(Math.max(0, resumeRpcDurationMs - backendHandlerMs) * 10) / 10
+
+        const unmeasuredRoundTripMs =
+          outsideHandlerRoundTripMs === undefined
+            ? undefined
+            : Math.round(
+                Math.max(
+                  0,
+                  outsideHandlerRoundTripMs -
+                    (backendDispatchQueueMs ?? 0) -
+                    (backendHandlerToWriteMs ?? 0) -
+                    (backendEventLoopQueueMs ?? 0) -
+                    (backendJsonSerializeMs ?? 0) -
+                    (backendTiming?.ws_ack_send ?? 0) -
+                    (backendTiming?.ws_receive_to_ack ?? 0) -
+                    (clientJsonParseMs ?? 0) -
+                    (backendTiming?.client_message_event_queue ?? 0) -
+                    (backendTiming?.client_request_send ?? 0)
+                ) * 10
+              ) / 10
+
+        trace.mark('resume-rpc-finished', {
+          backendAgentBuildActiveCount: backendTiming?.backend_agent_build_active_count,
+          backendAgentBuildActiveMaxElapsedMs: backendTiming?.backend_agent_build_active_max_elapsed_ms,
+          backendAgentBuildLastDurationMs: backendTiming?.backend_agent_build_last_duration_ms,
+          backendAgentBuildLastFinishedAgoMs: backendTiming?.backend_agent_build_last_finished_ago_ms,
+          backendDbOpenMs: backendTiming?.db_open,
+          backendDispatchQueueMs,
+          backendEventLoopQueueMs,
+          backendHandlerMs,
+          backendHandlerToWriteMs,
+          backendHistoryReadMs: backendTiming?.history_read,
+          backendJsonSerializeMs,
+          backendLiveLookupMs: backendTiming?.live_lookup,
+          backendLiveRegisterMs: backendTiming?.live_register,
+          backendMessageTransportMs: backendTiming?.message_transport,
+          backendPromptSetupMs: backendTiming?.prompt_setup,
+          backendRecordPrepareMs: backendTiming?.record_prepare,
+          backendReopenMs: backendTiming?.reopen,
+          backendResumeInfoMs: backendTiming?.resume_info,
+          backendResumePrewarmEnabled: backendTiming?.resume_prewarm_enabled,
+          backendResumePrewarmMode: backendTiming?.resume_prewarm_mode,
+          backendScheduleMs: backendTiming?.schedule,
+          backendSessionLookupMs: backendTiming?.session_lookup,
+          backendSlotClaimMs: backendTiming?.slot_claim,
+          backendTimingVersion: backendTiming?.schema_version,
+          backendTipResolveMs: backendTiming?.tip_resolve,
+          backendWsAckSendMs: backendTiming?.ws_ack_send,
+          backendWsEventLoopLagMs: backendTiming?.backend_ws_event_loop_lag_ms,
+          backendWsPreviousDispatchMs: backendTiming?.backend_ws_previous_dispatch_ms,
+          backendWsPreviousMethod: backendTiming?.backend_ws_previous_method,
+          backendWsPreviousRequestFinishedAgoMs: backendTiming?.backend_ws_previous_request_finished_ago_ms,
+          backendWsPreviousRequestMs: backendTiming?.backend_ws_previous_request_ms,
+          backendWsReceiveToAckMs: backendTiming?.ws_receive_to_ack,
+          clientJsonParseMs,
+          clientMessageEventQueueMs: backendTiming?.client_message_event_queue,
+          clientReceiveAckEventQueueMs: backendTiming?.client_receive_ack_event_queue,
+          clientReceiveAckToResponseMs: backendTiming?.client_receive_ack_to_response,
+          clientRequestReceiveAckMs: backendTiming?.client_request_receive_ack,
+          clientRequestReceiveAckRendererLagMs: backendTiming?.client_request_receive_ack_renderer_lag,
+          clientRequestReceiveAckTransportMs: backendTiming?.client_request_receive_ack_transport,
+          clientRequestReceiveAckUnattributedMs: backendTiming?.client_request_receive_ack_unattributed,
+          clientRequestSendMs: backendTiming?.client_request_send,
+          clientResponseChars: backendTiming?.response_chars,
+          outsideHandlerRoundTripMs,
+          unmeasuredRoundTripMs,
+          messageCount: resumed.messages.length,
+          rpcDurationMs: resumeRpcDurationMs
+        })
+
         if (!isCurrentResume()) {
+          trace.complete('superseded', { phase: 'resume-rpc' })
+
           return
         }
 
         const targetCachedMessages = sessionStateByRuntimeIdRef.current.get(resumed.session_id)?.messages
         const previousMessages = targetCachedMessages ?? (resumedSameSelectedSession ? resumeStartMessages : [])
+        const transcriptTransformStartedAt = performance.now()
         const resumedMessages = reconcileAuthoritativeMessages(resumed.messages, previousMessages, resumed)
+        trace.mark('transcript-transformed', {
+          transformDurationMs: Math.round((performance.now() - transcriptTransformStartedAt) * 10) / 10,
+          messageCount: resumedMessages.length
+        })
 
         if (sessionShouldHaveTranscript(stored) && resumedMessages.length === 0) {
           setResumeFailedSessionId(storedSessionId)
+          completeAfterNextPaint('failed', { emptyTranscript: true, profileSwitch })
 
           return
         }
@@ -805,10 +950,18 @@ export function useSessionActions({
         publishSessionViewSnapshot(
           prepareSessionSnapshot(resumed.session_id, resumedState, { runtimeSyncMode: 'layout' })
         )
+        trace.mark('cold-view-published', { messageCount: resumedMessages.length })
+        completeAfterNextPaint('cold-resumed', { messageCount: resumedMessages.length, profileSwitch })
       } catch (err) {
         if (!isCurrentResume()) {
+          trace.complete('superseded', { phase: 'resume-rpc' })
+
           return
         }
+
+        trace.mark('resume-rpc-failed', {
+          error: err instanceof Error ? err.message : String(err)
+        })
 
         // The gateway resume RPC failed. Try the REST transcript as a fallback
         // so the window at least shows history. CRITICAL: this fallback must be
@@ -847,9 +1000,12 @@ export function useSessionActions({
           // use-route-resume re-attempts the resume on the next render / window
           // focus / gateway reconnect instead of stranding the loader.
           fallbackError = e
+          trace.mark('fallback-rest-failed')
         }
 
         if (!isCurrentResume()) {
+          trace.complete('superseded', { phase: 'fallback-rest' })
+
           return
         }
 
@@ -860,6 +1016,7 @@ export function useSessionActions({
         // permanently-dead id. (Booting straight into a no-longer-existent
         // last-session id is the common trigger.)
         if (!fallbackPainted && isSessionGoneError(fallbackError)) {
+          completeAfterNextPaint('failed', { profileSwitch, sessionGone: true })
           // A session created THIS run isn't gone — its backend just flapped
           // before the turn-less session persisted. Keep the empty view and arm
           // the bounded retry to rebind, rather than yanking to a fresh draft.
@@ -888,6 +1045,7 @@ export function useSessionActions({
         }
 
         notifyError(err, copy.resumeFailed)
+        completeAfterNextPaint('failed', { fallbackPainted, profileSwitch })
       } finally {
         // Successful paths publish their complete target snapshot above. Failed
         // paths intentionally leave the previous visible snapshot untouched.

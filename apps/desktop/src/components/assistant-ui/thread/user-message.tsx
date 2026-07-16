@@ -3,6 +3,7 @@ import { type FC, type ReactNode, useCallback, useRef, useState } from 'react'
 
 import { DirectiveContent } from '@/components/assistant-ui/directive-text'
 import { messageAttachmentRefs, messageContentText } from '@/components/assistant-ui/thread/content'
+import { useMessageRenderTiming } from '@/components/assistant-ui/thread/message-render-timing'
 import { type RestoreMessageTarget } from '@/components/assistant-ui/thread/types'
 import { UserMessageText } from '@/components/assistant-ui/thread/user-message-text'
 import { Codicon } from '@/components/ui/codicon'
@@ -100,10 +101,12 @@ const ProcessNotificationNote: FC<{ text: string }> = ({ text }) => {
 export const UserMessage: FC<{
   onCancel?: () => Promise<void> | void
   onRequestRestoreConfirm?: (messageId: string, target: RestoreMessageTarget) => void
-}> = ({ onCancel, onRequestRestoreConfirm }) => {
+  traceSessionId?: string | null
+}> = ({ onCancel, onRequestRestoreConfirm, traceSessionId = null }) => {
   const { t } = useI18n()
   const copy = t.assistant.thread
   const messageId = useAuiState(s => s.message.id)
+  const finishRenderBody = useMessageRenderTiming(traceSessionId, messageId, 'user-message')
   const content = useAuiState(s => s.message.content)
   const messageText = messageContentText(content)
   const threadRunning = useAuiState(s => s.thread.isRunning)
@@ -198,6 +201,8 @@ export const UserMessage: FC<{
   // Injected background-process notification, not a human prompt — render the
   // compact system-style notice (after all hooks above have run).
   if (PROCESS_NOTIFICATION_RE.test(messageText.trim())) {
+    finishRenderBody()
+
     return (
       <MessagePrimitive.Root
         className="flex w-full min-w-0 flex-col items-stretch"
@@ -239,6 +244,8 @@ export const UserMessage: FC<{
       </div>
     </div>
   )
+
+  finishRenderBody()
 
   return (
     <MessagePrimitive.Root asChild>
