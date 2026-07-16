@@ -197,7 +197,7 @@ export function PreviewConsolePanel({
 
     const block = [copy.promptHeader, '```', ...entries.map(formatLogLine), '```'].join('\n')
 
-    requestComposerInsert(block, { mode: 'block', target: 'main' })
+    requestComposerInsert(block, { intent: 'text', mode: 'block', target: 'main' })
     consoleState.clearSelection()
     notify({
       kind: 'success',
