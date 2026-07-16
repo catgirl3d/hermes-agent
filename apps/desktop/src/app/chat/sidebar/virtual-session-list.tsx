@@ -6,26 +6,23 @@ import { type FC, useCallback, useRef } from 'react'
 import type { SessionInfo } from '@/hermes'
 import { type SidebarSessionEntry } from '@/lib/session-branch-tree'
 import { cn } from '@/lib/utils'
-import { sessionPinId } from '@/store/session'
 
 import { SidebarSessionRow } from './session-row'
 
 interface SessionRowCommonProps {
   branchStem?: string
   isPinned: boolean
-  isSelected: boolean
-  isWorking: boolean
-  onArchive: () => void
-  onBranch?: () => void
-  onDelete: () => void
-  onPin: () => void
-  onResume: () => void
+  showSelection: boolean
+  onArchiveSession: (sessionId: string) => void
+  onBranchSession?: (sessionId: string, profile?: string) => void
+  onDeleteSession: (sessionId: string) => void
+  onResumeSession: (sessionId: string) => void
+  onTogglePin: (sessionId: string) => void
   reorderable?: boolean
   showProfile?: boolean
 }
 
 interface VirtualSessionListProps {
-  activeSessionId: null | string
   className?: string
   entries: SidebarSessionEntry[]
   onArchiveSession: (sessionId: string) => void
@@ -36,14 +33,13 @@ interface VirtualSessionListProps {
   pinned: boolean
   showProfileTags?: boolean
   sortable: boolean
-  workingSessionIdSet: Set<string>
+  showSelection: boolean
 }
 
 const ROW_ESTIMATE_PX = 28
 const OVERSCAN_ROWS = 12
 
 export const VirtualSessionList: FC<VirtualSessionListProps> = ({
-  activeSessionId,
   className,
   entries,
   onArchiveSession,
@@ -54,7 +50,7 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
   pinned,
   showProfileTags = false,
   sortable,
-  workingSessionIdSet
+  showSelection
 }) => {
   const scrollerRef = useRef<HTMLDivElement | null>(null)
 
@@ -86,13 +82,12 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
     const commonProps: SessionRowCommonProps = {
       branchStem,
       isPinned: pinned,
-      isSelected: session.id === activeSessionId,
-      isWorking: workingSessionIdSet.has(session.id),
-      onArchive: () => onArchiveSession(session.id),
-      onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
-      onDelete: () => onDeleteSession(session.id),
-      onPin: () => onTogglePin(sessionPinId(session)),
-      onResume: () => onResumeSession(session.id),
+      showSelection,
+      onArchiveSession,
+      onBranchSession,
+      onDeleteSession,
+      onResumeSession,
+      onTogglePin,
       reorderable,
       showProfile: showProfileTags
     }

@@ -9,7 +9,6 @@ import type { HermesGitWorktree } from '@/global'
 import type { SessionInfo } from '@/hermes'
 import { flattenSessionsWithBranches } from '@/lib/session-branch-tree'
 import { cn } from '@/lib/utils'
-import { sessionPinId } from '@/store/session'
 
 import { SidebarCount } from './chrome'
 import {
@@ -84,8 +83,6 @@ interface SidebarSessionsSectionProps {
   open: boolean
   onToggle: () => void
   sessions: SessionInfo[]
-  activeSessionId: null | string
-  workingSessionIdSet: Set<string>
   onResumeSession: (sessionId: string) => void
   onDeleteSession: (sessionId: string) => void
   onArchiveSession: (sessionId: string) => void
@@ -93,6 +90,7 @@ interface SidebarSessionsSectionProps {
   onTogglePin: (sessionId: string) => void
   onNewSessionInWorkspace?: (path: null | string) => void
   pinned: boolean
+  showSelection?: boolean
   rootClassName?: string
   contentClassName?: string
   emptyState: React.ReactNode
@@ -146,8 +144,6 @@ export function SidebarSessionsSection({
   open,
   onToggle,
   sessions,
-  activeSessionId,
-  workingSessionIdSet,
   onResumeSession,
   onDeleteSession,
   onArchiveSession,
@@ -155,6 +151,7 @@ export function SidebarSessionsSection({
   onTogglePin,
   onNewSessionInWorkspace,
   pinned,
+  showSelection = true,
   rootClassName,
   contentClassName,
   emptyState,
@@ -200,13 +197,12 @@ export function SidebarSessionsSection({
     const rowProps = {
       branchStem,
       isPinned: pinned,
-      isSelected: session.id === activeSessionId,
-      isWorking: workingSessionIdSet.has(session.id),
-      onArchive: () => onArchiveSession(session.id),
-      onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
-      onDelete: () => onDeleteSession(session.id),
-      onPin: () => onTogglePin(sessionPinId(session)),
-      onResume: () => onResumeSession(session.id),
+      showSelection,
+      onArchiveSession,
+      onBranchSession,
+      onDeleteSession,
+      onResumeSession,
+      onTogglePin,
       reorderable: draggable && !branchStem,
       session,
       showProfile: showProfileTags
@@ -308,7 +304,6 @@ export function SidebarSessionsSection({
   } else if (flatVirtualized) {
     const virtual = (
       <VirtualSessionList
-        activeSessionId={activeSessionId}
         className={contentClassName}
         entries={displayEntries}
         onArchiveSession={onArchiveSession}
@@ -318,8 +313,8 @@ export function SidebarSessionsSection({
         onTogglePin={onTogglePin}
         pinned={pinned}
         showProfileTags={showProfileTags}
+        showSelection={showSelection}
         sortable={sessionsDraggable}
-        workingSessionIdSet={workingSessionIdSet}
       />
     )
 
@@ -369,12 +364,12 @@ export function SidebarSessionsSection({
 interface SortableSessionRowProps {
   session: SessionInfo
   isPinned: boolean
-  isSelected: boolean
-  isWorking: boolean
-  onArchive: () => void
-  onDelete: () => void
-  onPin: () => void
-  onResume: () => void
+  showSelection: boolean
+  onArchiveSession: (sessionId: string) => void
+  onBranchSession?: (sessionId: string, profile?: string) => void
+  onDeleteSession: (sessionId: string) => void
+  onResumeSession: (sessionId: string) => void
+  onTogglePin: (sessionId: string) => void
 }
 
 function SortableSidebarSessionRow(props: SortableSessionRowProps) {
