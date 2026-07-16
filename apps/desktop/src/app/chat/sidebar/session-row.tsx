@@ -1,5 +1,6 @@
-import { useStore } from '@nanostores/react'
+import type { ReadableAtom } from 'nanostores'
 import type * as React from 'react'
+import { memo, useCallback, useSyncExternalStore } from 'react'
 
 import { ProfileTag } from '@/app/chat/profile-tag'
 import { startSessionDrag } from '@/app/chat/session-drag'
@@ -17,7 +18,12 @@ import { cn } from '@/lib/utils'
 import { $backgroundRunningSessionIds } from '@/store/composer-status'
 import { $unreadFinishedSessionIds } from '@/store/session'
 import { $sessionColorById } from '@/store/session-color'
-import { $attentionSessionIds, openSessionTile } from '@/store/session-states'
+import {
+  $attentionSessionIds,
+  $focusedStoredSessionId,
+  $workingSessionIds,
+  openSessionTile
+} from '@/store/session-states'
 import { canOpenSessionWindow, openSessionInNewWindow } from '@/store/windows'
 
 import { SidebarRowBody, SidebarRowGrab, SidebarRowLabel, SidebarRowLead, SidebarRowShell } from './chrome'
@@ -29,8 +35,7 @@ interface SidebarSessionRowProps extends React.ComponentProps<'div'> {
   /** TUI-style tree stem for branched sessions (`└─ ` / `├─ `). */
   branchStem?: string
   isPinned: boolean
-  isSelected: boolean
-  isWorking: boolean
+  showSelection?: boolean
   onArchive: () => void
   onBranch?: () => void
   onDelete: () => void
@@ -54,12 +59,36 @@ function formatAge(seconds: number, r: Translations['sidebar']['row']): string {
   return unit === 'second' ? r.ageNow : `${value}${r[AGE_KEY[unit]]}`
 }
 
-export function SidebarSessionRow({
+type SessionMembershipValue = null | readonly string[] | string
+
+function sessionMembershipIncludes(value: SessionMembershipValue, sessionId: string): boolean {
+  return Array.isArray(value) ? value.includes(sessionId) : value === sessionId
+}
+
+function useStoreSelector<T, S>(store: ReadableAtom<T>, selector: (value: T) => S): S {
+  const subscribe = useCallback((notify: () => void) => store.listen(notify), [store])
+  const getSnapshot = useCallback(() => selector(store.get()), [selector, store])
+
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
+}
+
+function useSessionMembership<T extends SessionMembershipValue>(store: ReadableAtom<T>, sessionId: string): boolean {
+  const selector = useCallback((value: T) => sessionMembershipIncludes(value, sessionId), [sessionId])
+
+  return useStoreSelector(store, selector)
+}
+
+function useSessionColor(sessionId: string): null | string {
+  const selector = useCallback((colors: Record<string, string>) => colors[sessionId] ?? null, [sessionId])
+
+  return useStoreSelector($sessionColorById, selector)
+}
+
+export const SidebarSessionRow = memo(function SidebarSessionRow({
   session,
   branchStem,
   isPinned,
-  isSelected,
-  isWorking,
+  showSelection = true,
   onArchive,
   onBranch,
   onDelete,
@@ -85,20 +114,14 @@ export function SidebarSessionRow({
   // Telegram thread continued here still reads as Telegram.
   const handoffSource = handoffOriginSource(session.handoff_state, session.handoff_platform)
   const handoffLabel = handoffSource ? (sessionSourceLabel(handoffSource) ?? handoffSource) : null
-  // True when a clarify prompt in this session is waiting on the user.
-  const needsInput = useStore($attentionSessionIds).includes(session.id)
-  // True when the session's most recent turn finished in the background (while
-  // the user was viewing a different session) and hasn't been opened since.
-  const isUnread = useStore($unreadFinishedSessionIds).includes(session.id)
-  // True when a terminal(background=true) process is alive in this session.
-  const hasBackground = useStore($backgroundRunningSessionIds).includes(session.id)
-  // The session's resolved color (idle dot tint), read from the ONE shared map
-  // the pane tabs also read — an O(1) lookup, never re-derived per render.
-  const projectColor = useStore($sessionColorById)[session.id] ?? null
+  const selected = useSessionMembership($focusedStoredSessionId, session.id)
+  const isSelected = showSelection && selected
+  const isWorking = useSessionMembership($workingSessionIds, session.id)
+  const needsInput = useSessionMembership($attentionSessionIds, session.id)
+  const hasBackground = useSessionMembership($backgroundRunningSessionIds, session.id)
+  const isUnread = useSessionMembership($unreadFinishedSessionIds, session.id)
+  const projectColor = useSessionColor(session.id)
 
-  // Resolve the dot's display state once — the four signals are mutually
-  // exclusive by priority, so threading them as booleans through wrappers just
-  // to collapse them at the leaf is backwards.
   const dotState: SessionDotState = needsInput
     ? 'needs-input'
     : isWorking
@@ -269,7 +292,7 @@ export function SidebarSessionRow({
       </SidebarRowShell>
     </SessionContextMenu>
   )
-}
+})
 
 /** The session's display state for the sidebar lead dot. The call site
  *  resolves this from the four underlying signals (needs-input, working,

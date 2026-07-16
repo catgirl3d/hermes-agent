@@ -213,8 +213,6 @@ function useSessionActions({
   const { t } = useI18n()
   const r = t.sidebar.row
   const [renameOpen, setRenameOpen] = useState(false)
-  const tiles = useStore($sessionTiles)
-  const selectedStoredSessionId = useStore($selectedStoredSessionId)
   const [prunePreview, setPrunePreview] = useState<ToolResultPruneResponse | null>(null)
   const [prunePreviewError, setPrunePreviewError] = useState<string | null>(null)
   const [prunePreviewLoading, setPrunePreviewLoading] = useState(false)
@@ -246,7 +244,8 @@ function useSessionActions({
 
   // Already showing as a tab somewhere (a tile, or loaded in main — main IS
   // a tab): offering "Open in new tab" again is noise.
-  const alreadyTabbed = sessionId === selectedStoredSessionId || tiles.some(tile => tile.storedSessionId === sessionId)
+  const alreadyTabbed =
+    sessionId === $selectedStoredSessionId.get() || $sessionTiles.get().some(tile => tile.storedSessionId === sessionId)
 
   const spec = (partial: Omit<ItemSpec, 'onSelect'> & { onSelect: () => void }): ItemSpec => partial
 

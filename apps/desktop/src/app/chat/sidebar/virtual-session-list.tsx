@@ -13,8 +13,7 @@ import { SidebarSessionRow } from './session-row'
 interface SessionRowCommonProps {
   branchStem?: string
   isPinned: boolean
-  isSelected: boolean
-  isWorking: boolean
+  showSelection: boolean
   onArchive: () => void
   onBranch?: () => void
   onDelete: () => void
@@ -25,7 +24,6 @@ interface SessionRowCommonProps {
 }
 
 interface VirtualSessionListProps {
-  activeSessionId: null | string
   className?: string
   entries: SidebarSessionEntry[]
   onArchiveSession: (sessionId: string) => void
@@ -36,14 +34,13 @@ interface VirtualSessionListProps {
   pinned: boolean
   showProfileTags?: boolean
   sortable: boolean
-  workingSessionIdSet: Set<string>
+  showSelection: boolean
 }
 
 const ROW_ESTIMATE_PX = 28
 const OVERSCAN_ROWS = 12
 
 export const VirtualSessionList: FC<VirtualSessionListProps> = ({
-  activeSessionId,
   className,
   entries,
   onArchiveSession,
@@ -54,7 +51,7 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
   pinned,
   showProfileTags = false,
   sortable,
-  workingSessionIdSet
+  showSelection
 }) => {
   const scrollerRef = useRef<HTMLDivElement | null>(null)
 
@@ -86,8 +83,7 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
     const commonProps: SessionRowCommonProps = {
       branchStem,
       isPinned: pinned,
-      isSelected: session.id === activeSessionId,
-      isWorking: workingSessionIdSet.has(session.id),
+      showSelection,
       onArchive: () => onArchiveSession(session.id),
       onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
       onDelete: () => onDeleteSession(session.id),
