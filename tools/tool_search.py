@@ -1,14 +1,17 @@
 """Progressive tool disclosure ("tool search") for Hermes Agent.
 
-When enabled, MCP and non-core plugin tools are replaced in the model-visible
-tools array by three bridge tools — ``tool_search``, ``tool_describe``,
-``tool_call`` — and surfaced on demand. Core Hermes tools never defer.
+When enabled, deferrable tools are replaced in the model-visible tools array by
+three bridge tools — ``tool_search``, ``tool_describe``, ``tool_call`` — and
+surfaced on demand. By default that means MCP and other non-core tools. When
+``defer_core_tools`` is enabled, core tools outside the configured bootstrap
+list may defer as well.
 
 Design constraints this module is built around (see ``openclaw-tool-search-report``
 for the full rationale):
 
-* Core tools defined in ``toolsets._HERMES_CORE_TOOLS`` are *never* deferred.
-  Always-load means always-load. No exceptions.
+* Bridge tools are always visible.
+* Unknown/unregistered tools stay visible defensively rather than being
+  silently dropped.
 * The threshold gate runs every assembly: when deferrable tools would consume
   less than ``threshold_pct`` of the model's context window (default 10%),
   tool search is a no-op and the tools array passes through unchanged.
@@ -46,6 +49,19 @@ TOOL_CALL_NAME = "tool_call"
 
 BRIDGE_TOOL_NAMES = frozenset({TOOL_SEARCH_NAME, TOOL_DESCRIBE_NAME, TOOL_CALL_NAME})
 
+# Core bootstrap tools that remain directly visible when ``defer_core_tools``
+# is enabled. Stored as an immutable set on ToolSearchConfig so callers can
+# freeze the policy for the lifetime of a session.
+DEFAULT_ALWAYS_VISIBLE_TOOLS = frozenset({
+    "terminal",
+    "process",
+    "read_file",
+    "write_file",
+    "patch",
+    "search_files",
+    "clarify",
+})
+
 # When estimating tokens from char count without a real tokenizer, this is
 # the cheap rule of thumb that's stable across providers. Roughly 4 chars
 # per token for English+JSON. Underestimating leads to false negatives
@@ -53,6 +69,34 @@ BRIDGE_TOOL_NAMES = frozenset({TOOL_SEARCH_NAME, TOOL_DESCRIBE_NAME, TOOL_CALL_N
 # positives (activated when not needed). 4.0 errs slightly toward
 # underestimating, which is the safer default.
 CHARS_PER_TOKEN = 4.0
+
+# Compact signature budgets. Keep these tight because the manifest is paid on
+# every request, even when a turn only uses bootstrap tools.
+MAX_INLINE_ENUM_VALUES = 8
+MAX_INLINE_ENUM_CHARS = 96
+MAX_INLINE_DEFAULT_CHARS = 48
+MAX_SIGNATURE_CHARS = 320
+MAX_MANIFEST_BODY_CHARS = 2048
+MAX_BRIDGE_DESCRIPTION_CHARS = 4096
+
+_SAFE_NAME_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:/+-]+$")
+_COMPACT_BLOCKING_KEYS = frozenset({
+    "const",
+    "contains",
+    "contentEncoding",
+    "contentMediaType",
+    "dependentRequired",
+    "dependentSchemas",
+    "maxProperties",
+    "minProperties",
+    "not",
+    "pattern",
+    "patternProperties",
+    "propertyNames",
+    "unevaluatedItems",
+    "unevaluatedProperties",
+    "uniqueItems",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -62,12 +106,14 @@ CHARS_PER_TOKEN = 4.0
 
 @dataclass(frozen=True)
 class ToolSearchConfig:
-    """Resolved, validated tool-search configuration for a single assembly."""
+    """Resolved, validated tool-search policy for one session or assembly."""
 
     enabled: str  # "auto" | "on" | "off"
     threshold_pct: float  # 0..100 — only used when enabled == "auto"
     search_default_limit: int
     max_search_limit: int
+    defer_core_tools: bool
+    always_visible_tools: frozenset[str]
 
     @classmethod
     def from_raw(cls, raw: Any) -> "ToolSearchConfig":
@@ -81,13 +127,19 @@ class ToolSearchConfig:
         """
         if raw is True:
             return cls(enabled="auto", threshold_pct=10.0,
-                       search_default_limit=5, max_search_limit=20)
+                       search_default_limit=5, max_search_limit=20,
+                       defer_core_tools=False,
+                       always_visible_tools=DEFAULT_ALWAYS_VISIBLE_TOOLS)
         if raw is False:
             return cls(enabled="off", threshold_pct=10.0,
-                       search_default_limit=5, max_search_limit=20)
+                       search_default_limit=5, max_search_limit=20,
+                       defer_core_tools=False,
+                       always_visible_tools=DEFAULT_ALWAYS_VISIBLE_TOOLS)
         if not isinstance(raw, dict):
             return cls(enabled="auto", threshold_pct=10.0,
-                       search_default_limit=5, max_search_limit=20)
+                       search_default_limit=5, max_search_limit=20,
+                       defer_core_tools=False,
+                       always_visible_tools=DEFAULT_ALWAYS_VISIBLE_TOOLS)
 
         enabled_raw = str(raw.get("enabled", "auto")).strip().lower()
         if enabled_raw in ("true", "1", "yes"):
@@ -105,13 +157,28 @@ class ToolSearchConfig:
         max_search_limit = max(1, min(50, _safe_int(raw.get("max_search_limit"), 20)))
         search_default_limit = max(1, min(max_search_limit,
                                           _safe_int(raw.get("search_default_limit"), 5)))
+        defer_core_tools = _safe_bool(raw.get("defer_core_tools"), False)
+        always_visible_tools = _normalize_tool_names(
+            raw.get("always_visible_tools"),
+            fallback=DEFAULT_ALWAYS_VISIBLE_TOOLS,
+        )
 
         return cls(
             enabled=enabled,
             threshold_pct=threshold_pct,
             search_default_limit=search_default_limit,
             max_search_limit=max_search_limit,
+            defer_core_tools=defer_core_tools,
+            always_visible_tools=always_visible_tools,
         )
+
+
+@dataclass(frozen=True)
+class CompactSignature:
+    """Compact, schema-derived tool signature for deferred-tool hints."""
+
+    text: str
+    safe_for_direct_call: bool
 
 
 def _safe_int(value: Any, fallback: int) -> int:
@@ -126,6 +193,257 @@ def _safe_float(value: Any, fallback: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return fallback
+
+
+def _safe_bool(value: Any, fallback: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "on"}:
+            return True
+        if lowered in {"false", "0", "no", "off"}:
+            return False
+    if isinstance(value, (int, float)) and value in {0, 1}:
+        return bool(value)
+    return fallback
+
+
+def _normalize_tool_names(value: Any, *, fallback: frozenset[str]) -> frozenset[str]:
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        return fallback
+    names = []
+    for item in value:
+        if item is None:
+            continue
+        name = str(item).strip()
+        if name:
+            names.append(name)
+    return frozenset(names)
+
+
+def _describe_first_signature(name: str) -> CompactSignature:
+    return CompactSignature(text=f"{name}(describe first)", safe_for_direct_call=False)
+
+
+def _render_scalar_literal(value: Any) -> Optional[str]:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            rendered = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return None
+        return rendered
+    if isinstance(value, str):
+        if _SAFE_NAME_TOKEN_RE.match(value):
+            return value
+        try:
+            return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _render_inline_enum(values: Any) -> Optional[str]:
+    if not isinstance(values, list) or not values or len(values) > MAX_INLINE_ENUM_VALUES:
+        return None
+    rendered: List[str] = []
+    for value in values:
+        literal = _render_scalar_literal(value)
+        if literal is None:
+            return None
+        rendered.append(literal)
+    text = "|".join(rendered)
+    if len(text) > MAX_INLINE_ENUM_CHARS:
+        return None
+    return text
+
+
+def _render_default_suffix(schema: Dict[str, Any]) -> Tuple[str, bool]:
+    if "default" not in schema:
+        return "", False
+    rendered = _render_scalar_literal(schema.get("default"))
+    if rendered is None or len(rendered) > MAX_INLINE_DEFAULT_CHARS:
+        return "", True
+    return f"={rendered}", False
+
+
+def _render_numeric_text(value: Any) -> Optional[str]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _render_numeric_bounds(type_name: str, schema: Dict[str, Any]) -> Optional[str]:
+    minimum = schema.get("minimum")
+    maximum = schema.get("maximum")
+    exclusive_minimum = schema.get("exclusiveMinimum")
+    exclusive_maximum = schema.get("exclusiveMaximum")
+
+    lower_value = None
+    lower_inclusive = True
+    upper_value = None
+    upper_inclusive = True
+
+    if exclusive_minimum is not None:
+        lower_value = exclusive_minimum
+        lower_inclusive = False
+    elif minimum is not None:
+        lower_value = minimum
+
+    if exclusive_maximum is not None:
+        upper_value = exclusive_maximum
+        upper_inclusive = False
+    elif maximum is not None:
+        upper_value = maximum
+
+    if lower_value is None and upper_value is None:
+        return type_name
+
+    lower_text = _render_numeric_text(lower_value) if lower_value is not None else None
+    upper_text = _render_numeric_text(upper_value) if upper_value is not None else None
+    if (lower_value is not None and lower_text is None) or (upper_value is not None and upper_text is None):
+        return None
+
+    if lower_text is not None and upper_text is not None:
+        left = "[" if lower_inclusive else "("
+        right = "]" if upper_inclusive else ")"
+        return f"{type_name}{left}{lower_text}..{upper_text}{right}"
+    if lower_text is not None:
+        op = ">=" if lower_inclusive else ">"
+        return f"{type_name}{op}{lower_text}"
+    op = "<=" if upper_inclusive else "<"
+    return f"{type_name}{op}{upper_text}"
+
+
+def _compact_scalar_schema_text(schema: Dict[str, Any]) -> Optional[str]:
+    schema_type = schema.get("type")
+    if "enum" in schema:
+        if schema_type is not None and schema_type not in {"string", "integer", "number", "boolean", "null"}:
+            return None
+        return _render_inline_enum(schema.get("enum"))
+    if schema_type in {"string", "boolean", "null"}:
+        return str(schema_type)
+    if schema_type in {"integer", "number"}:
+        return _render_numeric_bounds(str(schema_type), schema)
+    return None
+
+
+def _compact_nullable_scalar_union_text(schema: Dict[str, Any]) -> Optional[str]:
+    schema_type = schema.get("type")
+    if isinstance(schema_type, list):
+        non_null = [item for item in schema_type if isinstance(item, str) and item != "null"]
+        saw_null = any(item == "null" for item in schema_type)
+        if saw_null and len(non_null) == 1 and len(non_null) == len(schema_type) - 1:
+            scalar_schema = dict(schema)
+            scalar_schema["type"] = non_null[0]
+            return _compact_scalar_schema_text(scalar_schema)
+
+    for key in ("anyOf", "oneOf"):
+        variants = schema.get(key)
+        if not isinstance(variants, list):
+            continue
+        non_null = []
+        saw_null = False
+        for variant in variants:
+            if isinstance(variant, dict) and variant.get("type") == "null":
+                saw_null = True
+            else:
+                non_null.append(variant)
+        if saw_null and len(non_null) == 1 and isinstance(non_null[0], dict):
+            return _compact_scalar_schema_text(non_null[0])
+    return None
+
+
+def _compact_type_text(
+    schema: Dict[str, Any],
+    *,
+    allow_object: bool = True,
+    in_array_item: bool = False,
+) -> Optional[str]:
+    if not isinstance(schema, dict):
+        return None
+    if "$ref" in schema or "allOf" in schema:
+        return None
+    if any(key in schema for key in _COMPACT_BLOCKING_KEYS):
+        return None
+
+    union_text = _compact_nullable_scalar_union_text(schema)
+    if union_text is not None:
+        return union_text
+    if "anyOf" in schema or "oneOf" in schema:
+        return None
+
+    scalar_text = _compact_scalar_schema_text(schema)
+    if scalar_text is not None:
+        return scalar_text
+
+    schema_type = schema.get("type")
+    if schema_type == "array":
+        items = schema.get("items")
+        item_text = _compact_type_text(items, allow_object=False, in_array_item=True) if isinstance(items, dict) else None
+        if item_text is None:
+            return None
+        if "|" in item_text:
+            item_text = f"({item_text})"
+        return f"{item_text}[]"
+    if schema_type == "object":
+        if not allow_object or in_array_item:
+            return None
+        properties = schema.get("properties")
+        if isinstance(properties, dict) and properties:
+            return None
+        additional_properties = schema.get("additionalProperties")
+        if isinstance(additional_properties, dict):
+            value_text = _compact_type_text(additional_properties, allow_object=False)
+            if value_text is None:
+                return None
+            return f"map<string, {value_text}>"
+        if additional_properties is False:
+            return None
+        return "object"
+    return None
+
+
+def compact_signature(tool_def: Dict[str, Any]) -> CompactSignature:
+    """Return a compact signature derived from the sanitized tool schema."""
+
+    fn = tool_def.get("function") or {}
+    name = str(fn.get("name") or "").strip() or "tool"
+    parameters = fn.get("parameters")
+    if not isinstance(parameters, dict):
+        return _describe_first_signature(name)
+
+    properties = parameters.get("properties")
+    if not isinstance(properties, dict):
+        return _describe_first_signature(name)
+
+    required = parameters.get("required")
+    required_names = {item for item in required if isinstance(item, str)} if isinstance(required, list) else set()
+
+    pieces: List[str] = []
+    for param_name, schema in properties.items():
+        if not isinstance(param_name, str) or not isinstance(schema, dict):
+            return _describe_first_signature(name)
+        type_text = _compact_type_text(schema)
+        if type_text is None:
+            return _describe_first_signature(name)
+        default_suffix, default_failed = _render_default_suffix(schema)
+        if default_failed:
+            return _describe_first_signature(name)
+        optional = "" if param_name in required_names else "?"
+        pieces.append(f"{param_name}{optional}: {type_text}{default_suffix}")
+
+    text = f"{name}({', '.join(pieces)})"
+    if len(text) > MAX_SIGNATURE_CHARS:
+        return _describe_first_signature(name)
+    return CompactSignature(text=text, safe_for_direct_call=True)
 
 
 def load_config() -> ToolSearchConfig:
@@ -148,7 +466,7 @@ def load_config() -> ToolSearchConfig:
 
 
 def _core_tool_names() -> frozenset[str]:
-    """Return the set of tool names that must NEVER be deferred.
+    """Return the set of registered Hermes core tool names.
 
     Imported lazily because ``toolsets`` imports from ``tools.registry``
     and we don't want a hard cycle.
@@ -160,39 +478,50 @@ def _core_tool_names() -> frozenset[str]:
         return frozenset()
 
 
-def is_deferrable_tool_name(name: str) -> bool:
+def is_deferrable_tool_name(name: str, config: Optional[ToolSearchConfig] = None) -> bool:
     """Return True if a tool with this name is *eligible* for deferral.
 
-    A tool is deferrable iff it is registered with an MCP toolset prefix
-    OR it is not in ``_HERMES_CORE_TOOLS``. Core tools are never deferred
-    even when their toolset is technically plugin-provided (this protects
-    against accidental shadowing).
+    Rules, in order:
+
+    * bridge tools are never deferred;
+    * tools in ``always_visible_tools`` are never deferred;
+    * unresolved names stay visible defensively;
+    * registered core tools defer only when ``defer_core_tools`` is enabled;
+    * registered non-core tools keep the existing deferrable behavior.
     """
+    if config is None:
+        config = load_config()
     if name in BRIDGE_TOOL_NAMES:
         return False
-    if name in _core_tool_names():
+    if name in config.always_visible_tools:
         return False
-    # Check registry toolset for MCP prefix.
     try:
         from tools.registry import registry
         entry = registry.get_entry(name)
         if entry is None:
             return False
+        if name in _core_tool_names():
+            return bool(config.defer_core_tools)
         if entry.toolset.startswith("mcp-"):
             return True
-        # Non-MCP, non-core → plugin tool, eligible.
+        # Non-core registered tools keep the current behavior.
         return True
     except Exception:
         return False
 
 
-def classify_tools(tool_defs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def classify_tools(
+    tool_defs: List[Dict[str, Any]],
+    config: Optional[ToolSearchConfig] = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Split a tool-defs list into (visible, deferrable).
 
     ``visible`` retains every tool that must stay in the model-facing array:
-    every core tool, plus any tool we can't classify. ``deferrable`` is the
-    candidate set for catalog entry.
+    bridge tools, bootstrap tools, and any tool we can't classify.
+    ``deferrable`` is the candidate set for catalog entry.
     """
+    if config is None:
+        config = load_config()
     visible: List[Dict[str, Any]] = []
     deferrable: List[Dict[str, Any]] = []
     for td in tool_defs:
@@ -202,7 +531,7 @@ def classify_tools(tool_defs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
             # Should never happen — bridge tools are added after classification —
             # but be defensive.
             continue
-        if is_deferrable_tool_name(name):
+        if is_deferrable_tool_name(name, config=config):
             deferrable.append(td)
         else:
             visible.append(td)
@@ -270,7 +599,7 @@ class CatalogEntry:
     name: str
     description: str
     schema: Dict[str, Any]  # The full {"type":"function", "function": {...}} entry.
-    source: str  # "mcp" | "plugin" | "other"
+    source: str  # "core" | "mcp" | "plugin" | "other"
     source_name: str  # Toolset name, e.g. "mcp-github" or "kanban"
 
     # Pre-tokenized fields for BM25.
@@ -311,6 +640,8 @@ def _classify_source(name: str) -> Tuple[str, str]:
         entry = registry.get_entry(name)
         if entry is None:
             return ("other", "")
+        if name in _core_tool_names():
+            return ("core", entry.toolset)
         if entry.toolset.startswith("mcp-"):
             return ("mcp", entry.toolset)
         return ("plugin", entry.toolset)
@@ -418,34 +749,95 @@ def search_catalog(catalog: List[CatalogEntry], query: str, limit: int = 5) -> L
     return [e for _, e in scored[:limit]]
 
 
+def _manifest_source_priority(name: str) -> Tuple[int, str]:
+    source, _ = _classify_source(name)
+    if source == "core":
+        return 0, name
+    if source == "mcp":
+        return 2, name
+    return 1, name
+
+
+def _tool_call_description(deferrable_tool_defs: List[Dict[str, Any]]) -> str:
+    base = (
+        "Invoke a deferred tool by name with the given arguments. The names below are "
+        f"values for `{TOOL_CALL_NAME}.name`. Do not invoke them as native tools. "
+        f"Call `{TOOL_CALL_NAME}` directly when a signature is shown and you know the "
+        f"arguments. Use `{TOOL_SEARCH_NAME}` when the needed tool is not listed or "
+        f"uncertain. Use `{TOOL_DESCRIBE_NAME}` for entries marked \"describe first\", "
+        "unknown parameters, or recovery after argument validation failure."
+    )
+    footer = (
+        f"Use `{TOOL_SEARCH_NAME}` for deferred tools not listed here or when uncertain. "
+        f"If a search result has `describe_required: true`, call `{TOOL_DESCRIBE_NAME}` "
+        f"before `{TOOL_CALL_NAME}`."
+    )
+
+    manifest_entries: List[str] = []
+    for td in sorted(deferrable_tool_defs, key=lambda item: _manifest_source_priority((item.get("function") or {}).get("name", ""))):
+        signature = compact_signature(td)
+        if signature.safe_for_direct_call:
+            manifest_entries.append(f"- {signature.text}")
+
+    if not manifest_entries:
+        text = f"{base}\n\n{footer}"
+        return text[:MAX_BRIDGE_DESCRIPTION_CHARS]
+
+    header = "Direct-call signatures:\n"
+    reserved = len(base) + 2 + len(header) + len(footer) + 2
+    available = min(MAX_MANIFEST_BODY_CHARS, MAX_BRIDGE_DESCRIPTION_CHARS - reserved)
+    if available <= 0:
+        text = f"{base}\n\n{footer}"
+        return text[:MAX_BRIDGE_DESCRIPTION_CHARS]
+
+    included: List[str] = []
+    body_len = 0
+    for line in manifest_entries:
+        add_len = len(line) if not included else len(line) + 1
+        if body_len + add_len > available:
+            break
+        included.append(line)
+        body_len += add_len
+
+    if not included:
+        text = f"{base}\n\n{footer}"
+        return text[:MAX_BRIDGE_DESCRIPTION_CHARS]
+
+    body = "\n".join(included)
+    text = f"{base}\n\n{header}{body}\n\n{footer}"
+    if len(text) > MAX_BRIDGE_DESCRIPTION_CHARS:
+        text = text[:MAX_BRIDGE_DESCRIPTION_CHARS]
+    return text
+
+
 # ---------------------------------------------------------------------------
 # Bridge tool schemas
 # ---------------------------------------------------------------------------
 
 
-def bridge_tool_schemas(deferred_count: int) -> List[Dict[str, Any]]:
+def bridge_tool_schemas(deferrable_tool_defs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Build the bridge tool schemas to inject in place of deferred tools.
 
     The schemas are intentionally short — every byte added here is a byte
     the user pays on every turn. Descriptions are tuned to be unambiguous
     about the call sequence the model should follow.
     """
+    deferred_count = len(deferrable_tool_defs)
     desc_search = (
         f"Search {deferred_count} additional tools that are loaded on demand. "
-        "Returns up to ``limit`` matches with name and description. Follow "
-        f"with `{TOOL_DESCRIBE_NAME}` to load a tool's full parameter schema, "
-        f"then `{TOOL_CALL_NAME}` to invoke it. Tools listed at the top of this "
-        "system prompt are already available and do not need to be searched."
+        "Returns up to ``limit`` matches with name, description, signature, and "
+        f"``describe_required``. Call `{TOOL_CALL_NAME}` directly when a match has "
+        "``describe_required: false`` and you know the arguments. Use "
+        f"`{TOOL_DESCRIBE_NAME}` only when ``describe_required: true``, "
+        "arguments are uncertain, or after argument validation failure. "
+        "Tools listed directly in the tools array do not need to be searched."
     )
     desc_describe = (
         f"Load the full JSON schema for one tool returned by `{TOOL_SEARCH_NAME}`. "
-        f"Required before `{TOOL_CALL_NAME}` if the tool's parameters are unknown."
+        f"Use this when `{TOOL_SEARCH_NAME}` says ``describe_required: true`` or "
+        f"the tool's parameters are still unclear before `{TOOL_CALL_NAME}`."
     )
-    desc_call = (
-        "Invoke a deferred tool by name with the given arguments. Argument shape "
-        f"matches the tool's schema (see `{TOOL_DESCRIBE_NAME}`). Policy, hooks, "
-        "and approvals run exactly as for any directly-listed tool."
-    )
+    desc_call = _tool_call_description(deferrable_tool_defs)
 
     return [
         {
@@ -535,9 +927,10 @@ def assemble_tool_defs(
     """Return the tool-defs list the model should actually see.
 
     When tool search is inactive (off, no deferrable tools, or below
-    threshold), this is a passthrough. When active, MCP and plugin tools
-    are stripped from the visible list and replaced with the three bridge
-    tools. Core tools are *never* deferred regardless of config.
+    threshold), this is a passthrough. When active, deferrable tools are
+    stripped from the visible list and replaced with the three bridge tools.
+    By default that means MCP / non-core tools; with ``defer_core_tools``
+    enabled, selected core tools may defer too.
 
     Idempotent: calling with bridge tools already in the input is a no-op
     (they classify as non-core/non-deferrable but their names are reserved,
@@ -551,7 +944,7 @@ def assemble_tool_defs(
     incoming = [td for td in tool_defs
                 if (td.get("function") or {}).get("name") not in BRIDGE_TOOL_NAMES]
 
-    visible, deferrable = classify_tools(incoming)
+    visible, deferrable = classify_tools(incoming, config=config)
     if not deferrable:
         return AssemblyResult(tool_defs=incoming, activated=False)
 
@@ -565,12 +958,12 @@ def assemble_tool_defs(
             threshold_tokens=int((context_length or 0) * (config.threshold_pct / 100.0)),
         )
 
-    bridge = bridge_tool_schemas(len(deferrable))
+    bridge = bridge_tool_schemas(deferrable)
     result = visible + bridge
     threshold_tokens = int((context_length or 0) * (config.threshold_pct / 100.0))
 
     logger.info(
-        "tool_search activated: %d core/visible tools kept, %d deferred (~%d tokens, threshold ~%d)",
+        "tool_search activated: %d visible/bootstrap tools kept, %d deferred (~%d tokens, threshold ~%d)",
         len(visible), len(deferrable), deferrable_tokens, threshold_tokens,
     )
 
@@ -593,12 +986,15 @@ def is_bridge_tool(name: str) -> bool:
 
 
 def _format_search_hit(entry: CatalogEntry) -> Dict[str, Any]:
+    signature = compact_signature(entry.schema)
     return {
         "name": entry.name,
         "source": entry.source,
         "source_name": entry.source_name,
         # Cap description so a chatty MCP server doesn't blow up the result.
         "description": (entry.description or "")[:400],
+        "signature": signature.text,
+        "describe_required": not signature.safe_for_direct_call,
     }
 
 
@@ -619,7 +1015,7 @@ def dispatch_tool_search(args: Dict[str, Any],
     else:
         limit = max(1, min(config.max_search_limit, _safe_int(raw_limit, config.search_default_limit)))
 
-    _, deferrable = classify_tools(current_tool_defs)
+    _, deferrable = classify_tools(current_tool_defs, config=config)
     catalog = build_catalog(deferrable)
     hits = search_catalog(catalog, query, limit=limit)
     return json.dumps({
@@ -631,19 +1027,22 @@ def dispatch_tool_search(args: Dict[str, Any],
 
 def dispatch_tool_describe(args: Dict[str, Any],
                            *,
-                           current_tool_defs: List[Dict[str, Any]]) -> str:
+                           current_tool_defs: List[Dict[str, Any]],
+                           config: Optional[ToolSearchConfig] = None) -> str:
     """Execute the ``tool_describe`` bridge tool. Returns a JSON string."""
+    if config is None:
+        config = load_config()
     name = str(args.get("name") or "").strip()
     if not name:
         return json.dumps({"error": "name is required"}, ensure_ascii=False)
-    if not is_deferrable_tool_name(name):
+    if not is_deferrable_tool_name(name, config=config):
         return json.dumps({
             "error": (
                 f"'{name}' is not a deferrable tool. If you see it in the tools list "
                 "already, call it directly; otherwise check the spelling against tool_search."
             ),
         }, ensure_ascii=False)
-    _, deferrable = classify_tools(current_tool_defs)
+    _, deferrable = classify_tools(current_tool_defs, config=config)
     for td in deferrable:
         fn = td.get("function") or {}
         if fn.get("name") == name:
@@ -657,7 +1056,10 @@ def dispatch_tool_describe(args: Dict[str, Any],
     }, ensure_ascii=False)
 
 
-def scoped_deferrable_names(tool_defs: List[Dict[str, Any]]) -> frozenset[str]:
+def scoped_deferrable_names(
+    tool_defs: List[Dict[str, Any]],
+    config: Optional[ToolSearchConfig] = None,
+) -> frozenset[str]:
     """Return the set of deferrable tool names present in ``tool_defs``.
 
     ``tool_defs`` is expected to be the *pre-assembly* tool list for the
@@ -669,15 +1071,20 @@ def scoped_deferrable_names(tool_defs: List[Dict[str, Any]]) -> frozenset[str]:
     ``tool_executor`` unwrap so a restricted-toolset session can never invoke
     an out-of-scope tool via the bridge.
     """
+    if config is None:
+        config = load_config()
     names: set[str] = set()
     for td in tool_defs:
         name = (td.get("function") or {}).get("name", "")
-        if name and is_deferrable_tool_name(name):
+        if name and is_deferrable_tool_name(name, config=config):
             names.add(name)
     return frozenset(names)
 
 
-def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[str, Any], Optional[str]]:
+def resolve_underlying_call(
+    args: Dict[str, Any],
+    config: Optional[ToolSearchConfig] = None,
+) -> Tuple[Optional[str], Dict[str, Any], Optional[str]]:
     """Parse a ``tool_call`` invocation into (underlying_name, args, error_msg).
 
     Used by:
@@ -687,6 +1094,8 @@ def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[s
 
     On parse error, returns ``(None, {}, error_message)``.
     """
+    if config is None:
+        config = load_config()
     name = str(args.get("name") or "").strip()
     if not name:
         return None, {}, "tool_call requires a 'name' argument"
@@ -702,7 +1111,7 @@ def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[s
             return None, {}, f"tool_call 'arguments' is not valid JSON: {e}"
     if not isinstance(raw_args, dict):
         return None, {}, "tool_call 'arguments' must be an object"
-    if not is_deferrable_tool_name(name):
+    if not is_deferrable_tool_name(name, config=config):
         return None, {}, (
             f"'{name}' is not a deferrable tool. If it appears in the model-facing tools "
             "list already, call it directly instead of via tool_call."
@@ -715,9 +1124,12 @@ __all__ = [
     "TOOL_DESCRIBE_NAME",
     "TOOL_CALL_NAME",
     "BRIDGE_TOOL_NAMES",
+    "DEFAULT_ALWAYS_VISIBLE_TOOLS",
     "ToolSearchConfig",
+    "CompactSignature",
     "CatalogEntry",
     "AssemblyResult",
+    "compact_signature",
     "load_config",
     "is_deferrable_tool_name",
     "classify_tools",

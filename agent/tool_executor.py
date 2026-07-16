@@ -262,10 +262,12 @@ def _tool_search_scoped_names(agent) -> frozenset:
 
     enabled = getattr(agent, "enabled_toolsets", None)
     disabled = getattr(agent, "disabled_toolsets", None)
+    policy = getattr(agent, "_tool_search_policy", None)
     cache_key = (
         getattr(_registry, "_generation", 0),
         frozenset(enabled) if enabled is not None else None,
         frozenset(disabled) if disabled is not None else None,
+        policy,
     )
     cached = getattr(agent, "_tool_search_scope_cache", None)
     if cached is not None and cached[0] == cache_key:
@@ -276,8 +278,9 @@ def _tool_search_scoped_names(agent) -> frozenset:
             disabled_toolsets=disabled,
             quiet_mode=True,
             skip_tool_search_assembly=True,
+            tool_search_policy=policy,
         ) or []
-        names = _ts.scoped_deferrable_names(scoped_defs)
+        names = _ts.scoped_deferrable_names(scoped_defs, config=policy)
     except Exception:
         names = frozenset()
     try:
@@ -428,7 +431,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         try:
             from tools import tool_search as _ts
             if function_name == _ts.TOOL_CALL_NAME:
-                _underlying, _underlying_args, _err = _ts.resolve_underlying_call(function_args)
+                _underlying, _underlying_args, _err = _ts.resolve_underlying_call(
+                    function_args,
+                    config=getattr(agent, "_tool_search_policy", None),
+                )
                 if not _err and _underlying:
                     if _underlying in _tool_search_scoped_names(agent):
                         function_name = _underlying
@@ -1109,7 +1115,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         try:
             from tools import tool_search as _ts
             if function_name == _ts.TOOL_CALL_NAME:
-                _underlying, _underlying_args, _err = _ts.resolve_underlying_call(function_args)
+                _underlying, _underlying_args, _err = _ts.resolve_underlying_call(
+                    function_args,
+                    config=getattr(agent, "_tool_search_policy", None),
+                )
                 if not _err and _underlying:
                     if _underlying in _tool_search_scoped_names(agent):
                         function_name = _underlying
@@ -1518,6 +1527,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     skip_tool_request_middleware=True,
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                    tool_search_policy=getattr(agent, "_tool_search_policy", None),
                     tool_request_middleware_trace=list(middleware_trace),
                 )
                 _spinner_result = function_result
@@ -1560,6 +1570,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     skip_tool_request_middleware=True,
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                    tool_search_policy=getattr(agent, "_tool_search_policy", None),
                     tool_request_middleware_trace=list(middleware_trace),
                 )
             except KeyboardInterrupt:
