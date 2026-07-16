@@ -1,0 +1,47 @@
+# Hermes Voice and Transcription
+
+Use this file when Hermes is receiving voice messages, transcribing audio, or
+speaking responses back to the user.
+
+## STT (Voice to Text)
+
+Voice messages from messaging platforms are auto-transcribed.
+
+Provider priority:
+
+1. Local `faster-whisper` -- free, no API key: `pip install faster-whisper`
+2. Groq Whisper -- free tier: set `GROQ_API_KEY`
+3. OpenAI Whisper -- paid: set `VOICE_TOOLS_OPENAI_KEY`
+4. Mistral Voxtral -- set `MISTRAL_API_KEY`
+
+Config:
+
+```yaml
+stt:
+  enabled: true
+  provider: local        # local, groq, openai, mistral
+  local:
+    model: base          # tiny, base, small, medium, large-v3
+```
+
+## TTS (Text to Voice)
+
+| Provider | Env var | Free? |
+|---|---|---|
+| Edge TTS | None | Yes (default) |
+| ElevenLabs | `ELEVENLABS_API_KEY` | Free tier |
+| OpenAI | `VOICE_TOOLS_OPENAI_KEY` | Paid |
+| MiniMax | `MINIMAX_API_KEY` | Paid |
+| Mistral (Voxtral) | `MISTRAL_API_KEY` | Paid |
+| NeuTTS (local) | None (`pip install neutts[all]` + `espeak-ng`) | Free |
+
+Voice commands:
+
+- `/voice on` -- voice-to-voice mode.
+- `/voice tts` -- always voice.
+- `/voice off` -- disable voice.
+
+## Verification
+
+- In CLI, restart Hermes after config changes.
+- In gateway, `/restart` after changing STT or TTS settings.
