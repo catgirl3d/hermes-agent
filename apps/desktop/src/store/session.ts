@@ -1,9 +1,9 @@
 import { atom, computed } from 'nanostores'
 
 import { lastVisibleMessageIsUser } from '@/app/chat/thread-loading'
-import type { ContextSuggestion } from '@/app/types'
 import type { HermesConnection } from '@/global'
 import type { ChatMessage } from '@/lib/chat-messages'
+import { prepareSessionSnapshot, type SessionViewSnapshot } from '@/lib/session-view-snapshot'
 import { persistBoolean, persistString, storedBoolean, storedString } from '@/lib/storage'
 import type { SessionInfo, UsageStats } from '@/types/hermes'
 
@@ -245,7 +245,6 @@ export const $messagingTruncated = atom<boolean>(false)
 // one. Empty for single-profile users (fall back to $sessionsTotal).
 export const $sessionProfileTotals = atom<Record<string, number>>({})
 export const $sessionsLoading = atom(true)
-export const $activeSessionId = atom<string | null>(null)
 export const $selectedStoredSessionId = atom<string | null>(null)
 export interface ActiveSessionStoredIdRotation {
   nextStoredSessionId: string
@@ -259,6 +258,7 @@ export interface ActiveSessionStoredIdRotation {
 // run the route-following effect, which lets a background session steal the
 // foreground route.
 export const $activeSessionStoredIdRotation = atom<ActiveSessionStoredIdRotation | null>(null)
+export const $activeSessionId = atom<string | null>(null)
 export const $messages = atom<ChatMessage[]>([])
 
 // Streaming-stable derivations of $messages. During a token stream the array
@@ -314,9 +314,71 @@ export const $introPersonality = atom('')
 export const $currentPersonality = atom('')
 export const $availablePersonalities = atom<string[]>([])
 export const $introSeed = atom(0)
-export const $contextSuggestions = atom<ContextSuggestion[]>([])
 export const $modelPickerOpen = atom(false)
 export const $sessionPickerOpen = atom(false)
+
+export const $sessionViewSnapshot = atom<SessionViewSnapshot>(
+  prepareSessionSnapshot(null, {
+    storedSessionId: null,
+    messages: [],
+    branch: '',
+    cwd: $currentCwd.get(),
+    model: $currentModel.get(),
+    provider: $currentProvider.get(),
+    reasoningEffort: $currentReasoningEffort.get(),
+    serviceTier: $currentServiceTier.get(),
+    fast: $currentFastMode.get(),
+    yolo: $yoloActive.get(),
+    personality: $currentPersonality.get(),
+    busy: false,
+    awaitingResponse: false,
+    streamId: null,
+    sawAssistantPayload: false,
+    pendingBranchGroup: null,
+    interrupted: false,
+    needsInput: false,
+    turnStartedAt: null,
+    usage: null
+  })
+)
+export const $sessionViewActiveSessionId = computed($sessionViewSnapshot, snapshot => snapshot.runtimeSessionId)
+export const $sessionViewStoredSessionId = computed($sessionViewSnapshot, snapshot => snapshot.storedSessionId)
+export const $sessionViewMessages = computed($sessionViewSnapshot, snapshot => snapshot.messages)
+export const $sessionViewMessagesEmpty = computed($sessionViewSnapshot, snapshot => snapshot.messages.length === 0)
+export const $sessionViewLastVisibleMessageIsUser = computed($sessionViewSnapshot, snapshot =>
+  lastVisibleMessageIsUser(snapshot.messages)
+)
+export const $sessionViewBusy = computed($sessionViewSnapshot, snapshot => snapshot.busy)
+export const $sessionViewAwaitingResponse = computed($sessionViewSnapshot, snapshot => snapshot.awaitingResponse)
+export const $sessionViewRuntimeSyncMode = computed($sessionViewSnapshot, snapshot => snapshot.runtimeSyncMode)
+
+function patchSessionViewSnapshot(patch: Partial<SessionViewSnapshot>): void {
+  $sessionViewSnapshot.set({ ...$sessionViewSnapshot.get(), ...patch, runtimeSyncMode: 'passive' })
+}
+
+/** Atomically publishes the coherent chat view, then updates compatibility mirrors. */
+export function publishSessionViewSnapshot(snapshot: SessionViewSnapshot): void {
+  $sessionViewSnapshot.set(snapshot)
+  $activeSessionId.set(snapshot.runtimeSessionId)
+  $messages.set(snapshot.messages)
+  $busy.set(snapshot.busy)
+  $awaitingResponse.set(snapshot.awaitingResponse)
+  $currentModel.set(snapshot.model)
+  $currentProvider.set(snapshot.provider)
+  $currentReasoningEffort.set(snapshot.reasoningEffort)
+  $currentServiceTier.set(snapshot.serviceTier)
+  $currentFastMode.set(snapshot.fast)
+  $yoloActive.set(snapshot.yolo)
+  $currentPersonality.set(snapshot.personality)
+  $currentCwd.set(snapshot.cwd)
+  $currentBranch.set(snapshot.branch)
+  $turnStartedAt.set(snapshot.turnStartedAt)
+  persistString(COMPOSER_MODEL_KEY, snapshot.model || null)
+  persistString(COMPOSER_PROVIDER_KEY, snapshot.provider || null)
+  persistString(COMPOSER_EFFORT_KEY, snapshot.reasoningEffort || null)
+  persistBoolean(COMPOSER_FAST_KEY, snapshot.fast)
+  persistString(workspaceCwdKey(), snapshot.cwd.trim() || null)
+}
 
 export const setConnection = (next: Updater<HermesConnection | null>) => updateAtom($connection, next)
 export const setGatewayState = (next: Updater<string>) => updateAtom($gatewayState, next)
@@ -330,7 +392,10 @@ export const setMessagingTruncated = (next: Updater<boolean>) => updateAtom($mes
 export const setSessionProfileTotals = (next: Updater<Record<string, number>>) =>
   updateAtom($sessionProfileTotals, next)
 export const setSessionsLoading = (next: Updater<boolean>) => updateAtom($sessionsLoading, next)
-export const setActiveSessionId = (next: Updater<string | null>) => updateAtom($activeSessionId, next)
+export const setActiveSessionId = (next: Updater<string | null>) => {
+  updateAtom($activeSessionId, next)
+  patchSessionViewSnapshot({ runtimeSessionId: $activeSessionId.get() })
+}
 export const setActiveSessionStoredIdRotation = (next: Updater<ActiveSessionStoredIdRotation | null>) =>
   updateAtom($activeSessionStoredIdRotation, next)
 
@@ -348,20 +413,31 @@ export const setSelectedStoredSessionId = (next: Updater<string | null>) => {
   }
 }
 
-export const setMessages = (next: Updater<ChatMessage[]>) => updateAtom($messages, next)
+export const setMessages = (next: Updater<ChatMessage[]>) => {
+  updateAtom($messages, next)
+  patchSessionViewSnapshot({ messages: $messages.get() })
+}
 export const setFreshDraftReady = (next: Updater<boolean>) => updateAtom($freshDraftReady, next)
 export const setResumeFailedSessionId = (next: Updater<string | null>) => updateAtom($resumeFailedSessionId, next)
 export const setResumeExhaustedSessionId = (next: Updater<string | null>) => updateAtom($resumeExhaustedSessionId, next)
-export const setBusy = (next: Updater<boolean>) => updateAtom($busy, next)
-export const setAwaitingResponse = (next: Updater<boolean>) => updateAtom($awaitingResponse, next)
+export const setBusy = (next: Updater<boolean>) => {
+  updateAtom($busy, next)
+  patchSessionViewSnapshot({ busy: $busy.get() })
+}
+export const setAwaitingResponse = (next: Updater<boolean>) => {
+  updateAtom($awaitingResponse, next)
+  patchSessionViewSnapshot({ awaitingResponse: $awaitingResponse.get() })
+}
 
 export const setCurrentModel = (next: Updater<string>) => {
   updateAtom($currentModel, next)
+  patchSessionViewSnapshot({ model: $currentModel.get() })
   persistString(COMPOSER_MODEL_KEY, $currentModel.get() || null)
 }
 
 export const setCurrentProvider = (next: Updater<string>) => {
   updateAtom($currentProvider, next)
+  patchSessionViewSnapshot({ provider: $currentProvider.get() })
   persistString(COMPOSER_PROVIDER_KEY, $currentProvider.get() || null)
 }
 
@@ -383,24 +459,36 @@ export const setCurrentModelSource = (source: ComposerModelSource) => {
 
 export const setCurrentReasoningEffort = (next: Updater<string>) => {
   updateAtom($currentReasoningEffort, next)
+  patchSessionViewSnapshot({ reasoningEffort: $currentReasoningEffort.get() })
   persistString(COMPOSER_EFFORT_KEY, $currentReasoningEffort.get() || null)
 }
 
-export const setCurrentServiceTier = (next: Updater<string>) => updateAtom($currentServiceTier, next)
+export const setCurrentServiceTier = (next: Updater<string>) => {
+  updateAtom($currentServiceTier, next)
+  patchSessionViewSnapshot({ serviceTier: $currentServiceTier.get() })
+}
 
 export const setCurrentFastMode = (next: Updater<boolean>) => {
   updateAtom($currentFastMode, next)
+  patchSessionViewSnapshot({ fast: $currentFastMode.get() })
   persistBoolean(COMPOSER_FAST_KEY, $currentFastMode.get())
 }
 
-export const setYoloActive = (next: Updater<boolean>) => updateAtom($yoloActive, next)
+export const setYoloActive = (next: Updater<boolean>) => {
+  updateAtom($yoloActive, next)
+  patchSessionViewSnapshot({ yolo: $yoloActive.get() })
+}
 
 export const setCurrentCwd = (next: Updater<string>) => {
   updateAtom($currentCwd, next)
+  patchSessionViewSnapshot({ cwd: $currentCwd.get() })
   persistString(workspaceCwdKey(), $currentCwd.get().trim() || null)
 }
 
-export const setCurrentCwdTransient = (next: Updater<string>) => updateAtom($currentCwd, next)
+export const setCurrentCwdTransient = (next: Updater<string>) => {
+  updateAtom($currentCwd, next)
+  patchSessionViewSnapshot({ cwd: $currentCwd.get() })
+}
 
 export const setNewChatWorkspaceTarget = (next: NewChatWorkspaceTarget): number => {
   const generation = $newChatWorkspaceTargetGeneration.get() + 1
@@ -424,14 +512,22 @@ export const workspaceCwdForNewSession = (): string => {
   return getConfiguredDefaultProjectDir()
 }
 
-export const setCurrentBranch = (next: Updater<string>) => updateAtom($currentBranch, next)
+export const setCurrentBranch = (next: Updater<string>) => {
+  updateAtom($currentBranch, next)
+  patchSessionViewSnapshot({ branch: $currentBranch.get() })
+}
 export const setCurrentUsage = (next: Updater<UsageStats>) => updateAtom($currentUsage, next)
 export const setSessionStartedAt = (next: Updater<number | null>) => updateAtom($sessionStartedAt, next)
-export const setTurnStartedAt = (next: Updater<number | null>) => updateAtom($turnStartedAt, next)
+export const setTurnStartedAt = (next: Updater<number | null>) => {
+  updateAtom($turnStartedAt, next)
+  patchSessionViewSnapshot({ turnStartedAt: $turnStartedAt.get() })
+}
 export const setIntroPersonality = (next: Updater<string>) => updateAtom($introPersonality, next)
-export const setCurrentPersonality = (next: Updater<string>) => updateAtom($currentPersonality, next)
+export const setCurrentPersonality = (next: Updater<string>) => {
+  updateAtom($currentPersonality, next)
+  patchSessionViewSnapshot({ personality: $currentPersonality.get() })
+}
 export const setAvailablePersonalities = (next: Updater<string[]>) => updateAtom($availablePersonalities, next)
 export const setIntroSeed = (next: Updater<number>) => updateAtom($introSeed, next)
-export const setContextSuggestions = (next: Updater<ContextSuggestion[]>) => updateAtom($contextSuggestions, next)
 export const setModelPickerOpen = (next: Updater<boolean>) => updateAtom($modelPickerOpen, next)
 export const setSessionPickerOpen = (next: Updater<boolean>) => updateAtom($sessionPickerOpen, next)

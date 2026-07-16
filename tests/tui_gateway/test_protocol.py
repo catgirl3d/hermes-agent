@@ -366,6 +366,8 @@ def test_session_resume_returns_hydrated_messages(server, monkeypatch):
     monkeypatch.setattr(server, "_make_agent", lambda sid, key, session_id=None, session_db=None, **_kwargs: object())
     monkeypatch.setattr(server, "_init_session", lambda sid, key, agent, history, cols=80, **_kwargs: None)
     monkeypatch.setattr(server, "_session_info", lambda _agent, _session=None: {"model": "test/model"})
+    cap_sweeps: list[None] = []
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: cap_sweeps.append(None))
 
     resp = server.handle_request(
         {
@@ -384,6 +386,7 @@ def test_session_resume_returns_hydrated_messages(server, monkeypatch):
         {"role": "assistant", "text": "yo", "reasoning": "thoughts"},
         {"role": "tool", "name": "tool", "context": ""},
     ]
+    assert cap_sweeps == [None]
 
 
 def test_session_resume_defaults_to_deferred_build(server, monkeypatch):
@@ -433,7 +436,8 @@ def test_session_resume_defaults_to_deferred_build(server, monkeypatch):
         server, "_make_agent", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no eager build"))
     )
     monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: builds.append(sid))
-    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+    cap_sweeps: list[None] = []
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: cap_sweeps.append(None))
 
     resp = server.handle_request(
         {
@@ -472,6 +476,7 @@ def test_session_resume_defaults_to_deferred_build(server, monkeypatch):
     # can't drop the provider ("No LLM provider configured").
     assert session["resume_runtime_overrides"]["model_override"]["model"] == "vendor/cool-model"
     assert server._find_live_session_by_key(target) == (sid, session)
+    assert cap_sweeps == [None]
 
 
 def test_enforce_session_cap_evicts_oldest_detached_only(server, monkeypatch):
@@ -531,6 +536,92 @@ def test_enforce_session_cap_disabled_is_noop(server, monkeypatch):
     server._enforce_session_cap()
 
     assert evicted == []
+
+
+def test_max_live_sessions_uses_default_of_sixteen_when_config_omits_key(server, monkeypatch):
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+
+    assert server._max_live_sessions() == 16
+
+
+@pytest.mark.parametrize(
+    "cfg",
+    [
+        {"max_live_sessions": 0},
+        {"max_live_sessions": None},
+        {"gateway": {"max_live_sessions": 0}},
+        {"gateway": {"max_live_sessions": None}},
+    ],
+    ids=["top-level-zero", "top-level-null", "gateway-zero", "gateway-null"],
+)
+def test_max_live_sessions_preserves_explicit_opt_out(server, monkeypatch, cfg):
+    monkeypatch.setattr(server, "_load_cfg", lambda: cfg)
+
+    assert server._max_live_sessions() == 0
+
+
+def test_closing_session_cancels_deferred_agent_build(server, monkeypatch):
+    timers = []
+
+    class _Timer:
+        def __init__(self, _delay, _callback):
+            self.cancelled = False
+            self.daemon = False
+            timers.append(self)
+
+        def cancel(self):
+            self.cancelled = True
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(server.threading, "Timer", _Timer)
+    monkeypatch.setattr(server, "_teardown_session", lambda *_args, **_kwargs: None)
+    server._sessions["deferred"] = {"session_key": "stored"}
+
+    server._schedule_agent_build("deferred")
+
+    assert len(timers) == 1
+    assert server._close_session_by_id("deferred") is True
+    assert timers[0].cancelled is True
+
+
+def test_rescheduling_agent_build_cancels_and_ignores_the_superseded_timer(server, monkeypatch):
+    timers = []
+    builds: list[str] = []
+
+    class _Timer:
+        def __init__(self, _delay, callback):
+            self.callback = callback
+            self.cancelled = False
+            self.daemon = False
+            timers.append(self)
+
+        def cancel(self):
+            self.cancelled = True
+
+        def start(self):
+            pass
+
+        def fire(self):
+            self.callback()
+
+    monkeypatch.setattr(server.threading, "Timer", _Timer)
+    monkeypatch.setattr(server, "_start_agent_build", lambda sid, _session: builds.append(sid))
+    server._sessions["deferred"] = {"session_key": "stored"}
+
+    server._schedule_agent_build("deferred")
+    server._schedule_agent_build("deferred")
+
+    assert len(timers) == 2
+    assert timers[0].cancelled is True
+
+    timers[0].fire()
+    assert builds == []
+
+    timers[1].fire()
+    assert builds == ["deferred"]
+    assert "agent_build_timer" not in server._sessions["deferred"]
 
 
 def test_session_resume_handles_multimodal_list_content(server, monkeypatch):
@@ -631,6 +722,8 @@ def test_session_resume_lazy_registers_watch_session_without_agent(server, monke
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
     monkeypatch.setattr(server, "_make_agent", _boom)
+    cap_sweeps: list[None] = []
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: cap_sweeps.append(None))
 
     resp = server.handle_request(
         {
@@ -647,6 +740,7 @@ def test_session_resume_lazy_registers_watch_session_without_agent(server, monke
     assert result["info"]["lazy"] is True
     assert result["info"]["desktop_contract"] == server.DESKTOP_BACKEND_CONTRACT
     assert result["messages"] == [{"role": "user", "text": "delegated goal"}]
+    assert cap_sweeps == [None]
 
     sid = result["session_id"]
     session = server._sessions[sid]

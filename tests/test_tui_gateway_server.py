@@ -1413,20 +1413,13 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch):
             captured["reopened"] = target
 
         def get_resume_conversations(self, session_id):
+            captured.setdefault("canonical_history_calls", []).append(session_id)
             return (
-                self.get_messages_as_conversation(session_id, repair_alternation=True),
-                self.get_messages_as_conversation(session_id, include_ancestors=True),
-            )
-
-        def get_messages_as_conversation(self, target, include_ancestors=False, repair_alternation=False):
-            captured.setdefault("history_calls", []).append((target, include_ancestors))
-            return (
+                [{"role": "user", "content": "tip prompt"}],
                 [
                     {"role": "user", "content": "root prompt"},
                     {"role": "assistant", "content": "root answer"},
-                ]
-                if include_ancestors
-                else [{"role": "user", "content": "tip prompt"}]
+                ],
             )
 
     monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
@@ -1458,7 +1451,7 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch):
         {"role": "user", "text": "root prompt"},
         {"role": "assistant", "text": "root answer"},
     ]
-    assert captured["history_calls"] == [("tip", False), ("tip", True)]
+    assert captured["canonical_history_calls"] == ["tip"]
 
 
 def test_session_resume_follows_compression_tip(monkeypatch, tmp_path):
@@ -1793,6 +1786,91 @@ def test_persist_live_session_runtime_preserves_resume_metadata(monkeypatch):
             "service_tier": "priority",
         },
         "gpt-5.4",
+    )
+
+
+def test_session_prewarm_starts_nonblocking_build_from_composer_intent(monkeypatch):
+    sid = "runtime-composer-intent"
+    current_transport = object()
+    session = {
+        "agent": None,
+        "agent_ready": threading.Event(),
+        "session_key": "stored-composer-intent",
+        "transport": object(),
+    }
+    starts = []
+    server._sessions[sid] = session
+    monkeypatch.setattr(
+        server,
+        "_start_agent_build",
+        lambda session_id, target: starts.append((session_id, target)),
+    )
+    monkeypatch.setattr(server, "current_transport", lambda: current_transport)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "prewarm",
+                "method": "session.prewarm",
+                "params": {"session_id": sid, "intent": "voice"},
+            }
+        )
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert resp["result"] == {
+        "accepted": True,
+        "session_id": sid,
+        "trigger": "composer_voice",
+    }
+    assert starts == [(sid, session)]
+    assert session["_agent_build_trigger"] == "composer_voice"
+    assert session["transport"] is current_transport
+
+
+def test_built_agent_reconciles_model_override_changed_during_build():
+    switched = []
+
+    class Agent:
+        model = "old-model"
+        provider = "old-provider"
+        base_url = "https://old.example"
+        api_mode = "old-mode"
+
+        def switch_model(self, **kwargs):
+            switched.append(kwargs)
+            self.model = kwargs["new_model"]
+            self.provider = kwargs["new_provider"]
+            self.base_url = kwargs["base_url"]
+            self.api_mode = kwargs["api_mode"]
+
+    agent = Agent()
+    session = {
+        "model_override": {
+            "model": "new-model",
+            "provider": "new-provider",
+            "base_url": "https://new.example",
+            "api_key": "new-key",
+            "api_mode": "new-mode",
+        }
+    }
+
+    server._sync_built_agent_with_session_override(session, agent)
+
+    assert switched == [
+        {
+            "new_model": "new-model",
+            "new_provider": "new-provider",
+            "api_key": "new-key",
+            "base_url": "https://new.example",
+            "api_mode": "new-mode",
+        }
+    ]
+    assert (agent.model, agent.provider, agent.base_url, agent.api_mode) == (
+        "new-model",
+        "new-provider",
+        "https://new.example",
+        "new-mode",
     )
 
 

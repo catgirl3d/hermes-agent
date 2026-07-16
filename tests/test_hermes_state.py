@@ -1290,6 +1290,105 @@ class TestMessageStorage:
             "second answer",
         ]
 
+    def test_get_resume_messages_returns_model_and_display_projections(self, db):
+        db.create_session("root", "tui")
+        db.append_message("root", role="user", content="first prompt")
+        db.append_message("root", role="assistant", content="first answer")
+        db.create_session("child", "tui", parent_session_id="root")
+        db.append_message("child", role="user", content="second prompt")
+        db.append_message("child", role="assistant", content="second answer")
+
+        model_history, display_history = db.get_resume_messages("child")
+
+        # The agent replays only the current continuation, while the renderer
+        # shows its full lineage from the same database snapshot.
+        assert [message["content"] for message in model_history] == ["second prompt", "second answer"]
+        assert [message["content"] for message in display_history] == [
+            "first prompt",
+            "first answer",
+            "second prompt",
+            "second answer",
+        ]
+
+    def test_get_resume_messages_repairs_only_model_replay(self, db):
+        db.create_session("child", "tui")
+        db.append_message("child", role="user", content="unanswered turn")
+        db.append_message("child", role="user", content="next turn")
+        db.append_message("child", role="assistant", content="next answer")
+
+        model_history, display_history = db.get_resume_messages(
+            "child", repair_alternation=True
+        )
+
+        assert [message["role"] for message in model_history] == ["user", "assistant"]
+        assert "unanswered turn" in model_history[0]["content"]
+        assert "next turn" in model_history[0]["content"]
+        assert [message["role"] for message in display_history] == [
+            "user",
+            "user",
+            "assistant",
+        ]
+
+    def test_get_resume_messages_uses_canonical_single_query(self, db, monkeypatch):
+        db.create_session("root", "tui")
+        db.append_message("root", role="user", content="first prompt")
+        db.append_message("root", role="assistant", content="first answer")
+        db.create_session("child", "tui", parent_session_id="root")
+        db.append_message("child", role="user", content="second prompt")
+        db.append_message("child", role="assistant", content="second answer")
+
+        converted_session_ids = []
+        original_convert = db._conversation_message_from_row
+        statements = []
+
+        def track_conversion(row):
+            converted_session_ids.append(row["session_id"])
+            return original_convert(row)
+
+        monkeypatch.setattr(db, "_conversation_message_from_row", track_conversion)
+        db._conn.set_trace_callback(statements.append)
+
+        db.get_resume_messages("child")
+
+        db._conn.set_trace_callback(None)
+
+        message_reads = [statement for statement in statements if "FROM messages" in statement]
+        assert len(message_reads) == 1
+        assert converted_session_ids == ["child", "child", "root", "root", "child", "child"]
+
+    def test_get_resume_messages_preserves_display_duplicate_suppression(self, db):
+        db.create_session("root", "tui")
+        db.append_message("root", role="user", content="same prompt")
+        db.append_message("root", role="user", content="same prompt")
+        db.append_message("root", role="assistant", content="root answer")
+        db.create_session("child", "tui", parent_session_id="root")
+        db.append_message("child", role="user", content="continuation prompt")
+
+        model_history, display_history = db.get_resume_messages("child")
+
+        assert [message["content"] for message in model_history] == ["continuation prompt"]
+        assert [message["content"] for message in display_history] == [
+            "same prompt",
+            "root answer",
+            "continuation prompt",
+        ]
+
+    def test_get_resume_messages_duplicate_suppression_resets_after_assistant(self, db):
+        db.create_session("root", "tui")
+        db.append_message("root", role="user", content="same prompt")
+        db.append_message("root", role="assistant", content="root answer")
+        db.create_session("child", "tui", parent_session_id="root")
+        db.append_message("child", role="user", content="same prompt")
+
+        model_history, display_history = db.get_resume_messages("child")
+
+        assert [message["content"] for message in model_history] == ["same prompt"]
+        assert [message["content"] for message in display_history] == [
+            "same prompt",
+            "root answer",
+            "same prompt",
+        ]
+
     def test_get_messages_as_conversation_avoids_repeated_resume_prompts_from_ancestors(self, db):
         db.create_session("root", "tui")
         db.append_message("root", role="user", content="same prompt")
@@ -1364,6 +1463,18 @@ class TestMessageStorage:
 
         assert model_history == model_expected
         assert display_history == display_expected
+
+    def test_get_messages_as_conversation_duplicate_suppression_ignores_empty_assistant(self, db):
+        db.create_session("root", "tui")
+        db.append_message("root", role="user", content="same prompt")
+        db.append_message("root", role="assistant", content="")
+        db.append_message("root", role="user", content="same prompt")
+        db.create_session("child", "tui", parent_session_id="root")
+        db.append_message("child", role="user", content="next prompt")
+
+        conv = db.get_messages_as_conversation("child", include_ancestors=True)
+
+        assert [m["content"] for m in conv if m["role"] == "user"] == ["same prompt", "next prompt"]
 
     def test_finish_reason_stored(self, db):
         db.create_session(session_id="s1", source="cli")
