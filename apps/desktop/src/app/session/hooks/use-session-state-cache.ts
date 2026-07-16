@@ -5,23 +5,17 @@ import type { ChatMessage } from '@/lib/chat-messages'
 import { preserveLocalAssistantErrors } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { setMutableRef } from '@/lib/mutable-ref'
+import { prepareSessionSnapshot } from '@/lib/session-view-snapshot'
 import {
   $activeSessionId,
-  $busy,
-  $messages,
+  $sessionViewBusy,
+  $sessionViewSnapshot,
   noteSessionActivity,
   onSessionWatchdogClear,
+  publishSessionViewSnapshot,
   setActiveSessionStoredId,
-  setCurrentFastMode,
-  setCurrentModel,
-  setCurrentPersonality,
-  setCurrentProvider,
-  setCurrentReasoningEffort,
-  setCurrentServiceTier,
   setSessionAttention,
   setSessionWorking,
-  setTurnStartedAt,
-  setYoloActive
 } from '@/store/session'
 import { publishSessionState } from '@/store/session-states'
 
@@ -53,30 +47,14 @@ interface SessionStateCacheOptions {
   activeSessionId: string | null
   busyRef: MutableRefObject<boolean>
   selectedStoredSessionId: string | null
-  setAwaitingResponse: (awaiting: boolean) => void
-  setBusy: (busy: boolean) => void
-  setMessages: (messages: ChatMessage[]) => void
-}
-
-function syncRuntimeMetadataToView(state: ClientSessionState) {
-  setCurrentModel(state.model ?? '')
-  setCurrentProvider(state.provider ?? '')
-  setCurrentReasoningEffort(state.reasoningEffort ?? '')
-  setCurrentServiceTier(state.serviceTier ?? '')
-  setCurrentFastMode(state.fast ?? false)
-  setYoloActive(state.yolo ?? false)
-  setCurrentPersonality(state.personality ?? '')
 }
 
 export function useSessionStateCache({
   activeSessionId,
   busyRef,
-  selectedStoredSessionId,
-  setAwaitingResponse,
-  setBusy,
-  setMessages
+  selectedStoredSessionId
 }: SessionStateCacheOptions) {
-  const busy = useStore($busy)
+  const busy = useStore($sessionViewBusy)
   const activeSessionIdRef = useRef<string | null>(null)
   const selectedStoredSessionIdRef = useRef<string | null>(null)
   const sessionStateByRuntimeIdRef = useRef(new Map<string, ClientSessionState>())
@@ -169,7 +147,8 @@ export function useSessionStateCache({
     // assistant-ui runtime → the virtualizer, which re-measures and visibly
     // jerks the scroll position while the user is reading. Skip the publish when
     // the merged result is content-identical to what's already on screen.
-    const currentMessages = $messages.get()
+    const currentSnapshot = $sessionViewSnapshot.get()
+    const currentMessages = currentSnapshot.messages
 
     // On a thread switch `$messages` still holds the *previous* thread, so
     // preserving its local errors would graft that thread's failed turn (e.g.
@@ -181,21 +160,13 @@ export function useSessionStateCache({
         ? preserveLocalAssistantErrors(pending.state.messages, currentMessages)
         : pending.state.messages
 
-    if (!sameMessageList(nextMessages, currentMessages)) {
-      setMessages(nextMessages)
-    }
-
+    const nextState = sameMessageList(nextMessages, pending.state.messages)
+      ? pending.state
+      : { ...pending.state, messages: nextMessages }
+    publishSessionViewSnapshot(prepareSessionSnapshot(pending.sessionId, nextState))
     viewSessionIdRef.current = pending.sessionId
-
-    syncRuntimeMetadataToView(pending.state)
-    setBusy(pending.state.busy)
-    setMutableRef(busyRef, pending.state.busy)
-    setAwaitingResponse(pending.state.awaitingResponse)
-    // Mirror the focused session's per-session turn clock into the global
-    // atom the statusbar timer reads. Keeps a backgrounded turn's elapsed
-    // time intact on focus instead of zeroing it (the "timer restarts" bug).
-    setTurnStartedAt(pending.state.turnStartedAt)
-  }, [busyRef, setAwaitingResponse, setBusy, setMessages])
+    setMutableRef(busyRef, nextState.busy)
+  }, [busyRef])
 
   const syncSessionStateToView = useCallback(
     (sessionId: string, state: ClientSessionState) => {
@@ -212,7 +183,6 @@ export function useSessionStateCache({
         return
       }
 
-      syncRuntimeMetadataToView(state)
       pendingViewStateRef.current = { sessionId, state }
 
       // Terminal / attention transitions (turn finished, error, or the agent is

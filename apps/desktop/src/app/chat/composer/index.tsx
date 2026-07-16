@@ -80,6 +80,7 @@ export function ChatBar({
   onPickFolders,
   onPickImages,
   onRemoveAttachment,
+  onIntent,
   onSteer,
   onSubmit: onSubmitProp,
   onTranscribeAudio
@@ -171,7 +172,7 @@ export function ChatBar({
     sessionIdRef,
     setComposerText,
     stashAt
-  } = useComposerDraft({ activeQueueSessionKey, focusKey, inputDisabled, queueEditRef, sessionId })
+  } = useComposerDraft({ activeQueueSessionKey, focusKey, inputDisabled, onIntent, queueEditRef, sessionId })
 
   // "Add URL" dialog — open/value state, autofocus, and submit (host onAddUrl or
   // an @url: directive into the draft).
@@ -327,6 +328,7 @@ export function ChatBar({
       return
     }
 
+    onIntent?.('text')
     scheduleFlushEditorToDraft(event.currentTarget)
   }
 
@@ -335,6 +337,7 @@ export function ChatBar({
 
     if (imageBlobs.length > 0) {
       event.preventDefault()
+      onIntent?.('attachment')
 
       if (onAttachImageBlob) {
         triggerHaptic('selection')
@@ -355,6 +358,7 @@ export function ChatBar({
 
     if (!pastedText) {
       event.preventDefault()
+      onIntent?.('attachment')
 
       // Under WSL2/WSLg the Windows host clipboard doesn't bridge *images* to
       // the Linux clipboard the DOM paste event reads, so a host screenshot
@@ -376,6 +380,7 @@ export function ChatBar({
     }
 
     event.preventDefault()
+    onIntent?.('text')
     insertPlainTextAtCaret(event.currentTarget, pastedText)
     scheduleFlushEditorToDraft(event.currentTarget)
   }
@@ -654,7 +659,7 @@ export function ChatBar({
     handleDrop,
     handleInputDragOver,
     handleInputDrop
-  } = useComposerDrop({ cwd, insertInlineRefs, onAttachDroppedItems, requestMainFocus })
+  } = useComposerDrop({ cwd, insertInlineRefs, onAttachDroppedItems, onIntent, requestMainFocus })
 
   // Branch / worktree hand-offs (CodingStatusRow). Owns the worktree open +
   // branch-off/convert/list/switch actions; draft travels into the new session.
@@ -682,18 +687,54 @@ export function ChatBar({
     maxRecordingSeconds,
     onSubmit,
     onTranscribeAudio,
+    onIntent,
     sessionId,
     target: scope.target
   })
 
   const contextMenu = (
     <ContextMenu
-      onInsertText={insertText}
-      onOpenUrlDialog={openUrlDialog}
-      onPasteClipboardImage={onPasteClipboardImage}
-      onPickFiles={onPickFiles}
-      onPickFolders={onPickFolders}
-      onPickImages={onPickImages}
+      onInsertText={text => {
+        onIntent?.('text')
+        insertText(text)
+      }}
+      onOpenUrlDialog={() => {
+        onIntent?.('attachment')
+        openUrlDialog()
+      }}
+      onPasteClipboardImage={
+        onPasteClipboardImage
+          ? options => {
+              onIntent?.('attachment')
+
+              return onPasteClipboardImage(options)
+            }
+          : undefined
+      }
+      onPickFiles={
+        onPickFiles
+          ? () => {
+              onIntent?.('attachment')
+              onPickFiles()
+            }
+          : undefined
+      }
+      onPickFolders={
+        onPickFolders
+          ? () => {
+              onIntent?.('attachment')
+              onPickFolders()
+            }
+          : undefined
+      }
+      onPickImages={
+        onPickImages
+          ? () => {
+              onIntent?.('attachment')
+              onPickImages()
+            }
+          : undefined
+      }
       state={state}
     />
   )
@@ -746,6 +787,7 @@ export function ChatBar({
         onBlur={() => window.setTimeout(closeTrigger, 80)}
         onCompositionEnd={event => {
           composingRef.current = false
+          onIntent?.('text')
 
           // The input events fired *during* composition were skipped (they
           // carried uncommitted preedit text), and Chromium does NOT reliably
