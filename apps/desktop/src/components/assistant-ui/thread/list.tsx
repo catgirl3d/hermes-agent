@@ -4,10 +4,13 @@ import {
   type CSSProperties,
   type FC,
   memo,
+  Profiler,
+  type ProfilerOnRenderCallback,
   type ReactNode,
   startTransition,
   useCallback,
   useEffect,
+  useInsertionEffect,
   useLayoutEffect,
   useRef,
   useState
@@ -15,6 +18,13 @@ import {
 import { useStickToBottom } from 'use-stick-to-bottom'
 
 import { useI18n } from '@/i18n'
+import {
+  activeSessionSwitchTraceRequestId,
+  elapsedSinceActiveSessionSwitchStage,
+  markActiveSessionSwitchTrace,
+  markActiveSessionSwitchTraceForRequest,
+  measureRenderCommitPhases
+} from '@/lib/session-switch-trace'
 import { cn } from '@/lib/utils'
 import {
   onScrollToBottomRequest,
@@ -54,6 +64,7 @@ interface ThreadMessageListProps {
   emptyPlaceholder?: ReactNode
   loadingIndicator?: ReactNode
   sessionKey?: string | null
+  traceSessionId?: string | null
 }
 
 // Group each user message with the assistant turn(s) that follow it so the
@@ -118,8 +129,20 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   components,
   emptyPlaceholder,
   loadingIndicator,
-  sessionKey
+  sessionKey,
+  traceSessionId = null
 }) => {
+  const renderStartedAt = performance.now()
+  let renderBodyFinishedAt = renderStartedAt
+  const traceRequestId = activeSessionSwitchTraceRequestId(traceSessionId)
+
+  const runtimeSyncStartToRenderStartMs = elapsedSinceActiveSessionSwitchStage(
+    traceSessionId,
+    'runtime-adapter-sync-started',
+    renderStartedAt,
+    traceRequestId
+  )
+
   const messageSignature = useAuiState(s =>
     s.thread.messages
       .map((message, index) => `${index}:${message.id}:${message.role}:${message.content?.length ?? 1}`)
@@ -194,7 +217,16 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
 
   const hiddenCount = firstVisibleGroupIndex(groups, renderBudget)
   const visibleGroups = hiddenCount > 0 ? groups.slice(hiddenCount) : groups
+
+  const mountedMessageCount = visibleGroups.reduce(
+    (count, group) => count + (group.kind === 'turn' ? group.indices.length : 1),
+    0
+  )
+
   const restoreFromBottomRef = useRef<number | null>(null)
+  const lastLayoutTraceKeyRef = useRef<string | null>(null)
+  const insertionCommitRef = useRef<{ at: number; traceKey: string } | null>(null)
+  const traceKey = `${traceRequestId ?? 'inactive'}:${traceSessionId ?? ''}:${sessionKey ?? ''}:${messageSignature}`
   // Secondary windows (new-session scratch, subagent watch, cmd-click pop-out)
   // hide the titlebar tool cluster + session header, but the OS traffic lights
   // still sit in the top-left, so reserve the titlebar gap above the transcript.
@@ -210,6 +242,22 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   const threadContentTopPad = secondaryWindow
     ? 'pt-[calc(var(--titlebar-height)+0.75rem)]'
     : 'pt-[calc(var(--titlebar-height)-0.5rem)]'
+
+  const onMessageListRender = useCallback<ProfilerOnRenderCallback>(
+    (_id, phase, actualDuration, baseDuration) => {
+      markActiveSessionSwitchTrace(traceSessionId, 'thread-message-list-react-commit', {
+        actualDurationMs: Math.round(actualDuration * 10) / 10,
+        baseDurationMs: Math.round(baseDuration * 10) / 10,
+        groupCount: groups.length,
+        hiddenGroupCount: hiddenCount,
+        phase,
+        renderBudget,
+        renderEmpty,
+        visibleGroupCount: visibleGroups.length
+      })
+    },
+    [groups.length, hiddenCount, renderBudget, renderEmpty, traceSessionId, visibleGroups.length]
+  )
 
   useEffect(() => setThreadAtBottom(isAtBottom), [isAtBottom])
   useEffect(() => () => resetThreadScroll(), [])
@@ -238,6 +286,41 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   useEffect(() => onThreadEditOpen(beginEditHold), [beginEditHold])
   useEffect(() => onThreadEditClose(endEditHold), [endEditHold])
   useEffect(() => () => endEditHold(), [endEditHold])
+
+  useInsertionEffect(() => {
+    if (traceRequestId !== undefined) {
+      insertionCommitRef.current = { at: performance.now(), traceKey }
+    }
+  })
+
+  useLayoutEffect(() => {
+    const layoutCommittedAt = performance.now()
+    const insertionCommit = insertionCommitRef.current
+
+    if (lastLayoutTraceKeyRef.current === traceKey) {
+      return
+    }
+
+    lastLayoutTraceKeyRef.current = traceKey
+
+    const renderCommitPhases =
+      insertionCommit?.traceKey === traceKey
+        ? measureRenderCommitPhases(renderStartedAt, renderBodyFinishedAt, insertionCommit.at, layoutCommittedAt)
+        : undefined
+
+    markActiveSessionSwitchTraceForRequest(traceSessionId, traceRequestId, 'thread-message-list-layout-commit', {
+      groupCount: groups.length,
+      hiddenGroupCount: hiddenCount,
+      insertionCommitToLayoutMs: renderCommitPhases?.insertionCommitToLayoutMs,
+      mountedMessageCount,
+      renderBodyDurationMs: renderCommitPhases?.renderBodyDurationMs,
+      renderToInsertionCommitMs: renderCommitPhases?.renderToInsertionCommitMs,
+      renderToLayoutCommitMs: Math.round((layoutCommittedAt - renderStartedAt) * 10) / 10,
+      runtimeSyncStartToRenderStartMs,
+      visibleGroupCount: visibleGroups.length
+    })
+  })
+
   // New run → snap to the latest turn.
   useAuiEvent('thread.runStart', () => void scrollToBottom())
 
@@ -310,6 +393,8 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
     }
   }, [scrollRef, renderBudget])
 
+  renderBodyFinishedAt = performance.now()
+
   return (
     <div
       className="relative min-h-0 max-w-full overflow-hidden contain-[layout_paint]"
@@ -337,70 +422,62 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
         data-slot="aui_thread-viewport"
         ref={scrollRef as React.RefCallback<HTMLDivElement>}
       >
-        {renderEmpty ? (
-          <div
-            className="mx-auto grid h-full w-full max-w-(--composer-width) grid-rows-[minmax(0,1fr)_auto] min-w-0 gap-(--conversation-turn-gap) px-6 py-8"
-            data-slot="aui_thread-content"
-          >
-            {emptyPlaceholder}
-          </div>
-        ) : (
-          <div
-            className={cn('mx-auto flex w-full max-w-(--composer-width) min-w-0 flex-col px-6', threadContentTopPad)}
-            data-slot="aui_thread-content"
-            ref={contentRef as React.RefCallback<HTMLDivElement>}
-          >
-            {hiddenCount > 0 && (
-              <button
-                className="mx-auto mb-(--conversation-turn-gap) rounded-full border border-border/65 bg-(--composer-fill) px-3 py-1 text-xs text-muted-foreground hover:text-foreground"
-                onClick={showEarlier}
-                type="button"
-              >
-                {t.assistant.thread.showEarlier}
-              </button>
-            )}
-            {visibleGroups.map(group => (
-              // content-visibility:auto — off-screen turns skip style recalc,
-              // layout, and paint. On a long transcript this is what keeps
-              // UNRELATED UI fast: any dialog/popover mount (Radix Presence
-              // reads getComputedStyle) forces a whole-document style recalc,
-              // measured ~650-730ms per open on a 1300-message session and
-              // ~100-200ms with this on. contain-intrinsic-size keeps a
-              // placeholder height for never-rendered turns (auto: remembered
-              // real size once rendered), so scrollbar/anchoring stay stable.
-              // Sticky human bubbles are unaffected — their turn is rendered
-              // whenever any part of it intersects the viewport.
-              <div
-                className="flex min-w-0 flex-col gap-(--conversation-turn-gap) pb-(--conversation-turn-gap) [contain-intrinsic-size:auto_37.5rem] [content-visibility:auto]"
-                key={group.id}
-              >
-                <MessageRenderBoundary resetKey={messageSignature}>
-                  {group.kind === 'turn' ? (
-                    <div
-                      className="composer-human-ai-pair-container relative flex min-w-0 flex-col gap-(--conversation-turn-gap)"
-                      data-slot="aui_turn-pair"
-                    >
-                      {group.indices.map(index => (
-                        <ThreadPrimitive.MessageByIndex components={components} index={index} key={index} />
-                      ))}
-                    </div>
-                  ) : (
-                    <ThreadPrimitive.MessageByIndex components={components} index={group.index} />
-                  )}
-                </MessageRenderBoundary>
-              </div>
-            ))}
-            {loadingIndicator}
-            {clampToComposer && (
-              <div
-                aria-hidden="true"
-                className="shrink-0"
-                data-slot="aui_composer-clearance"
-                style={{ height: 'var(--thread-last-message-clearance)' }}
-              />
-            )}
-          </div>
-        )}
+        <Profiler id="thread-message-list" onRender={onMessageListRender}>
+          {renderEmpty ? (
+            <div
+              className="mx-auto grid h-full w-full max-w-(--composer-width) grid-rows-[minmax(0,1fr)_auto] min-w-0 gap-(--conversation-turn-gap) px-6 py-8"
+              data-slot="aui_thread-content"
+            >
+              {emptyPlaceholder}
+            </div>
+          ) : (
+            <div
+              className={cn('mx-auto flex w-full max-w-(--composer-width) min-w-0 flex-col px-6', threadContentTopPad)}
+              data-slot="aui_thread-content"
+              ref={contentRef as React.RefCallback<HTMLDivElement>}
+            >
+              {hiddenCount > 0 && (
+                <button
+                  className="mx-auto mb-(--conversation-turn-gap) rounded-full border border-border/65 bg-(--composer-fill) px-3 py-1 text-xs text-muted-foreground hover:text-foreground"
+                  onClick={showEarlier}
+                  type="button"
+                >
+                  {t.assistant.thread.showEarlier}
+                </button>
+              )}
+              {visibleGroups.map(group => (
+                <div
+                  className="flex min-w-0 flex-col gap-(--conversation-turn-gap) pb-(--conversation-turn-gap)"
+                  key={group.id}
+                >
+                  <MessageRenderBoundary resetKey={messageSignature}>
+                    {group.kind === 'turn' ? (
+                      <div
+                        className="composer-human-ai-pair-container relative flex min-w-0 flex-col gap-(--conversation-turn-gap)"
+                        data-slot="aui_turn-pair"
+                      >
+                        {group.indices.map(index => (
+                          <ThreadPrimitive.MessageByIndex components={components} index={index} key={index} />
+                        ))}
+                      </div>
+                    ) : (
+                      <ThreadPrimitive.MessageByIndex components={components} index={group.index} />
+                    )}
+                  </MessageRenderBoundary>
+                </div>
+              ))}
+              {loadingIndicator}
+              {clampToComposer && (
+                <div
+                  aria-hidden="true"
+                  className="shrink-0"
+                  data-slot="aui_composer-clearance"
+                  style={{ height: 'var(--thread-last-message-clearance)' }}
+                />
+              )}
+            </div>
+          )}
+        </Profiler>
       </div>
     </div>
   )

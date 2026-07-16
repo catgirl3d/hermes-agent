@@ -57,6 +57,13 @@ export function isJsonRpcGatewayError(error: unknown, code?: number): error is J
 export type WebSocketLike = WebSocket
 
 type PendingCall = {
+  clientRequestReceiveAckRendererLagMs?: number
+  clientRequestSendMs?: number
+  rendererLagProbe?: RendererLagProbe
+  requestStartedAt?: number
+  serverReceiveAckAt?: number
+  serverReceiveAckBackendMetrics?: Record<string, number | string>
+  serverReceiveAckEventQueueMs?: number
   reject: (error: Error) => void
   resolve: (value: unknown) => void
   timer?: ReturnType<typeof setTimeout>
@@ -75,10 +82,49 @@ export interface GatewayClientOptions {
 
 const ANY = '*'
 const DEFAULT_REQUEST_TIMEOUT_MS = 120_000
+const RENDERER_LAG_INTERVAL_MS = 50
 // A reconnect after sleep/wake must not hang forever in 'connecting' (which
 // keeps the composer disabled and stuck on "Starting Hermes..."). If the open
 // handshake doesn't land in this window, fail to 'error' so callers can retry.
 const DEFAULT_CONNECT_TIMEOUT_MS = 15_000
+
+interface RendererLagProbe {
+  maxLagMs: number
+  nextDueAt: number
+  timer?: ReturnType<typeof setTimeout>
+}
+
+function startRendererLagProbe(): RendererLagProbe {
+  const probe: RendererLagProbe = {
+    maxLagMs: 0,
+    nextDueAt: performance.now() + RENDERER_LAG_INTERVAL_MS
+  }
+
+  const tick = () => {
+    const now = performance.now()
+
+    probe.maxLagMs = Math.max(probe.maxLagMs, Math.max(0, now - probe.nextDueAt))
+    probe.nextDueAt = now + RENDERER_LAG_INTERVAL_MS
+    probe.timer = setTimeout(tick, RENDERER_LAG_INTERVAL_MS)
+  }
+
+  probe.timer = setTimeout(tick, RENDERER_LAG_INTERVAL_MS)
+
+  return probe
+}
+
+function stopRendererLagProbe(probe: RendererLagProbe | undefined): number | undefined {
+  if (!probe) {
+    return undefined
+  }
+
+  if (probe.timer) {
+    clearTimeout(probe.timer)
+  }
+  const lagMs = Math.max(probe.maxLagMs, Math.max(0, performance.now() - probe.nextDueAt))
+
+  return Math.round(lagMs * 100) / 100
+}
 
 export class JsonRpcGatewayClient {
   private nextId = 0
@@ -122,7 +168,7 @@ export class JsonRpcGatewayClient {
         return
       }
 
-      this.handleMessage(message.data)
+      this.handleMessage(message.data, message.timeStamp)
     })
 
     socket.addEventListener('close', () => {
@@ -262,6 +308,7 @@ export class JsonRpcGatewayClient {
     }
 
     const id = this.options.createRequestId(++this.nextId)
+    const requestStartedAt = method === 'session.resume' ? performance.now() : undefined
 
     return new Promise<T>((resolve, reject) => {
       let onAbort: (() => void) | undefined
@@ -273,6 +320,8 @@ export class JsonRpcGatewayClient {
       }
 
       const pending: PendingCall = {
+        rendererLagProbe: requestStartedAt === undefined ? undefined : startRendererLagProbe(),
+        requestStartedAt,
         resolve: value => {
           detach()
           resolve(value as T)
@@ -285,7 +334,8 @@ export class JsonRpcGatewayClient {
 
       if (timeoutMs > 0) {
         pending.timer = setTimeout(() => {
-          if (this.pending.delete(id)) {
+          if (this.pending.has(id)) {
+            this.clearPending(id)
             detach()
             reject(new Error(`request timed out: ${method}`))
           }
@@ -301,8 +351,7 @@ export class JsonRpcGatewayClient {
           if (call?.timer) {
             clearTimeout(call.timer)
           }
-
-          this.pending.delete(id)
+          this.clearPending(id)
           detach()
           reject(new DOMException('Aborted', 'AbortError'))
         }
@@ -313,14 +362,19 @@ export class JsonRpcGatewayClient {
       this.pending.set(id, pending)
 
       try {
-        socket.send(
-          JSON.stringify({
-            jsonrpc: '2.0',
-            id,
-            method,
-            params
-          })
-        )
+        const measureRequestSend = method === 'session.resume'
+        const sendStartedAt = measureRequestSend ? performance.now() : 0
+        const line = JSON.stringify({
+          jsonrpc: '2.0',
+          id,
+          method,
+          params
+        })
+
+        socket.send(line)
+        if (measureRequestSend) {
+          pending.clientRequestSendMs = Math.round((performance.now() - sendStartedAt) * 100) / 100
+        }
       } catch (error) {
         this.clearPending(id)
         detach()
@@ -329,9 +383,11 @@ export class JsonRpcGatewayClient {
     })
   }
 
-  private handleMessage(raw: unknown): void {
+  private handleMessage(raw: unknown, eventTimestamp?: number): void {
     const text = typeof raw === 'string' ? raw : String(raw)
     let frame: JsonRpcFrame
+    const parseStartedAt = performance.now()
+    const eventQueueMs = eventTimestamp === undefined ? undefined : parseStartedAt - eventTimestamp
 
     try {
       frame = JSON.parse(text) as JsonRpcFrame
@@ -351,6 +407,45 @@ export class JsonRpcGatewayClient {
       if (frame.error) {
         call.reject(new JsonRpcGatewayError(frame.error.message || 'Hermes RPC failed', frame.error.code))
       } else {
+        const result = frame.result
+        const timing =
+          result && typeof result === 'object' && 'backend_timing_ms' in result
+            ? (result as { backend_timing_ms?: unknown }).backend_timing_ms
+            : null
+
+        if (timing && typeof timing === 'object') {
+          const metrics = timing as Record<string, number>
+
+          metrics.client_json_parse = Math.round((performance.now() - parseStartedAt) * 100) / 100
+          metrics.client_request_send = call.clientRequestSendMs ?? 0
+          metrics.response_chars = text.length
+
+          if (call.requestStartedAt !== undefined && call.serverReceiveAckAt !== undefined) {
+            const requestReceiveAckMs = call.serverReceiveAckAt - call.requestStartedAt
+            const rendererLagMs = call.clientRequestReceiveAckRendererLagMs ?? 0
+
+            metrics.client_request_receive_ack = Math.round(requestReceiveAckMs * 100) / 100
+            metrics.client_receive_ack_event_queue = call.serverReceiveAckEventQueueMs ?? 0
+            metrics.client_request_receive_ack_renderer_lag = rendererLagMs
+            metrics.client_request_receive_ack_transport =
+              Math.round(Math.max(0, requestReceiveAckMs - (call.serverReceiveAckEventQueueMs ?? 0)) * 100) / 100
+            metrics.client_request_receive_ack_unattributed =
+              Math.round(
+                Math.max(
+                  0,
+                  requestReceiveAckMs - (call.serverReceiveAckEventQueueMs ?? 0) - rendererLagMs
+                ) * 100
+              ) / 100
+            metrics.client_receive_ack_to_response =
+              Math.round(Math.max(0, parseStartedAt - call.serverReceiveAckAt) * 100) / 100
+            Object.assign(metrics, call.serverReceiveAckBackendMetrics)
+          }
+
+          if (eventQueueMs !== undefined && eventQueueMs >= 0 && eventQueueMs < DEFAULT_REQUEST_TIMEOUT_MS) {
+            metrics.client_message_event_queue = Math.round(eventQueueMs * 100) / 100
+          }
+        }
+
         call.resolve(frame.result)
       }
 
@@ -358,6 +453,36 @@ export class JsonRpcGatewayClient {
     }
 
     if (frame.method === 'event' && frame.params?.type) {
+      if (frame.params.type === 'gateway.request_received') {
+        const payload = frame.params.payload
+        const requestId =
+          payload && typeof payload === 'object' && 'request_id' in payload
+            ? (payload as { request_id?: unknown }).request_id
+            : undefined
+
+        if (typeof requestId === 'number' || typeof requestId === 'string') {
+          const call = this.pending.get(requestId)
+
+          if (call?.requestStartedAt !== undefined) {
+            call.serverReceiveAckAt = performance.now()
+            call.clientRequestReceiveAckRendererLagMs = stopRendererLagProbe(call.rendererLagProbe)
+            call.rendererLagProbe = undefined
+            call.serverReceiveAckBackendMetrics = Object.fromEntries(
+              Object.entries(payload as Record<string, unknown>).filter(
+                ([key, value]) =>
+                  (key.startsWith('backend_agent_build_') && typeof value === 'number') ||
+                  (key.startsWith('backend_ws_') && (typeof value === 'number' || typeof value === 'string'))
+              )
+            ) as Record<string, number | string>
+            if (eventQueueMs !== undefined && eventQueueMs >= 0 && eventQueueMs < DEFAULT_REQUEST_TIMEOUT_MS) {
+              call.serverReceiveAckEventQueueMs = Math.round(eventQueueMs * 100) / 100
+            }
+          }
+        }
+
+        return
+      }
+
       this.dispatchEvent(frame.params)
     }
   }
@@ -367,6 +492,10 @@ export class JsonRpcGatewayClient {
 
     if (call?.timer) {
       clearTimeout(call.timer)
+    }
+    if (call?.rendererLagProbe) {
+      stopRendererLagProbe(call.rendererLagProbe)
+      call.rendererLagProbe = undefined
     }
 
     this.pending.delete(id)
@@ -384,12 +513,8 @@ export class JsonRpcGatewayClient {
 
   private rejectAllPending(error: Error): void {
     for (const [id, call] of this.pending) {
-      if (call.timer) {
-        clearTimeout(call.timer)
-      }
-
+      this.clearPending(id)
       call.reject(error)
-      this.pending.delete(id)
     }
   }
 
