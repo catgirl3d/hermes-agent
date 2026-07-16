@@ -30,6 +30,7 @@ export type ChatActions = Pick<
   ComponentProps<typeof ChatView>,
   | 'onAddContextRef'
   | 'onAddUrl'
+  | 'onApplyToolResultPrune'
   | 'onAttachDroppedItems'
   | 'onAttachImageBlob'
   | 'onBranchInNewChat'
@@ -41,6 +42,7 @@ export type ChatActions = Pick<
   | 'onPickFiles'
   | 'onPickFolders'
   | 'onPickImages'
+  | 'onPreviewToolResultPrune'
   | 'onReload'
   | 'onRemoveAttachment'
   | 'onRestoreToMessage'

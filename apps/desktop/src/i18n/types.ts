@@ -1378,6 +1378,32 @@ export interface Translations {
       hideTabBar: string
       openInNewTab: string
       openInSplit: string
+      cleanToolOutputs: string
+      cleanToolOutputsChoose: string
+      cleanToolOutputsCodeWarning: string
+      cleanToolOutputsConfirm: string
+      cleanToolOutputsDone: string
+      cleanToolOutputsFailed: string
+      cleanToolOutputsNoop: string
+      cleanToolOutputsKinds: {
+        bounded_excerpt: string
+        file_structure: string
+        terminal_tail: string
+        web_fields: string
+      }
+      cleanToolOutputsPreview: (resultCount: number, argumentCount: number, tokens: string) => string
+      cleanToolOutputsProtected: (turns: number) => string
+      cleanToolOutputsStale: string
+      cleanToolOutputsToggle: (name: string) => string
+      cleanToolOutputsToolMeta: (
+        resultCount: number,
+        argumentCount: number,
+        tokens: string,
+        policy: string
+      ) => string
+      cleanToolOutputsTitle: string
+      cleanToolOutputsUpdating: string
+      cleanToolOutputsWarning: string
       copyIdFailed: string
       actionsFor: (title: string) => string
       sessionActions: string

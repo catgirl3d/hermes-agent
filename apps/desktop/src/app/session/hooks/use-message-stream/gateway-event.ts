@@ -687,6 +687,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
                 id: `review-summary-${Date.now()}`,
                 role: 'system',
                 parts: [textPart(text)],
+                rendererOwned: true,
                 timestamp: Math.floor(Date.now() / 1000)
               }
             ]

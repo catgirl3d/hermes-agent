@@ -1572,6 +1572,31 @@ export const ja = defineLocale({
       rename: '名前を変更',
       archive: 'アーカイブ',
       newWindow: '新しいウィンドウ',
+      cleanToolOutputs: 'ツール出力を整理',
+      cleanToolOutputsChoose: '圧縮するツール出力を選択',
+      cleanToolOutputsCodeWarning:
+        'ファイル／コードの圧縮は情報を失います。回答品質が下がるか、モデルがファイルを再読込する場合があります。',
+      cleanToolOutputsConfirm: 'コンテキストを整理',
+      cleanToolOutputsDone: 'コンテキストを整理しました',
+      cleanToolOutputsFailed: 'ツール出力を整理できませんでした',
+      cleanToolOutputsNoop: '整理できる古い大きなツール出力はありません。',
+      cleanToolOutputsKinds: {
+        bounded_excerpt: '先頭と末尾を保持',
+        file_structure: '損失のあるアウトラインまたは先頭＋末尾',
+        terminal_tail: '出力末尾（利用可能な場合は構造化エラーも保持）',
+        web_fields: '上位5件の結果フィールド'
+      },
+      cleanToolOutputsPreview: (resultCount, argumentCount, tokens) =>
+        `古い結果 ${resultCount} 件と呼び出しペイロード ${argumentCount} 件を圧縮し、約 ${tokens} トークン節約します。`,
+      cleanToolOutputsProtected: turns => `直近 ${turns} ターンはそのまま保持されます。`,
+      cleanToolOutputsStale: 'セッションが変更されました。更新されたプレビューを確認して、もう一度実行してください。',
+      cleanToolOutputsToggle: name => `${name} の出力を圧縮`,
+      cleanToolOutputsToolMeta: (resultCount, argumentCount, tokens, policy) =>
+        `結果 ${resultCount} 件 + 呼び出し ${argumentCount} 件 · 約 ${tokens} トークン · ${policy}`,
+      cleanToolOutputsTitle: 'ツール出力を整理しますか？',
+      cleanToolOutputsUpdating: 'プレビューを更新中…',
+      cleanToolOutputsWarning:
+        '現在のセッション履歴を書き換え、プロンプトキャッシュが 1 回ミスします。この操作は元に戻せません。',
       copyIdFailed: 'セッション ID をコピーできませんでした',
       actionsFor: title => `${title} のアクション`,
       sessionActions: 'セッションアクション',
