@@ -425,6 +425,7 @@ describe('resumeSession failure recovery', () => {
     expect($resumeFailedSessionId.get()).toBeNull()
     // The fallback transcript is visible.
     expect($messages.get().length).toBeGreaterThan(0)
+    expect($sessionViewSnapshot.get().runtimeSyncMode).toBe('layout')
   })
 
   it('does NOT throw out of the fallback when REST also fails (no unhandled rejection)', async () => {
@@ -815,6 +816,11 @@ describe('resumeSession warm-cache mapping integrity', () => {
     const methods = requestGateway.mock.calls.map(([method]) => method)
     expect(methods).not.toContain('session.resume')
     expect(runtimeIdByStoredSessionIdRef.current.get('stored-A')).toBe('rt-A')
+    expect($sessionViewSnapshot.get()).toMatchObject({
+      runtimeSessionId: 'rt-A',
+      runtimeSyncMode: 'layout',
+      storedSessionId: 'stored-A'
+    })
   })
 
   it('does not await a warm-cache usage probe before restoring the cached view', async () => {
