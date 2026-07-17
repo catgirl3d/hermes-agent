@@ -34,6 +34,7 @@ import { createComposerAttachmentScope } from '@/store/composer'
 import { $pinnedSessionIds, pinSession, unpinSession } from '@/store/layout'
 import { sessionAwaitingInput } from '@/store/prompts'
 import {
+  $activeSessionId,
   $gatewayState,
   $selectedStoredSessionId,
   $sessions,
@@ -50,6 +51,8 @@ import {
   sessionTileDelegate
 } from '@/store/session-states'
 
+import type { ClientSessionState, ToolResultPruneResponse } from '../types'
+
 import type { SessionDragPayload } from './composer/inline-refs'
 import { type ComposerScope, ComposerScopeProvider } from './composer/scope'
 import { useComposerActions } from './hooks/use-composer-actions'
@@ -63,6 +66,7 @@ import { lastVisibleMessageIsUser } from './thread-loading'
 import { ChatView } from '.'
 
 const NO_MESSAGES: ChatMessage[] = []
+const SESSION_ACTIONS_UNAVAILABLE = 'Session actions are unavailable'
 
 /** The tile's SessionView: the same atom shape the primary chat renders
  *  from, computed from this session's slice of `$sessionStates`. */
@@ -257,6 +261,20 @@ function tileTitle(storedSessionId: string): string {
   return stored ? sessionTitle(stored) : 'Session'
 }
 
+function runtimeForTabMenu(
+  storedSessionId: string,
+  activeSessionId: string | null,
+  selectedStoredSessionId: string | null,
+  tiles: SessionTile[],
+  states: Record<string, ClientSessionState>
+): string | null {
+  const runtimeId =
+    tiles.find(tile => tile.storedSessionId === storedSessionId)?.runtimeId ??
+    (storedSessionId === selectedStoredSessionId ? activeSessionId : null)
+
+  return runtimeId && states[runtimeId]?.storedSessionId === storedSessionId ? runtimeId : null
+}
+
 /** The `@session` link payload for a tile tab drag — id + owning profile + title. */
 function tileDragPayload(storedSessionId: string): SessionDragPayload {
   const stored = $sessions.get().find(s => sessionMatchesStoredId(s, storedSessionId))
@@ -350,19 +368,51 @@ export function SessionTabMenu({
 }) {
   const sessions = useStore($sessions)
   const pinnedSessionIds = useStore($pinnedSessionIds)
+  const activeSessionId = useStore($activeSessionId)
+  const selectedStoredSessionId = useStore($selectedStoredSessionId)
+  const tiles = useStore($sessionTiles)
+  const sessionStates = useStore($sessionStates)
   const stored = sessions.find(s => sessionMatchesStoredId(s, storedSessionId))
   const pinId = stored ? sessionPinId(stored) : storedSessionId
   const pinned = pinnedSessionIds.includes(pinId)
+  const runtimeId = runtimeForTabMenu(storedSessionId, activeSessionId, selectedStoredSessionId, tiles, sessionStates)
+  const canPruneToolResults = Boolean(runtimeId && !sessionStates[runtimeId]?.busy)
+
+  const onPreviewToolResultPrune = canPruneToolResults
+    ? async (toolNames?: string[]) => {
+        const delegate = sessionTileDelegate()
+
+        if (!delegate) {
+          throw new Error(SESSION_ACTIONS_UNAVAILABLE)
+        }
+
+        return delegate.previewToolResultPrune(storedSessionId, toolNames)
+      }
+    : undefined
+
+  const onApplyToolResultPrune = canPruneToolResults
+    ? async (preview: ToolResultPruneResponse) => {
+        const delegate = sessionTileDelegate()
+
+        if (!delegate) {
+          throw new Error(SESSION_ACTIONS_UNAVAILABLE)
+        }
+
+        return delegate.applyToolResultPrune(storedSessionId, preview)
+      }
+    : undefined
 
   return (
     <span className="contents" onContextMenu={event => event.stopPropagation()}>
       <SessionContextMenu
+        onApplyToolResultPrune={onApplyToolResultPrune}
         onArchive={() => void sessionTileDelegate()?.archiveSession(storedSessionId)}
         onBranch={() => void sessionTileDelegate()?.branchSession(storedSessionId)}
         onClose={onClose}
         onDelete={() => void sessionTileDelegate()?.deleteSession(storedSessionId)}
         onHideTabBar={onHideTabBar}
         onPin={() => (pinned ? unpinSession(pinId) : pinSession(pinId))}
+        onPreviewToolResultPrune={onPreviewToolResultPrune}
         pinned={pinned}
         profile={stored?.profile}
         sessionId={storedSessionId}
