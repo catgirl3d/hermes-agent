@@ -613,7 +613,9 @@ export function useSessionActions({
           selectedStoredSessionIdRef.current = storedSessionId
           activeSessionIdRef.current = cachedRuntimeId
           busyRef.current = cachedViewState.busy
-          publishSessionViewSnapshot(prepareSessionSnapshot(cachedRuntimeId, cachedViewState))
+          publishSessionViewSnapshot(
+            prepareSessionSnapshot(cachedRuntimeId, cachedViewState, { runtimeSyncMode: 'layout' })
+          )
           trace.mark('warm-view-published', { messageCount: cachedViewState.messages.length })
           completeAfterNextPaint('warm-restored', { messageCount: cachedViewState.messages.length, profileSwitch })
           setSessionStartedAt(Date.now())
@@ -871,7 +873,7 @@ export function useSessionActions({
           }
           activeSessionIdRef.current = null
           busyRef.current = false
-          publishSessionViewSnapshot(prepareSessionSnapshot(null, fallbackState))
+          publishSessionViewSnapshot(prepareSessionSnapshot(null, fallbackState, { runtimeSyncMode: 'layout' }))
           fallbackPainted = true
         } catch (e) {
           // Fallback also failed: nothing to paint. Leave whatever messages are
