@@ -28,9 +28,7 @@ export function getSessionTransitionState({
 }: SessionTransitionStateInput): SessionTransitionState {
   return {
     loadingSession:
-      !resumeExhausted &&
-      isRoutedSessionView &&
-      (routeSessionMismatch || (!hasVisibleSession && !activeSessionId)),
+      !resumeExhausted && isRoutedSessionView && (routeSessionMismatch || (!hasVisibleSession && !activeSessionId)),
     suppressMessages: routeSessionMismatch
   }
 }
@@ -46,9 +44,11 @@ export function getSessionTransitionRuntimeSyncMode({
     return 'layout'
   }
 
-  return runtimeSyncMode === 'layout' &&
-    traceRequestId !== undefined &&
-    layoutSyncedRequestId !== traceRequestId
+  if (runtimeSyncMode === 'layout' && traceRequestId === undefined) {
+    return 'layout'
+  }
+
+  return runtimeSyncMode === 'layout' && traceRequestId !== undefined && layoutSyncedRequestId !== traceRequestId
     ? 'layout'
     : 'passive'
 }
