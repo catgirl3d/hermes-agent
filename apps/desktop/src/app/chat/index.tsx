@@ -20,6 +20,7 @@ import { ErrorState } from '@/components/ui/error-state'
 import { TitleMenuTrigger } from '@/components/ui/title-menu-trigger'
 import type { HermesGateway } from '@/hermes'
 import { useI18n } from '@/i18n'
+import type { ChatMessage } from '@/lib/chat-messages'
 import { sessionTitle } from '@/lib/chat-runtime'
 import {
   type RuntimeAdapterSyncMetrics,
@@ -43,8 +44,8 @@ import {
   $introSeed,
   $resumeExhaustedSessionId,
   $selectedStoredSessionId,
-  $sessionViewRuntimeSyncMode,
   $sessions,
+  $sessionViewRuntimeSyncMode,
   sessionMatchesStoredId,
   sessionPinId
 } from '@/store/session'
@@ -61,11 +62,12 @@ import { droppedFileInlineRefs } from './composer/inline-refs'
 import { useComposerScope } from './composer/scope'
 import type { ChatBarState } from './composer/types'
 import { type DroppedFile, partitionDroppedFiles } from './hooks/use-composer-actions'
+import { useComposerIntentPrewarm } from './hooks/use-composer-intent-prewarm'
 import { type DragKind, useFileDropZone } from './hooks/use-file-drop-zone'
 import { ProfileTag } from './profile-tag'
 import { useRuntimeMessageRepository } from './runtime-repository'
-import { useComposerIntentPrewarm } from './hooks/use-composer-intent-prewarm'
 import { ScrollToBottomButton } from './scroll-to-bottom-button'
+import { getSessionTransitionRuntimeSyncMode, getSessionTransitionState } from './session-transition'
 import { useSessionView } from './session-view'
 import { SessionActionsMenu } from './sidebar/session-actions-menu'
 import { threadLoadingState } from './thread-loading'
@@ -187,8 +189,11 @@ interface ChatRuntimeBoundaryProps {
   onEdit: (message: AppendMessage) => Promise<void>
   onReload: (parentId: string | null) => Promise<void>
   onThreadMessagesChange: (messages: readonly ThreadMessage[]) => void
+  suppressMessages: boolean
   traceSessionId: null | string
 }
+
+const NO_MESSAGES: ChatMessage[] = []
 
 /**
  * Owns the $messages subscription and the assistant-ui external-store runtime.
@@ -206,6 +211,7 @@ function ChatRuntimeBoundary({
   onEdit,
   onReload,
   onThreadMessagesChange,
+  suppressMessages,
   traceSessionId
 }: ChatRuntimeBoundaryProps) {
   const renderStartedAt = performance.now()
@@ -219,12 +225,15 @@ function ChatRuntimeBoundary({
   )
 
   const view = useSessionView()
-  const busy = useStore(view.$busy)
-  const messages = useStore(view.$messages)
+  const viewBusy = useStore(view.$busy)
+  const viewMessages = useStore(view.$messages)
+  const busy = suppressMessages ? false : viewBusy
+  const messages = suppressMessages ? NO_MESSAGES : viewMessages
   const runtimeSyncMode = useStore($sessionViewRuntimeSyncMode)
   const runtimeMessageRepository = useRuntimeMessageRepository(messages, traceSessionId)
   const layoutCommittedAtRef = useRef<number | null>(null)
   const layoutSyncedRequestIdRef = useRef<number | undefined>(undefined)
+  const suppressMessagesCommittedRef = useRef(false)
 
   const lastRuntimeLayoutTraceRef = useRef<{
     adapter: ExternalStoreAdapter<ThreadMessage>
@@ -278,6 +287,10 @@ function ChatRuntimeBoundary({
   )
 
   useLayoutEffect(() => {
+    suppressMessagesCommittedRef.current = suppressMessages
+  }, [suppressMessages])
+
+  useLayoutEffect(() => {
     const layoutCommittedAt = performance.now()
     const lastTrace = lastRuntimeLayoutTraceRef.current
 
@@ -295,10 +308,13 @@ function ChatRuntimeBoundary({
     })
   })
 
-  const pendingRuntimeSyncMode =
-    runtimeSyncMode === 'layout' && traceRequestId !== undefined && layoutSyncedRequestIdRef.current !== traceRequestId
-      ? 'layout'
-      : 'passive'
+  const pendingRuntimeSyncMode = getSessionTransitionRuntimeSyncMode({
+    layoutSyncedRequestId: layoutSyncedRequestIdRef.current,
+    runtimeSyncMode,
+    suppressMessages,
+    traceRequestId,
+    wasSuppressingMessages: suppressMessagesCommittedRef.current
+  })
 
   const runtime = useIncrementalExternalStoreRuntime<ThreadMessage>(runtimeAdapter, {
     onAdapterSync: onRuntimeAdapterSync,
@@ -415,8 +431,13 @@ export function ChatView({
 
   const hasVisibleSession = Boolean(visibleStoredSessionId || activeSessionId || !messagesEmpty)
 
-  const loadingSession =
-    !resumeExhausted && isRoutedSessionView && !hasVisibleSession && (routeSessionMismatch || !activeSessionId)
+  const { loadingSession, suppressMessages } = getSessionTransitionState({
+    activeSessionId,
+    hasVisibleSession,
+    isRoutedSessionView,
+    resumeExhausted,
+    routeSessionMismatch
+  })
 
   const threadLoading = threadLoadingState(loadingSession, busy, awaitingResponse, lastVisibleIsUser)
   // Hide the composer in the exhausted error state too: there's no live runtime
@@ -539,7 +560,7 @@ export function ChatView({
         void onAttachDroppedItems(osDrops)
       }
     },
-    [currentCwd, onAttachDroppedItems, prewarmOnIntent]
+    [composerScope.target, currentCwd, onAttachDroppedItems, prewarmOnIntent]
   )
 
   // Session drags are POINTER drags (session-drag.ts) — never native DnD.
@@ -596,6 +617,7 @@ export function ChatView({
           onEdit={onEdit}
           onReload={onReload}
           onThreadMessagesChange={onThreadMessagesChange}
+          suppressMessages={suppressMessages}
           traceSessionId={selectedSessionId}
         >
           <div
