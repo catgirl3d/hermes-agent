@@ -48,4 +48,16 @@ describe('getSessionTransitionState', () => {
       })
     ).toBe('layout')
   })
+
+  it('honors an explicit layout sync without a session-switch trace', () => {
+    expect(
+      getSessionTransitionRuntimeSyncMode({
+        layoutSyncedRequestId: undefined,
+        runtimeSyncMode: 'layout',
+        suppressMessages: false,
+        traceRequestId: undefined,
+        wasSuppressingMessages: false
+      })
+    ).toBe('layout')
+  })
 })
