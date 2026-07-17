@@ -1,7 +1,8 @@
 import { useEffect } from 'react'
 
+import type { ToolResultPruneResponse } from '@/app/types'
 import { getSessionMessages, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS } from '@/hermes'
-import { toChatMessages } from '@/lib/chat-messages'
+import { reconcilePrunedChatMessages, toChatMessages } from '@/lib/chat-messages'
 import { publishSessionState, setSessionTileDelegate } from '@/store/session-states'
 import type { SessionResumeResponse } from '@/types/hermes'
 
@@ -40,9 +41,66 @@ export function useSessionTileDelegate({
   updateSessionState
 }: SessionTileDelegateParams): void {
   useEffect(() => {
+    const runtimeForStoredSession = (storedSessionId: string): string | null => {
+      const runtimeId = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
+      const state = runtimeId ? sessionStateByRuntimeIdRef.current.get(runtimeId) : undefined
+
+      return runtimeId && state?.storedSessionId === storedSessionId ? runtimeId : null
+    }
+
+    const requireRuntimeForStoredSession = (storedSessionId: string): string => {
+      const runtimeId = runtimeForStoredSession(storedSessionId)
+
+      if (!runtimeId) {
+        throw new Error('Session is no longer active')
+      }
+
+      return runtimeId
+    }
+
     setSessionTileDelegate({
       archiveSession: async storedSessionId => {
         await archiveSession(storedSessionId)
+      },
+      applyToolResultPrune: async (storedSessionId, preview) => {
+        const runtimeId = requireRuntimeForStoredSession(storedSessionId)
+
+        if (preview.session_id !== runtimeId) {
+          throw new Error('Session is no longer active')
+        }
+
+        const result = await requestGateway<ToolResultPruneResponse>('session.prune_tool_results', {
+          session_id: preview.session_id,
+          confirm: true,
+          history_version: preview.history_version,
+          selection_hash: preview.selection_hash,
+          tool_names: preview.selected_tool_names
+        })
+
+        // Reconnects re-mint runtime IDs. Never publish a late response into a
+        // stored session whose runtime binding changed while the RPC was in flight.
+        if (runtimeForStoredSession(storedSessionId) !== runtimeId) {
+          return result
+        }
+
+        if (result.applied && Array.isArray(result.messages)) {
+          const backendMessages = toChatMessages(result.messages)
+
+          updateSessionState(
+            runtimeId,
+            state => ({
+              ...state,
+              messages: reconcilePrunedChatMessages(
+                backendMessages,
+                state.messages,
+                new Set(result.selected_tool_names)
+              )
+            }),
+            storedSessionId
+          )
+        }
+
+        return result
       },
       branchSession: async storedSessionId => {
         await branchStoredSession(storedSessionId)
@@ -55,6 +113,14 @@ export function useSessionTileDelegate({
       },
       interruptSession: async runtimeId => {
         await requestGateway('session.interrupt', { session_id: runtimeId })
+      },
+      previewToolResultPrune: async (storedSessionId, toolNames) => {
+        const runtimeId = requireRuntimeForStoredSession(storedSessionId)
+
+        return requestGateway<ToolResultPruneResponse>('session.prune_tool_results', {
+          session_id: runtimeId,
+          ...(toolNames !== undefined ? { tool_names: toolNames } : {})
+        })
       },
       resumeTile: async storedSessionId => {
         const existing = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
