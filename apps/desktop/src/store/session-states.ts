@@ -18,7 +18,7 @@
 
 import { atom, computed } from 'nanostores'
 
-import type { ClientSessionState } from '@/app/types'
+import type { ClientSessionState, ToolResultPruneResponse } from '@/app/types'
 import { findGroup, findGroupOfPane } from '@/components/pane-shell/tree/model'
 import {
   $activeTreeGroup,
@@ -370,6 +370,10 @@ export interface SessionTileDelegate {
   executeSlash(rawCommand: string, sessionId: string): Promise<void>
   /** Interrupt a tile's running turn. */
   interruptSession(runtimeId: string): Promise<void>
+  /** Preview compaction for a stored session's currently bound runtime. */
+  previewToolResultPrune(storedSessionId: string, toolNames?: string[]): Promise<ToolResultPruneResponse>
+  /** Apply a reviewed compaction preview to its original stored session. */
+  applyToolResultPrune(storedSessionId: string, preview: ToolResultPruneResponse): Promise<ToolResultPruneResponse>
   /** Bind a live runtime id for a stored session (resume without touching
    *  the main view). Returns the runtime id, or throws. */
   resumeTile(storedSessionId: string): Promise<string>
