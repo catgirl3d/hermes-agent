@@ -3116,6 +3116,37 @@ class TestTokenBudgetTailProtection:
         assert file_result[3]["content"] == terminal_content
         assert file_result[1]["tool_calls"][0]["function"]["arguments"] != read_args
 
+    def test_manual_tool_prune_is_idempotent_on_already_pruned_history(self, budget_compressor):
+        messages = [
+            {"role": "user", "content": "inspect"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "read-old",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": '{"path":"store.py"}'},
+                    },
+                    {
+                        "id": "terminal-old",
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": '{"command":"pytest"}'},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "read-old", "content": "x" * 5000},
+            {"role": "tool", "tool_call_id": "terminal-old", "content": "output\n" * 500},
+            {"role": "user", "content": "recent"},
+        ]
+
+        once, stats_once = budget_compressor.prune_tool_results(messages, protect_tail_count=1)
+        twice, stats_twice = budget_compressor.prune_tool_results(once, protect_tail_count=1)
+
+        assert once == twice
+        assert stats_once["changed"] is True
+        assert stats_twice["changed"] is False
+
     def test_manual_web_prune_keeps_top_result_fields(self, budget_compressor):
         web_content = json.dumps(
             {

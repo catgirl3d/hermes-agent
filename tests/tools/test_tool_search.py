@@ -589,6 +589,21 @@ class TestBridgeDispatch:
         )
         assert "error" in json.loads(result)
 
+    def test_tool_describe_requires_a_current_refresh(self, monkeypatch):
+        from tools import tool_search as ts
+
+        monkeypatch.setattr(ts, "is_deferrable_tool_name", lambda name, config=None: True)
+
+        result = ts.dispatch_tool_describe(
+            {"name": "session_search"},
+            current_tool_defs=[],
+            config=ts.ToolSearchConfig.from_raw({"enabled": "on"}),
+        )
+
+        parsed = json.loads(result)
+        assert "currently available" in parsed["error"]
+        assert "Re-run tool_search to refresh." in parsed["error"]
+
     def test_tool_describe_allows_deferred_core_with_policy(self):
         from tools.tool_search import ToolSearchConfig, dispatch_tool_describe
 
