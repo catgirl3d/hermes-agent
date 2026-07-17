@@ -3,7 +3,7 @@ import type { MutableRefObject } from 'react'
 import { useEffect } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { getSessionMessages, type SessionInfo } from '@/hermes'
+import { deleteSession, getSessionMessages, type SessionInfo, setSessionArchived } from '@/hermes'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { prepareSessionSnapshot } from '@/lib/session-view-snapshot'
 import { $activeGatewayProfile, $newChatProfile } from '@/store/profile'
@@ -269,6 +269,58 @@ describe('active stored-session id rotation routing', () => {
   })
 })
 
+type RemovalHandle = Pick<ReturnType<typeof useSessionActions>, 'archiveSession' | 'removeSession'>
+
+interface RemovalHarnessProps {
+  activeSessionIdRef: MutableRefObject<string | null>
+  getRouteToken: () => string
+  navigate: ReturnType<typeof vi.fn>
+  onFreshDraftRouteIntent: () => void
+  onReady: (handle: RemovalHandle) => void
+  requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
+  runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>>
+  selectedStoredSessionId: string | null
+  selectedStoredSessionIdRef: MutableRefObject<string | null>
+  sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>>
+}
+
+function RemovalHarness({
+  activeSessionIdRef,
+  getRouteToken,
+  navigate,
+  onFreshDraftRouteIntent,
+  onReady,
+  requestGateway,
+  runtimeIdByStoredSessionIdRef,
+  selectedStoredSessionId,
+  selectedStoredSessionIdRef,
+  sessionStateByRuntimeIdRef
+}: RemovalHarnessProps) {
+  const actions = useSessionActions({
+    activeSessionId: activeSessionIdRef.current,
+    activeSessionIdRef,
+    busyRef: { current: false },
+    creatingSessionRef: { current: false },
+    ensureSessionState: () => ({}) as ClientSessionState,
+    getRouteToken,
+    getRoutedStoredSessionId: () => null,
+    navigate: navigate as never,
+    onFreshDraftRouteIntent,
+    requestGateway,
+    resetViewSync: vi.fn(),
+    runtimeIdByStoredSessionIdRef,
+    selectedStoredSessionId,
+    selectedStoredSessionIdRef,
+    sessionStateByRuntimeIdRef,
+    updateSessionState: () => ({}) as ClientSessionState
+  })
+
+  useEffect(() => {
+    onReady(actions)
+  }, [actions, onReady])
+
+  return null
+}
 async function createWith(
   profileSetup: () => void,
   beforeCreate?: (handle: HarnessHandle) => Promise<void> | void
@@ -1678,5 +1730,171 @@ describe('createBackendSessionForSend workspace target', () => {
     )
 
     expect(params).toMatchObject({ cwd: '/clicked-workspace' })
+  })
+})
+
+describe('foreground session removal', () => {
+  afterEach(() => {
+    cleanup()
+    setSelectedStoredSessionId(null)
+    setSessions([])
+    vi.restoreAllMocks()
+  })
+
+  async function renderRemovalHarness({
+    selectedStoredSessionId,
+    sessions,
+    visibleStoredSessionId
+  }: {
+    selectedStoredSessionId: string | null
+    sessions: SessionInfo[]
+    visibleStoredSessionId: string | null
+  }) {
+    const runtimeId = visibleStoredSessionId ? `runtime-${visibleStoredSessionId}` : null
+
+    const visibleState = createClientSessionState(visibleStoredSessionId, [
+      {
+        id: 'message-1',
+        parts: [{ text: 'old transcript', type: 'text' }],
+        role: 'assistant'
+      }
+    ])
+
+    const activeSessionIdRef: MutableRefObject<string | null> = { current: runtimeId }
+    const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: selectedStoredSessionId }
+
+    const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
+      current: visibleStoredSessionId && runtimeId ? new Map([[visibleStoredSessionId, runtimeId]]) : new Map()
+    }
+
+    const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
+      current: runtimeId ? new Map([[runtimeId, visibleState]]) : new Map()
+    }
+
+    const navigate = vi.fn()
+    const requestGateway = vi.fn(async () => ({}) as never)
+    let routeGeneration = 0
+    let handle: RemovalHandle | null = null
+
+    setSessions(sessions)
+    setSelectedStoredSessionId(selectedStoredSessionId)
+    publishSessionViewSnapshot(prepareSessionSnapshot(runtimeId, visibleState))
+    render(
+      <RemovalHarness
+        activeSessionIdRef={activeSessionIdRef}
+        getRouteToken={() => String(routeGeneration)}
+        navigate={navigate}
+        onFreshDraftRouteIntent={() => {
+          routeGeneration += 1
+        }}
+        onReady={value => (handle = value)}
+        requestGateway={requestGateway}
+        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
+        selectedStoredSessionId={selectedStoredSessionId}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+        sessionStateByRuntimeIdRef={sessionStateByRuntimeIdRef}
+      />
+    )
+
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    return { handle: handle!, navigate, requestGateway }
+  }
+
+  it('publishes an empty layout-synced draft when deleting the visible conversation by its rotated id', async () => {
+    const session = storedSession({ _lineage_root_id: 'stored-root', id: 'stored-tip' })
+
+    const { handle, navigate, requestGateway } = await renderRemovalHarness({
+      selectedStoredSessionId: 'stored-root',
+      sessions: [session],
+      visibleStoredSessionId: 'stored-root'
+    })
+
+    await act(async () => handle.removeSession('stored-tip'))
+
+    expect($sessionViewSnapshot.get()).toMatchObject({
+      messages: [],
+      runtimeSessionId: null,
+      runtimeSyncMode: 'layout',
+      storedSessionId: null
+    })
+    expect($selectedStoredSessionId.get()).toBeNull()
+    expect(navigate).toHaveBeenCalledWith('/', { replace: true })
+    expect(requestGateway).toHaveBeenCalledWith('session.close', { session_id: 'runtime-stored-root' })
+    expect(vi.mocked(deleteSession)).toHaveBeenCalledWith('stored-tip', session.profile)
+  })
+
+  it('restores the prior foreground snapshot and route when deletion fails', async () => {
+    const session = storedSession({ _lineage_root_id: 'stored-root', id: 'stored-tip' })
+    vi.mocked(deleteSession).mockRejectedValueOnce(new Error('delete failed'))
+
+    const { handle, navigate } = await renderRemovalHarness({
+      selectedStoredSessionId: 'stored-root',
+      sessions: [session],
+      visibleStoredSessionId: 'stored-root'
+    })
+
+    await act(async () => handle.removeSession('stored-tip'))
+
+    expect($sessionViewSnapshot.get()).toMatchObject({
+      runtimeSessionId: 'runtime-stored-root',
+      storedSessionId: 'stored-root'
+    })
+    expect($sessionViewSnapshot.get().messages).toHaveLength(1)
+    expect($selectedStoredSessionId.get()).toBe('stored-root')
+    expect(navigate).toHaveBeenLastCalledWith(sessionRoute('stored-root'), { replace: true })
+  })
+
+  it('does not close the visible runtime when deleting a selected route that has not published yet', async () => {
+    const visible = storedSession({ id: 'stored-A' })
+    const pending = storedSession({ id: 'stored-B' })
+
+    const { handle, requestGateway } = await renderRemovalHarness({
+      selectedStoredSessionId: 'stored-B',
+      sessions: [visible, pending],
+      visibleStoredSessionId: 'stored-A'
+    })
+
+    await act(async () => handle.removeSession('stored-B'))
+
+    expect($sessionViewSnapshot.get().messages).toEqual([])
+    expect(requestGateway).not.toHaveBeenCalledWith('session.close', { session_id: 'runtime-stored-A' })
+  })
+
+  it('leaves the foreground transcript intact when deleting a background conversation', async () => {
+    const visible = storedSession({ id: 'stored-A' })
+    const background = storedSession({ id: 'stored-B' })
+
+    const { handle, navigate } = await renderRemovalHarness({
+      selectedStoredSessionId: 'stored-A',
+      sessions: [visible, background],
+      visibleStoredSessionId: 'stored-A'
+    })
+
+    await act(async () => handle.removeSession('stored-B'))
+
+    expect($sessionViewSnapshot.get().storedSessionId).toBe('stored-A')
+    expect($sessionViewSnapshot.get().messages).toHaveLength(1)
+    expect(navigate).not.toHaveBeenCalled()
+  })
+
+  it('uses the same foreground transition when archiving a rotated conversation', async () => {
+    const session = storedSession({ _lineage_root_id: 'stored-root', id: 'stored-tip' })
+
+    const { handle } = await renderRemovalHarness({
+      selectedStoredSessionId: 'stored-root',
+      sessions: [session],
+      visibleStoredSessionId: 'stored-root'
+    })
+
+    await act(async () => handle.archiveSession('stored-tip'))
+
+    expect($sessionViewSnapshot.get()).toMatchObject({
+      messages: [],
+      runtimeSessionId: null,
+      runtimeSyncMode: 'layout',
+      storedSessionId: null
+    })
+    expect(vi.mocked(setSessionArchived)).toHaveBeenCalledWith('stored-tip', true, session.profile)
   })
 })

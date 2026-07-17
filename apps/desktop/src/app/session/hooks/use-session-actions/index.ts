@@ -169,12 +169,48 @@ interface FreshSessionDraftOptions {
   workspaceTarget?: NewChatWorkspaceTarget
 }
 
+interface SessionTargetIdentity {
+  _lineage_root_id?: null | string
+  id?: null | string
+}
+
+function sessionTargetIds(storedSessionId: string, session?: SessionTargetIdentity): string[] {
+  return [
+    ...new Set([storedSessionId, session?.id, session?._lineage_root_id].filter((id): id is string => Boolean(id)))
+  ]
+}
+
+function targetIncludesSessionId(targetIds: readonly string[], sessionId: null | string): boolean {
+  return Boolean(sessionId && targetIds.includes(sessionId))
+}
+
+function boundRuntimeForTarget(
+  targetIds: readonly string[],
+  visibleSnapshot: ReturnType<typeof $sessionViewSnapshot.get>,
+  runtimeIdByStoredSessionId: ReadonlyMap<string, string>,
+  sessionStateByRuntimeId: ReadonlyMap<string, ClientSessionState>
+): string | null {
+  if (visibleSnapshot.runtimeSessionId && targetIncludesSessionId(targetIds, visibleSnapshot.storedSessionId)) {
+    return visibleSnapshot.runtimeSessionId
+  }
+
+  for (const storedId of targetIds) {
+    const runtimeId = runtimeIdByStoredSessionId.get(storedId)
+    const runtimeState = runtimeId ? sessionStateByRuntimeId.get(runtimeId) : undefined
+
+    if (runtimeId && targetIncludesSessionId(targetIds, runtimeState?.storedSessionId ?? null)) {
+      return runtimeId
+    }
+  }
+
+  return null
+}
+
 function normalizeNewChatWorkspaceTarget(target: NewChatWorkspaceTarget): NewChatWorkspaceTarget {
   return typeof target === 'string' ? target.trim() || null : target
 }
 
 export function useSessionActions({
-  activeSessionId,
   activeSessionIdRef,
   busyRef,
   creatingSessionRef,
@@ -297,7 +333,7 @@ export function useSessionActions({
       activeSessionIdRef.current = null
       setSelectedStoredSessionId(null)
       selectedStoredSessionIdRef.current = null
-      publishSessionViewSnapshot(prepareSessionSnapshot(null, draftState))
+      publishSessionViewSnapshot(prepareSessionSnapshot(null, draftState, { runtimeSyncMode: 'layout' }))
       setCurrentUsage({
         calls: 0,
         input: 0,
@@ -1240,9 +1276,21 @@ export function useSessionActions({
       clearNotifications()
 
       const removed = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
-      const wasSelected = selectedStoredSessionId === storedSessionId
-      const closingRuntimeId = wasSelected ? activeSessionId : null
       const previousSnapshot = $sessionViewSnapshot.get()
+      const targetIds = sessionTargetIds(storedSessionId, removed)
+
+      const wasForeground =
+        targetIncludesSessionId(targetIds, selectedStoredSessionId) ||
+        targetIncludesSessionId(targetIds, previousSnapshot.storedSessionId)
+
+      const targetRuntimeId = boundRuntimeForTarget(
+        targetIds,
+        previousSnapshot,
+        runtimeIdByStoredSessionIdRef.current,
+        sessionStateByRuntimeIdRef.current
+      )
+
+      const closingRuntimeId = wasForeground ? targetRuntimeId : null
       const previousPinned = $pinnedSessionIds.get()
       // Pins are keyed on the durable lineage-root id; the stored id may be the
       // live tip after compression. Drop both so the pin can't linger.
@@ -1260,7 +1308,7 @@ export function useSessionActions({
 
       // Tear down before awaiting so the route effect can't resume the
       // doomed session via the stale /<sid> URL.
-      if (wasSelected) {
+      if (wasForeground) {
         startFreshSessionDraft(true)
       }
 
@@ -1279,13 +1327,14 @@ export function useSessionActions({
         // A tiled copy of this session must not outlive it: collapse the pane
         // and evict its mirrored runtime state so nothing submits to (or renders)
         // a deleted session.
-        const tiledRuntimeId = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
-        closeSessionTile(storedSessionId)
+        for (const targetId of targetIds) {
+          closeSessionTile(targetId)
+          runtimeIdByStoredSessionIdRef.current.delete(targetId)
+        }
 
-        if (tiledRuntimeId) {
-          runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
-          sessionStateByRuntimeIdRef.current.delete(tiledRuntimeId)
-          dropSessionState(tiledRuntimeId)
+        if (targetRuntimeId) {
+          sessionStateByRuntimeIdRef.current.delete(targetRuntimeId)
+          dropSessionState(targetRuntimeId)
         }
       } catch (err) {
         if (removed) {
@@ -1296,10 +1345,10 @@ export function useSessionActions({
         untombstoneSessions([storedSessionId, removed?.id, removed?._lineage_root_id])
         $pinnedSessionIds.set(previousPinned)
 
-        if (wasSelected) {
+        if (wasForeground) {
           setFreshDraftReady(false)
-          setSelectedStoredSessionId(storedSessionId)
-          selectedStoredSessionIdRef.current = storedSessionId
+          setSelectedStoredSessionId(selectedStoredSessionId)
+          selectedStoredSessionIdRef.current = selectedStoredSessionId
           const stored = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
 
           if (stored) {
@@ -1307,18 +1356,15 @@ export function useSessionActions({
           }
 
           publishSessionViewSnapshot(previousSnapshot)
-          navigate(sessionRoute(storedSessionId), { replace: true })
+          navigate(selectedStoredSessionId ? sessionRoute(selectedStoredSessionId) : NEW_CHAT_ROUTE, { replace: true })
 
-          if (closingRuntimeId) {
-            activeSessionIdRef.current = closingRuntimeId
-          }
+          activeSessionIdRef.current = previousSnapshot.runtimeSessionId
         }
 
         notifyError(err, copy.deleteFailed)
       }
     },
     [
-      activeSessionId,
       activeSessionIdRef,
       copy,
       navigate,
@@ -1336,7 +1382,20 @@ export function useSessionActions({
       clearNotifications()
 
       const archived = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
-      const wasSelected = selectedStoredSessionId === storedSessionId
+      const previousSnapshot = $sessionViewSnapshot.get()
+      const targetIds = sessionTargetIds(storedSessionId, archived)
+
+      const wasForeground =
+        targetIncludesSessionId(targetIds, selectedStoredSessionId) ||
+        targetIncludesSessionId(targetIds, previousSnapshot.storedSessionId)
+
+      const archivedRuntimeId = boundRuntimeForTarget(
+        targetIds,
+        previousSnapshot,
+        runtimeIdByStoredSessionIdRef.current,
+        sessionStateByRuntimeIdRef.current
+      )
+
       const previousPinned = $pinnedSessionIds.get()
       // Pins are keyed on the durable lineage-root id; the stored id may be the
       // live tip after compression. Drop both so the pin can't linger.
@@ -1351,7 +1410,7 @@ export function useSessionActions({
       setSessionsTotal(prev => Math.max(0, prev - 1))
       $pinnedSessionIds.set(previousPinned.filter(id => id !== storedSessionId && id !== archivedPinId))
 
-      if (wasSelected) {
+      if (wasForeground) {
         startFreshSessionDraft(true)
       }
 
@@ -1364,13 +1423,15 @@ export function useSessionActions({
         setSessions(prev => prev.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
         $pinnedSessionIds.set($pinnedSessionIds.get().filter(id => id !== storedSessionId && id !== archivedPinId))
         // An archived session is hidden from the sidebar; its tile must go too.
-        const tiledRuntimeId = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
-        closeSessionTile(storedSessionId)
 
-        if (tiledRuntimeId) {
-          runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
-          sessionStateByRuntimeIdRef.current.delete(tiledRuntimeId)
-          dropSessionState(tiledRuntimeId)
+        for (const targetId of targetIds) {
+          closeSessionTile(targetId)
+          runtimeIdByStoredSessionIdRef.current.delete(targetId)
+        }
+
+        if (archivedRuntimeId) {
+          sessionStateByRuntimeIdRef.current.delete(archivedRuntimeId)
+          dropSessionState(archivedRuntimeId)
         }
 
         notify({ durationMs: 2_000, kind: 'success', message: copy.archived })
