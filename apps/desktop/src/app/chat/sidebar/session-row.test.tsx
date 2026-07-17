@@ -3,11 +3,11 @@ import { Profiler, type ProfilerOnRenderCallback } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { ProjectInfo, SessionInfo } from '@/hermes'
-import { $backgroundRunningSessionIds } from '@/store/composer-status'
 import { $projects } from '@/store/projects'
-import { $sessions, $unreadFinishedSessionIds } from '@/store/session'
+import { $backgroundStatusBySession } from '@/store/composer-status'
+import { $selectedStoredSessionId, $sessions, $unreadFinishedSessionIds } from '@/store/session'
 import { $sessionColorById } from '@/store/session-color'
-import { $attentionSessionIds, $focusedStoredSessionId, $workingSessionIds } from '@/store/session-states'
+import { $sessionStates } from '@/store/session-states'
 
 import { SidebarSessionRow } from './session-row'
 
@@ -73,11 +73,10 @@ function renderRows(onRender: ProfilerOnRenderCallback) {
 
 afterEach(() => {
   cleanup()
-  $attentionSessionIds.set([])
-  $backgroundRunningSessionIds.set([])
-  $focusedStoredSessionId.set(null)
-  $workingSessionIds.set([])
+  $backgroundStatusBySession.set({})
+  $selectedStoredSessionId.set(null)
   $unreadFinishedSessionIds.set([])
+  $sessionStates.set({})
   $projects.set([])
   $sessions.set([])
 })
@@ -90,25 +89,38 @@ describe('SidebarSessionRow', () => {
     renderRows(onRender)
     commits.length = 0
 
-    act(() => $focusedStoredSessionId.set('session-a'))
+    act(() => $selectedStoredSessionId.set('session-a'))
 
     expect(commits).toEqual(['session-a'])
     expect(screen.getByTestId('session-a').className).toContain('bg-(--ui-row-active-background)')
 
     commits.length = 0
-    act(() => $focusedStoredSessionId.set('session-b'))
+    act(() => $selectedStoredSessionId.set('session-b'))
 
     expect(commits).toEqual(expect.arrayContaining(['session-a', 'session-b']))
     expect(commits).toHaveLength(2)
 
     commits.length = 0
-    act(() => $workingSessionIds.set(['session-a']))
+    act(() => $sessionStates.set({ rt1: { busy: true, needsInput: false, storedSessionId: 'session-a' } as never }))
 
     expect(commits).toEqual(['session-a'])
     expect(screen.getByTestId('session-a').dataset.working).toBe('true')
 
     commits.length = 0
-    act(() => $attentionSessionIds.set(['session-a']))
+    act(() => $sessionStates.set({ rt1: { busy: true, needsInput: true, storedSessionId: 'session-a' } as never }))
+
+    expect(commits).toEqual(['session-a'])
+
+    commits.length = 0
+    act(() => {
+      $sessionStates.set({ rt1: { storedSessionId: 'session-a' } as never })
+      $backgroundStatusBySession.set({ rt1: [{ id: 'bg1', state: 'running', title: 'bg', type: 'background' }] })
+    })
+
+    expect(commits).toEqual(['session-a'])
+
+    commits.length = 0
+    act(() => $unreadFinishedSessionIds.set(['session-a']))
 
     expect(commits).toEqual(['session-a'])
   })
@@ -127,7 +139,7 @@ describe('SidebarSessionRow', () => {
       />
     )
 
-    act(() => $focusedStoredSessionId.set('session-a'))
+    act(() => $selectedStoredSessionId.set('session-a'))
 
     expect(screen.getByTestId('session-a').className).not.toContain('bg-(--ui-row-active-background)')
   })

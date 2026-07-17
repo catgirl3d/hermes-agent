@@ -1616,9 +1616,19 @@ def _start_agent_build(sid: str, session: dict) -> None:
         return
     lock = session.setdefault("agent_build_lock", threading.Lock())
     with lock:
-        if ready.is_set() or session.get("agent_build_started"):
+        if session.get("agent") is not None:
             session.pop("_agent_build_trigger", None)
             return
+        if session.get("agent_build_started"):
+            session.pop("_agent_build_trigger", None)
+            return
+        if ready.is_set():
+            if session.get("agent_error") and session.get("agent") is None:
+                session["agent_error"] = None
+                ready.clear()
+            else:
+                session.pop("_agent_build_trigger", None)
+                return
         _cancel_scheduled_agent_build(session)
         session["agent_build_started"] = True
         build_trigger = str(session.pop("_agent_build_trigger", "") or "unspecified")
@@ -1631,8 +1641,10 @@ def _start_agent_build(sid: str, session: dict) -> None:
         global _last_agent_build_duration_ms, _last_agent_build_finished_at
         with _sessions_lock:
             current = _sessions.get(sid)
-        if current is None:
-            ready.set()
+        if current is not session:
+            with lock:
+                session["agent_build_started"] = False
+                ready.set()
             return
 
         _emit(
@@ -1652,6 +1664,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
         notify_registered = False
         home_token = None
         build_error_type = None
+        agent = None
         profile_home = current.get("profile_home")
         try:
             tokens = _set_session_context(key)
@@ -1715,6 +1728,16 @@ def _start_agent_build(sid: str, session: dict) -> None:
             except Exception:
                 pass
 
+            with _sessions_lock:
+                replaced = _sessions.get(sid) is not current
+
+            if replaced:
+                with contextlib.suppress(Exception):
+                    close_agent = getattr(agent, "close", None)
+                    if callable(close_agent):
+                        close_agent()
+                return
+
             try:
                 from tools.approval import (
                     register_gateway_notify,
@@ -1770,6 +1793,30 @@ def _start_agent_build(sid: str, session: dict) -> None:
             _schedule_mcp_late_refresh(sid, agent)
         except Exception as e:
             build_error_type = type(e).__name__
+            with _sessions_lock:
+                still_current = _sessions.get(sid) is current
+            if still_current:
+                stop_event = current.pop("_notif_stop", None)
+                if stop_event is not None:
+                    with contextlib.suppress(Exception):
+                        stop_event.set()
+                attached_worker = current.pop("slash_worker", None)
+                if attached_worker is not None:
+                    with contextlib.suppress(Exception):
+                        attached_worker.close()
+                attached_agent = current.get("agent")
+                if agent is not None and attached_agent is agent:
+                    current["agent"] = None
+                    with contextlib.suppress(Exception):
+                        close_agent = getattr(agent, "close", None)
+                        if callable(close_agent):
+                            close_agent()
+                current.pop("config_model_seen", None)
+            if notify_registered:
+                with contextlib.suppress(Exception):
+                    from tools.approval import unregister_gateway_notify
+
+                    unregister_gateway_notify(key)
             current["agent_error"] = str(e)
             _emit("error", sid, {"message": f"agent init failed: {e}"})
         finally:
@@ -1796,7 +1843,9 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     unregister_gateway_notify(key)
                 except Exception:
                     pass
-            ready.set()
+            with lock:
+                session["agent_build_started"] = False
+                ready.set()
             if not replaced:
                 _emit(
                     "agent.build_timing",
@@ -6702,6 +6751,7 @@ def _(rid, params: dict) -> dict:
             _mark_resume_stage("live_register")
             return _ok_resume(_reuse_live_payload(*live))
         _mark_resume_stage("live_register")
+        _schedule_session_cap_enforcement()  # deferred resume also creates a live session
 
         messages = _history_to_messages(display_history)
         _mark_resume_stage("message_transport")

@@ -73,4 +73,39 @@ describe('useComposerIntentPrewarm', () => {
       session_id: 'runtime-a'
     })
   })
+
+  it('does not let a stale failure clear the next runtime session request', async () => {
+    let rejectFirst: ((reason?: unknown) => void) | undefined
+
+    const request = vi
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise((_resolve, reject) => {
+            rejectFirst = reject
+          })
+      )
+      .mockResolvedValueOnce({ accepted: true })
+
+    const gateway = gatewayWithRequest(request)
+
+    const { rerender, result } = renderHook(({ sessionId }) => useComposerIntentPrewarm({ gateway, sessionId }), {
+      initialProps: { sessionId: 'runtime-a' as string | null }
+    })
+
+    act(() => result.current('text'))
+    rerender({ sessionId: 'runtime-b' })
+    act(() => result.current('voice'))
+
+    rejectFirst?.(new Error('late failure from previous runtime'))
+    await Promise.resolve()
+
+    act(() => result.current('voice'))
+
+    expect(request).toHaveBeenCalledTimes(2)
+    expect(request).toHaveBeenLastCalledWith('session.prewarm', {
+      intent: 'voice',
+      session_id: 'runtime-b'
+    })
+  })
 })

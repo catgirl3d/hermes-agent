@@ -485,6 +485,560 @@ def test_session_resume_defaults_to_deferred_build(server, monkeypatch):
     assert cap_sweeps == [None]
 
 
+def test_session_resume_deferred_reuses_live_session_and_releases_loser_lease(
+    server, monkeypatch
+):
+    target = "20260409_010101_abc123"
+
+    class _Lease:
+        def __init__(self, name: str):
+            self.name = name
+            self.released = 0
+
+        def release(self):
+            self.released += 1
+
+    lease1 = _Lease("first")
+    lease2 = _Lease("second")
+    claim_calls = 0
+    claim_barrier = threading.Barrier(2)
+
+    class _DB:
+        def get_session(self, _sid):
+            return {"id": target, "model": "vendor/cool-model", "model_config": {"provider": "vendor"}}
+
+        def get_session_by_title(self, _title):
+            return None
+
+        def resolve_resume_session_id(self, sid):
+            return sid
+
+        def reopen_session(self, _sid):
+            return None
+
+        def get_messages_as_conversation(self, _sid, include_ancestors=False):
+            return [{"role": "user", "content": "hello"}]
+
+    original_claim_or_reuse_live = server._claim_or_reuse_live
+    original_lazy_resume_info = server._lazy_resume_info
+
+    def fake_claim_active_session_slot(*_args, **_kwargs):
+        nonlocal claim_calls
+        claim_calls += 1
+        return (lease1 if claim_calls == 1 else lease2), None
+
+    def wrapped_claim_or_reuse_live(sid, session_key, record, lease):
+        try:
+            claim_barrier.wait(timeout=1)
+        except threading.BrokenBarrierError as exc:
+            raise AssertionError("concurrent resumes never reached claim_or_reuse_live together") from exc
+        live = original_claim_or_reuse_live(sid, session_key, record, lease)
+        return live
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    monkeypatch.setattr(server, "_claim_active_session_slot", fake_claim_active_session_slot)
+    monkeypatch.setattr(server, "_claim_or_reuse_live", wrapped_claim_or_reuse_live)
+    monkeypatch.setattr(server, "_lazy_resume_info", original_lazy_resume_info)
+    monkeypatch.setattr(server, "_make_agent", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no build")))
+    cap_sweeps: list[None] = []
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: cap_sweeps.append(None))
+
+    first_holder: dict[str, object] = {}
+    second_holder: dict[str, object] = {}
+
+    def run_first():
+        first_holder["resp"] = server.handle_request(
+            {"id": "first", "method": "session.resume", "params": {"session_id": target, "cols": 100}}
+        )
+
+    def run_second():
+        second_holder["resp"] = server.handle_request(
+            {"id": "second", "method": "session.resume", "params": {"session_id": target, "cols": 100}}
+        )
+
+    first_thread = threading.Thread(target=run_first)
+    second_thread = threading.Thread(target=run_second)
+    first_thread.start()
+    second_thread.start()
+    first_thread.join(timeout=1)
+    second_thread.join(timeout=1)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+
+    first_resp = first_holder["resp"]
+    second_resp = second_holder["resp"]
+    assert "error" not in first_resp
+    assert "error" not in second_resp
+    assert first_resp["result"]["session_id"] == second_resp["result"]["session_id"]
+    assert len(server._sessions) == 1
+    assert sorted([lease1.released, lease2.released]) == [0, 1]
+    assert claim_calls == 2
+    assert cap_sweeps == [None]
+
+
+def test_deferred_agent_build_failure_allows_a_single_explicit_retry(server, monkeypatch):
+    target = "20260409_010101_abc123"
+
+    class _DB:
+        def get_session(self, _sid):
+            return {"id": target, "model": "vendor/cool-model", "model_config": {"provider": "vendor"}}
+
+        def get_session_by_title(self, _title):
+            return None
+
+        def resolve_resume_session_id(self, sid):
+            return sid
+
+        def reopen_session(self, _sid):
+            return None
+
+        def get_messages_as_conversation(self, _sid, include_ancestors=False):
+            return [{"role": "user", "content": "hello"}]
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+
+    build_calls = 0
+    retry_build_entered = threading.Event()
+    release_retry_build = threading.Event()
+
+    class _Agent:
+        def __init__(self):
+            self.model = "vendor/cool-model"
+
+    def boom_make_agent(*_args, **_kwargs):
+        nonlocal build_calls
+        build_calls += 1
+        if build_calls == 1:
+            raise RuntimeError("agent boom")
+        retry_build_entered.set()
+        assert release_retry_build.wait(timeout=1), "retry build never released"
+        return _Agent()
+
+    monkeypatch.setattr(server, "_make_agent", boom_make_agent)
+    monkeypatch.setattr(server, "_SlashWorker", lambda *_a, **_k: types.SimpleNamespace(close=lambda: None))
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_session_info", lambda *_a, **_k: {"model": "vendor/cool-model"})
+    monkeypatch.setattr(server, "_sync_built_agent_with_session_override", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_wire_callbacks", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_start_notification_poller", lambda *_a, **_k: object())
+    monkeypatch.setattr(server, "_probe_config_health", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *_a, **_k: None)
+    fake_approval = types.SimpleNamespace(
+        register_gateway_notify=lambda *_a, **_k: None,
+        unregister_gateway_notify=lambda *_a, **_k: None,
+        load_permanent_allowlist=lambda: None,
+    )
+
+    session = server._deferred_session_record(
+        target,
+        cols=100,
+        cwd="/tmp",
+        history=[{"role": "user", "content": "hello"}],
+        lease=object(),
+        source="tui",
+        close_on_disconnect=False,
+        profile_home=None,
+        lazy=False,
+        resume_runtime_overrides={"model_override": {"model": "vendor/cool-model", "provider": "vendor"}},
+    )
+    sid = "resume-failure"
+    server._sessions[sid] = session
+
+    try:
+        with patch.dict(sys.modules, {"tools.approval": fake_approval}):
+            server._start_agent_build(sid, session)
+
+        assert session["agent_ready"].wait(timeout=1)
+        assert session["agent"] is None
+        assert session["agent_error"] == "agent boom"
+
+        err = server._wait_agent(session, "rid")
+        assert err is not None
+        assert err["error"]["message"] == "agent boom"
+
+        retry_barrier = threading.Barrier(2)
+
+        def retry_once():
+            try:
+                retry_barrier.wait(timeout=1)
+            except threading.BrokenBarrierError as exc:
+                raise AssertionError("retry callers did not line up") from exc
+            server._start_agent_build(sid, session)
+
+        first_retry = threading.Thread(target=retry_once)
+        second_retry = threading.Thread(target=retry_once)
+        first_retry.start()
+        second_retry.start()
+        assert retry_build_entered.wait(timeout=1), "retry build never started"
+        first_retry.join(timeout=1)
+        second_retry.join(timeout=1)
+        assert not first_retry.is_alive()
+        assert not second_retry.is_alive()
+
+        release_retry_build.set()
+        assert session["agent_ready"].wait(timeout=1)
+        assert build_calls == 2
+        assert session["agent"] is not None
+        assert session["agent_error"] is None
+        assert server._wait_agent(session, "rid") is None
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_deferred_agent_build_failure_publishes_readiness_atomically_before_retry(server, monkeypatch):
+    class BlockingReady:
+        def __init__(self):
+            self._flag = False
+            self.entered_set = threading.Event()
+            self.release_set = threading.Event()
+
+        def is_set(self):
+            return self._flag
+
+        def clear(self):
+            self._flag = False
+
+        def set(self):
+            self.entered_set.set()
+            assert self.release_set.wait(timeout=1), "ready.set was never released"
+            self._flag = True
+
+        def wait(self, timeout=None):
+            deadline = None if timeout is None else time.time() + timeout
+            while not self._flag:
+                if deadline is not None and time.time() >= deadline:
+                    return False
+                time.sleep(0.01)
+            return True
+
+    build_calls = 0
+    second_build_entered = threading.Event()
+
+    class _Agent:
+        def __init__(self):
+            self.model = "retry-model"
+
+    def fake_make_agent(*_args, **_kwargs):
+        nonlocal build_calls
+        build_calls += 1
+        if build_calls == 1:
+            raise RuntimeError("first failure")
+        second_build_entered.set()
+        return _Agent()
+
+    monkeypatch.setattr(server, "_make_agent", fake_make_agent)
+    monkeypatch.setattr(server, "_SlashWorker", lambda *_a, **_k: types.SimpleNamespace(close=lambda: None))
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_session_info", lambda *_a, **_k: {"model": "retry-model"})
+    monkeypatch.setattr(server, "_sync_built_agent_with_session_override", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_wire_callbacks", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_start_notification_poller", lambda *_a, **_k: object())
+    monkeypatch.setattr(server, "_probe_config_health", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *_a, **_k: None)
+    fake_approval = types.SimpleNamespace(
+        register_gateway_notify=lambda *_a, **_k: None,
+        unregister_gateway_notify=lambda *_a, **_k: None,
+        load_permanent_allowlist=lambda: None,
+    )
+
+    session = server._deferred_session_record(
+        "stored-atomic",
+        cols=100,
+        cwd="/tmp",
+        history=[],
+        lease=object(),
+        source="tui",
+        close_on_disconnect=False,
+        profile_home=None,
+        lazy=False,
+    )
+    ready = BlockingReady()
+    session["agent_ready"] = ready
+    sid = "atomic-retry"
+    server._sessions[sid] = session
+
+    try:
+        with patch.dict(sys.modules, {"tools.approval": fake_approval}):
+            server._start_agent_build(sid, session)
+            assert ready.entered_set.wait(timeout=1), "failed build never reached ready publication"
+
+            retry_entered = threading.Event()
+
+            def run_retry():
+                retry_entered.set()
+                server._start_agent_build(sid, session)
+
+            retry_thread = threading.Thread(target=run_retry)
+            retry_thread.start()
+            assert retry_entered.wait(timeout=1), "retry caller never started"
+            assert build_calls == 1
+            assert not second_build_entered.is_set()
+
+            ready.release_set.set()
+            retry_thread.join(timeout=1)
+            assert not retry_thread.is_alive()
+            assert second_build_entered.wait(timeout=1), "retry did not start after ready publication"
+            assert build_calls == 2
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_deferred_agent_build_partial_publish_failure_cleans_state_and_allows_retry(server, monkeypatch):
+    build_calls = 0
+    closed_agents: list[str] = []
+    closed_workers: list[str] = []
+    unregistered: list[str] = []
+    poller_stops: list[str] = []
+    poller_started: list[str] = []
+
+    class _Agent:
+        def __init__(self, name: str):
+            self.model = f"model-{name}"
+            self.name = name
+
+        def close(self):
+            closed_agents.append(self.name)
+
+    class _Worker:
+        def __init__(self, name: str):
+            self.name = name
+
+        def close(self):
+            closed_workers.append(self.name)
+
+    class _StopEvent:
+        def __init__(self, name: str):
+            self.name = name
+
+        def set(self):
+            poller_stops.append(self.name)
+
+    def fake_make_agent(*_args, **_kwargs):
+        nonlocal build_calls
+        build_calls += 1
+        return _Agent(f"build-{build_calls}")
+
+    def fake_worker(*_args, **_kwargs):
+        return _Worker(f"build-{build_calls}")
+
+    boundary_calls = 0
+
+    def fake_notify_session_boundary(*_args, **_kwargs):
+        nonlocal boundary_calls
+        boundary_calls += 1
+        if boundary_calls == 1:
+            raise RuntimeError("boundary failed")
+
+    monkeypatch.setattr(server, "_make_agent", fake_make_agent)
+    monkeypatch.setattr(server, "_SlashWorker", fake_worker)
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_session_info", lambda *_a, **_k: {"model": "ok"})
+    monkeypatch.setattr(server, "_sync_built_agent_with_session_override", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_wire_callbacks", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_notify_session_boundary", fake_notify_session_boundary)
+    monkeypatch.setattr(server, "_probe_config_health", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        server,
+        "_start_notification_poller",
+        lambda *_a, **_k: poller_started.append(f"build-{build_calls}") or _StopEvent(f"build-{build_calls}"),
+    )
+    fake_approval = types.SimpleNamespace(
+        register_gateway_notify=lambda *_a, **_k: None,
+        unregister_gateway_notify=lambda key: unregistered.append(key),
+        load_permanent_allowlist=lambda: None,
+    )
+
+    session = server._deferred_session_record(
+        "stored-partial",
+        cols=100,
+        cwd="/tmp",
+        history=[],
+        lease=object(),
+        source="tui",
+        close_on_disconnect=False,
+        profile_home=None,
+        lazy=False,
+    )
+    sid = "partial-retry"
+    server._sessions[sid] = session
+
+    try:
+        with patch.dict(sys.modules, {"tools.approval": fake_approval}):
+            server._start_agent_build(sid, session)
+            assert session["agent_ready"].wait(timeout=1)
+            assert session["agent"] is None
+            assert session["agent_error"] == "boundary failed"
+            assert session.get("slash_worker") is None
+            assert session.get("_notif_stop") is None
+            assert closed_agents == ["build-1"]
+            assert closed_workers == ["build-1"]
+            assert poller_started == ["build-1"]
+            assert poller_stops == ["build-1"]
+            assert unregistered == ["stored-partial"]
+
+            server._start_agent_build(sid, session)
+            assert session["agent_ready"].wait(timeout=1)
+            assert build_calls == 2
+            assert session["agent"] is not None
+            assert session["agent_error"] is None
+            assert session.get("slash_worker") is not None
+            assert session.get("_notif_stop") is not None
+            assert closed_agents == ["build-1"]
+            assert closed_workers == ["build-1"]
+            assert poller_started == ["build-1", "build-2"]
+            assert poller_stops == ["build-1"]
+            assert unregistered == ["stored-partial"]
+            assert server._wait_agent(session, "rid") is None
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_deferred_agent_build_skips_if_session_record_was_replaced_before_worker_runs(server, monkeypatch):
+    queued_targets: list[callable] = []
+    make_agent_calls: list[str] = []
+
+    class _FakeThread:
+        def __init__(self, target=None, daemon=None):
+            self.target = target
+
+        def start(self):
+            queued_targets.append(self.target)
+
+    monkeypatch.setattr(server.threading, "Thread", _FakeThread)
+    monkeypatch.setattr(server, "_make_agent", lambda *_a, **_k: make_agent_calls.append("called"))
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+
+    old_session = server._deferred_session_record(
+        "stored-old",
+        cols=100,
+        cwd="/tmp",
+        history=[{"role": "user", "content": "hello"}],
+        lease=object(),
+        source="tui",
+        close_on_disconnect=False,
+        profile_home=None,
+        lazy=False,
+    )
+    sid = "stale-before-run"
+    server._sessions[sid] = old_session
+
+    try:
+        server._start_agent_build(sid, old_session)
+        assert len(queued_targets) == 1
+
+        new_session = server._deferred_session_record(
+            "stored-new",
+            cols=100,
+            cwd="/tmp",
+            history=[],
+            lease=object(),
+            source="tui",
+            close_on_disconnect=False,
+            profile_home=None,
+            lazy=False,
+        )
+        server._sessions[sid] = new_session
+
+        queued_targets[0]()
+
+        assert make_agent_calls == []
+        assert new_session["agent"] is None
+        assert new_session["agent_error"] is None
+        assert not new_session["agent_ready"].is_set()
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_deferred_agent_build_does_not_publish_into_replaced_session_record(server, monkeypatch):
+    build_entered = threading.Event()
+    release_build = threading.Event()
+    closed_workers: list[str] = []
+    closed_agents: list[str] = []
+    poller_calls: list[str] = []
+
+    class _Agent:
+        def __init__(self):
+            self.model = "test/model"
+
+        def close(self):
+            closed_agents.append("old")
+
+    class _Worker:
+        def close(self):
+            closed_workers.append("old")
+
+    def fake_make_agent(*_args, **_kwargs):
+        build_entered.set()
+        assert release_build.wait(timeout=1), "replacement was never applied before build completion"
+        return _Agent()
+
+    monkeypatch.setattr(server, "_make_agent", fake_make_agent)
+    monkeypatch.setattr(server, "_SlashWorker", lambda *_a, **_k: _Worker())
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_session_info", lambda *_a, **_k: {"model": "test/model"})
+    monkeypatch.setattr(server, "_sync_built_agent_with_session_override", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_wire_callbacks", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_probe_config_health", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_start_notification_poller", lambda *_a, **_k: poller_calls.append("called") or object())
+    fake_approval = types.SimpleNamespace(
+        register_gateway_notify=lambda *_a, **_k: None,
+        unregister_gateway_notify=lambda *_a, **_k: None,
+        load_permanent_allowlist=lambda: None,
+    )
+
+    old_session = server._deferred_session_record(
+        "stored-old",
+        cols=100,
+        cwd="/tmp",
+        history=[{"role": "user", "content": "hello"}],
+        lease=object(),
+        source="tui",
+        close_on_disconnect=False,
+        profile_home=None,
+        lazy=False,
+    )
+    sid = "stale-build"
+    server._sessions[sid] = old_session
+
+    try:
+        with patch.dict(sys.modules, {"tools.approval": fake_approval}):
+            build_thread = threading.Thread(target=lambda: server._start_agent_build(sid, old_session))
+            build_thread.start()
+            assert build_entered.wait(timeout=1)
+
+            new_session = server._deferred_session_record(
+                "stored-new",
+                cols=100,
+                cwd="/tmp",
+                history=[],
+                lease=object(),
+                source="tui",
+                close_on_disconnect=False,
+                profile_home=None,
+                lazy=False,
+            )
+            server._sessions[sid] = new_session
+            release_build.set()
+            assert old_session["agent_ready"].wait(timeout=1), "stale build did not finish"
+            build_thread.join(timeout=1)
+
+        assert not build_thread.is_alive()
+        assert new_session["agent"] is None
+        assert new_session["agent_error"] is None
+        assert not new_session["agent_ready"].is_set()
+        assert "_notif_stop" not in new_session
+        assert poller_calls == []
+        assert closed_workers == ["old"]
+        assert closed_agents == ["old"]
+    finally:
+        server._sessions.pop(sid, None)
+
+
 def test_enforce_session_cap_evicts_oldest_detached_only(server, monkeypatch):
     """The LRU cap frees the least-recently-active DETACHED sessions when over
     the limit, and never a live-transport / running / mid-build one."""
