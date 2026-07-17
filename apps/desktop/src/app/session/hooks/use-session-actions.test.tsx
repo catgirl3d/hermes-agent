@@ -614,6 +614,7 @@ describe('resumeSession failure recovery', () => {
     expect($resumeFailedSessionId.get()).toBeNull()
     // The fallback transcript is visible.
     expect($messages.get().length).toBeGreaterThan(0)
+    expect($sessionViewSnapshot.get().runtimeSyncMode).toBe('layout')
   })
 
   it('preserves an optimistic user message during a same-session reconnect', async () => {
@@ -1287,6 +1288,11 @@ describe('resumeSession warm-cache mapping integrity', () => {
     expect(requestGateway.mock.calls.map(([method]) => method)).not.toContain('session.resume')
     expect(runtimeIdByStoredSessionIdRef.current.get('stored-A')).toBe('rt-A')
     expect(sessionStateByRuntimeIdRef.current.get('rt-A')?.messages[0]?.id).toBe('user-optimistic')
+    expect($sessionViewSnapshot.get()).toMatchObject({
+      runtimeSessionId: 'rt-A',
+      runtimeSyncMode: 'layout',
+      storedSessionId: 'stored-A'
+    })
   })
 
   it('does not await a warm-cache usage probe before restoring the cached view', async () => {
