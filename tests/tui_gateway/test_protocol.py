@@ -516,7 +516,7 @@ def test_session_resume_deferred_reuses_live_session_and_releases_loser_lease(
         def reopen_session(self, _sid):
             return None
 
-        def get_messages_as_conversation(self, _sid, include_ancestors=False):
+        def get_messages_as_conversation(self, _sid, include_ancestors=False, repair_alternation=False):
             return [{"role": "user", "content": "hello"}]
 
     original_claim_or_reuse_live = server._claim_or_reuse_live
