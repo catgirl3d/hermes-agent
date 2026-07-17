@@ -3,7 +3,14 @@ import { Profiler, type ProfilerOnRenderCallback } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { SessionInfo } from '@/hermes'
-import { $attentionSessionIds, $selectedStoredSessionId, $workingSessionIds } from '@/store/session'
+import {
+  $attentionSessionIds,
+  $selectedStoredSessionId,
+  $unreadFinishedSessionIds,
+  $workingSessionIds
+} from '@/store/session'
+import { $backgroundStatusBySession } from '@/store/composer-status'
+import { $sessionStates } from '@/store/session-states'
 
 import { SidebarSessionRow } from './session-row'
 
@@ -53,7 +60,10 @@ function renderRows(onRender: ProfilerOnRenderCallback) {
 afterEach(() => {
   cleanup()
   $attentionSessionIds.set([])
+  $backgroundStatusBySession.set({})
   $selectedStoredSessionId.set(null)
+  $unreadFinishedSessionIds.set([])
+  $sessionStates.set({})
   $workingSessionIds.set([])
 })
 
@@ -84,6 +94,19 @@ describe('SidebarSessionRow', () => {
 
     commits.length = 0
     act(() => $attentionSessionIds.set(['session-a']))
+
+    expect(commits).toEqual(['session-a'])
+
+    commits.length = 0
+    act(() => {
+      $sessionStates.set({ rt1: { storedSessionId: 'session-a' } as never })
+      $backgroundStatusBySession.set({ rt1: [{ id: 'bg1', state: 'running', title: 'bg', type: 'background' }] })
+    })
+
+    expect(commits).toEqual(['session-a'])
+
+    commits.length = 0
+    act(() => $unreadFinishedSessionIds.set(['session-a']))
 
     expect(commits).toEqual(['session-a'])
   })
