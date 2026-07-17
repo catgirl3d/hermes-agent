@@ -55,11 +55,12 @@ describe('buildGroups', () => {
 
 describe('firstVisibleGroupIndex', () => {
   const group = (id: string, weight: number): MessageGroup => ({ id, index: 0, kind: 'standalone', weight })
+  const turn = (id: string, weight = 1): MessageGroup => ({ id, indices: [0], kind: 'turn', weight })
 
   it('shows everything when total weight fits the budget', () => {
     const groups = [group('a', 10), group('b', 10), group('c', 10)]
 
-    expect(firstVisibleGroupIndex(groups, 100)).toBe(0)
+    expect(firstVisibleGroupIndex(groups, 10, 100)).toBe(0)
   })
 
   it('walks newest-first and hides everything before the turn that meets the budget', () => {
@@ -67,16 +68,34 @@ describe('firstVisibleGroupIndex', () => {
 
     // newest-first: 30 (new) < 60, +30 (mid) = 60 >= 60 → mid is the first
     // visible group, old is hidden.
-    expect(firstVisibleGroupIndex(groups, 60)).toBe(1)
+    expect(firstVisibleGroupIndex(groups, 10, 60)).toBe(1)
   })
 
   it('keeps whole turns intact — the turn that crosses the budget stays visible', () => {
     const groups = [group('old', 5), group('huge', 500)]
 
-    expect(firstVisibleGroupIndex(groups, 60)).toBe(1)
+    expect(firstVisibleGroupIndex(groups, 10, 60)).toBe(1)
   })
 
   it('returns groups.length for an empty list', () => {
-    expect(firstVisibleGroupIndex([], 60)).toBe(0)
+    expect(firstVisibleGroupIndex([], 1, 300)).toBe(0)
+  })
+
+  it('limits the automatic window to the newest complete turn', () => {
+    const groups = Array.from({ length: 9 }, (_, index) => turn(`turn-${index}`))
+
+    expect(firstVisibleGroupIndex(groups, 1, 300)).toBe(8)
+  })
+
+  it('keeps adjacent standalone messages with the selected turn', () => {
+    const groups = [turn('old'), group('separator', 1), turn('new'), group('tail', 1)]
+
+    expect(firstVisibleGroupIndex(groups, 1, 300)).toBe(1)
+  })
+
+  it('reveals one additional complete turn when the window expands', () => {
+    const groups = [turn('old'), turn('middle'), turn('new')]
+
+    expect(firstVisibleGroupIndex(groups, 2, 600)).toBe(1)
   })
 })

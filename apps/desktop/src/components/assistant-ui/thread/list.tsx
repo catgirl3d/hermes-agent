@@ -7,7 +7,6 @@ import {
   Profiler,
   type ProfilerOnRenderCallback,
   type ReactNode,
-  startTransition,
   useCallback,
   useEffect,
   useInsertionEffect,
@@ -44,19 +43,14 @@ export type MessageGroup = { id: string; weight: number } & (
   | { indices: number[]; kind: 'turn' }
 )
 
-// DOM is bounded by a rendered-PART budget, not a message/turn count: a single
-// assistant message folds every tool call into a part, so heavy sessions are
-// ~40 turns / ~100 messages but ~1000 parts — and parts are what drive node
-// count. "Show earlier" prepends another page; whole turns stay intact so the
-// sticky human bubble never loses its turn. This is the long-session perf lever
-// WITHOUT a virtualizer — pure rendering, never touches scrollTop, so it can't
-// fight use-stick-to-bottom (the single scroll owner).
-const RENDER_BUDGET = 300
-// On session switch, paint a small budget first (enough for the bottom turn(s)
-// the user actually sees after scroll-to-bottom), then bump to the full budget
-// in a requestAnimationFrame — defers the heavy markdown+syntax-highlight render
-// past the initial commit, so the switch feels instant.
-const FIRST_PAINT_BUDGET = 60
+// REBASE INVARIANT: keep automatic mounting bounded to one complete turn.
+// Do not restore the 60 -> 300 rAF/startTransition backfill from upstream
+// 0f05aaa2b/c856f3645. It caused a second mass message-layout commit 500-1000ms
+// after the target session had painted, even with hiddenGroupCount === 0.
+// Keep upstream's render-phase reset and shortened scroll settling, but mount
+// older turns only through the explicit "Show earlier" action below.
+const TURN_RENDER_BATCH = 2
+const PART_RENDER_BUDGET = 300
 
 interface ThreadMessageListProps {
   clampToComposer: boolean
@@ -106,17 +100,30 @@ export function buildGroups(signature: string): MessageGroup[] {
   return groups
 }
 
-// Walk turns newest-first, summing their part weights until the budget is met;
-// everything before the first kept turn is hidden. Returns the index of that
-// first visible group.
-export function firstVisibleGroupIndex(groups: readonly MessageGroup[], budget: number): number {
+// Walk newest-first until either the turn or rendered-part budget is met.
+// Standalone messages adjacent to the selected turn remain visible, and a turn
+// is never split even when that one turn exceeds the part budget.
+export function firstVisibleGroupIndex(
+  groups: readonly MessageGroup[],
+  visibleTurnLimit: number,
+  partBudget: number
+): number {
   let firstVisible = groups.length
+  let renderedParts = 0
+  let renderedTurns = 0
 
-  for (let i = groups.length - 1, weight = 0; i >= 0; i--) {
-    weight += groups[i].weight
-    firstVisible = i
+  for (let index = groups.length - 1; index >= 0; index--) {
+    const group = groups[index]
 
-    if (weight >= budget) {
+    if (group.kind === 'turn' && renderedTurns >= visibleTurnLimit) {
+      break
+    }
+
+    renderedParts += group.weight
+    renderedTurns += group.kind === 'turn' ? 1 : 0
+    firstVisible = index
+
+    if (renderedParts >= partBudget) {
       break
     }
   }
@@ -163,59 +170,21 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
     resize: 'instant'
   })
 
-  const [renderBudget, setRenderBudget] = useState(FIRST_PAINT_BUDGET)
+  const [renderWindow, setRenderWindow] = useState({
+    partBudget: PART_RENDER_BUDGET,
+    sessionKey,
+    turnLimit: TURN_RENDER_BATCH
+  })
 
-  // Cut the budget during RENDER, not in the post-commit layout effect. An
-  // effect-time cut is too late: React would first build the whole tree with
-  // the full budget (up to 300 parts of markdown + syntax highlighting),
-  // commit it, and only then re-render at the small budget. The render-phase
-  // state adjustment restarts this component immediately — before any child
-  // renders — so the heavy commit never happens.
-  //
-  // Two triggers, because the transcript swap arrives differently per path:
-  // a WARM switch publishes sessionKey + messages in one commit (the key
-  // branch), while a COLD switch changes sessionKey with an empty transcript
-  // and the prefetched messages land hundreds of ms later under the SAME key
-  // (the empty→non-empty branch).
-  const hasGroups = groups.length > 0
-  const [budgetSessionKey, setBudgetSessionKey] = useState(sessionKey)
-  const [hadGroups, setHadGroups] = useState(hasGroups)
+  const sessionWindowChanged = renderWindow.sessionKey !== sessionKey
 
-  if (budgetSessionKey !== sessionKey) {
-    setBudgetSessionKey(sessionKey)
-    setHadGroups(hasGroups)
-    setRenderBudget(FIRST_PAINT_BUDGET)
-  } else if (hadGroups !== hasGroups) {
-    setHadGroups(hasGroups)
-
-    if (hasGroups) {
-      setRenderBudget(FIRST_PAINT_BUDGET)
-    }
+  if (sessionWindowChanged) {
+    setRenderWindow({ partBudget: PART_RENDER_BUDGET, sessionKey, turnLimit: TURN_RENDER_BATCH })
   }
 
-  // Backfill from FIRST_PAINT_BUDGET to the full budget after the small
-  // commit painted — as a TRANSITION, so the heavy markdown + syntax
-  // highlight render of the older turns is interruptible instead of one long
-  // synchronous commit that freezes input right after the switch. Route
-  // changes stay urgent (main.tsx disables router transitions); it's exactly
-  // this backfill that belongs at background priority. "Show earlier" pages
-  // (budget > RENDER_BUDGET) never re-enter here.
-  useEffect(() => {
-    if (renderBudget >= RENDER_BUDGET) {
-      return
-    }
-
-    const rafId = requestAnimationFrame(() => {
-      // Functional max, not a plain set: an urgent "Show earlier" click can
-      // land between scheduling and committing this transition, and a plain
-      // set would rebase over it and shrink the budget back down.
-      startTransition(() => setRenderBudget(budget => Math.max(budget, RENDER_BUDGET)))
-    })
-
-    return () => cancelAnimationFrame(rafId)
-  }, [renderBudget])
-
-  const hiddenCount = firstVisibleGroupIndex(groups, renderBudget)
+  const effectiveRenderBudget = sessionWindowChanged ? PART_RENDER_BUDGET : renderWindow.partBudget
+  const effectiveTurnLimit = sessionWindowChanged ? TURN_RENDER_BATCH : renderWindow.turnLimit
+  const hiddenCount = firstVisibleGroupIndex(groups, effectiveTurnLimit, effectiveRenderBudget)
   const visibleGroups = hiddenCount > 0 ? groups.slice(hiddenCount) : groups
 
   const mountedMessageCount = visibleGroups.reduce(
@@ -251,12 +220,13 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
         groupCount: groups.length,
         hiddenGroupCount: hiddenCount,
         phase,
-        renderBudget,
+        renderBudget: effectiveRenderBudget,
         renderEmpty,
+        visibleTurnLimit: effectiveTurnLimit,
         visibleGroupCount: visibleGroups.length
       })
     },
-    [groups.length, hiddenCount, renderBudget, renderEmpty, traceSessionId, visibleGroups.length]
+    [effectiveRenderBudget, effectiveTurnLimit, groups.length, hiddenCount, renderEmpty, traceSessionId, visibleGroups.length]
   )
 
   useEffect(() => setThreadAtBottom(isAtBottom), [isAtBottom])
@@ -376,13 +346,18 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
 
   // Prepend an older page while preserving the on-screen position. The user is
   // scrolled up (reading history) so the stick-to-bottom lock is escaped and
-  // won't fight this manual restore.
+  // won't fight this manual restore. This is intentionally the only path that
+  // expands the transcript window; never add an automatic post-paint backfill.
   const showEarlier = useCallback(() => {
     const el = scrollRef.current
 
     restoreFromBottomRef.current = el ? el.scrollHeight - el.scrollTop : null
-    setRenderBudget(budget => budget + RENDER_BUDGET)
-  }, [scrollRef])
+    setRenderWindow(current => ({
+      partBudget: (current.sessionKey === sessionKey ? current.partBudget : PART_RENDER_BUDGET) + PART_RENDER_BUDGET,
+      sessionKey,
+      turnLimit: (current.sessionKey === sessionKey ? current.turnLimit : TURN_RENDER_BATCH) + TURN_RENDER_BATCH
+    }))
+  }, [scrollRef, sessionKey])
 
   useLayoutEffect(() => {
     const el = scrollRef.current
@@ -391,7 +366,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
       el.scrollTop = el.scrollHeight - restoreFromBottomRef.current
       restoreFromBottomRef.current = null
     }
-  }, [scrollRef, renderBudget])
+  }, [renderWindow.partBudget, renderWindow.turnLimit, scrollRef])
 
   renderBodyFinishedAt = performance.now()
 
