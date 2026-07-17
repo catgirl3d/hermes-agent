@@ -18,7 +18,7 @@
 
 import { atom, computed } from 'nanostores'
 
-import type { ClientSessionState } from '@/app/types'
+import type { ClientSessionState, ToolResultPruneResponse } from '@/app/types'
 import { findGroup, findGroupOfPane, type LayoutNode } from '@/components/pane-shell/tree/model'
 import {
   $activeTreeGroup,
@@ -421,6 +421,8 @@ export function resetTileRuntimeBindings() {
 // ---------------------------------------------------------------------------
 
 export interface SessionTileDelegate {
+  /** Apply a previously reviewed tool-result pruning preview to a tile. */
+  applyToolResultPrune(storedSessionId: string, preview: ToolResultPruneResponse): Promise<ToolResultPruneResponse>
   /** Archive a stored session (the sidebar's archive, incl. tile cleanup). */
   archiveSession(storedSessionId: string): Promise<void>
   /** Branch a stored session into a new chat (the sidebar's branch). */
@@ -432,6 +434,8 @@ export interface SessionTileDelegate {
   executeSlash(rawCommand: string, sessionId: string): Promise<void>
   /** Interrupt a tile's running turn. */
   interruptSession(runtimeId: string): Promise<void>
+  /** Build a pruning preview for the selected tile's live runtime. */
+  previewToolResultPrune(storedSessionId: string, toolNames?: string[]): Promise<ToolResultPruneResponse>
   /** Bind a live runtime id for a stored session (resume without touching
    *  the main view). Returns the runtime id, or throws. */
   resumeTile(storedSessionId: string): Promise<string>
