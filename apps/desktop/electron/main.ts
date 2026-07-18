@@ -4837,10 +4837,10 @@ function toggleDevTools(window) {
 function installDevToolsShortcut(window) {
   // F12 / Cmd+Opt+I works in both dev and packaged builds.
   window.webContents.on('before-input-event', (event, input) => {
-    const key = input.key.toLowerCase()
+    const key = String(input.key || '').toLowerCase()
 
     const isInspectShortcut =
-      input.key === 'F12' ||
+      key === 'f12' ||
       (IS_MAC && input.meta && input.alt && key === 'i') ||
       (!IS_MAC && input.control && input.shift && key === 'i')
 
