@@ -1,6 +1,6 @@
 import { useStore } from '@nanostores/react'
 import { computed } from 'nanostores'
-import type { CSSProperties, ReactElement, PointerEvent as ReactPointerEvent } from 'react'
+import { type CSSProperties, type ReactElement, type PointerEvent as ReactPointerEvent, useLayoutEffect } from 'react'
 
 import { PREVIEW_RAIL_MAX_WIDTH, PREVIEW_RAIL_MIN_WIDTH } from '@/app/chat/right-rail'
 import { PALETTE_AREA, type PaletteContribution } from '@/app/command-palette/contrib'
@@ -523,10 +523,9 @@ bindTreeSideVisibility('right', $fileBrowserOpen, setFileBrowserOpen)
 // back. The terminal is NOT workspace-gated: unlike the old shell (where it
 // rode the rail's row and vanished with it), its zone stands on its own.
 const $hasWorkspace = computed($currentCwd, cwd => Boolean(cwd.trim()))
+const $filesVisible = computed([$fileBrowserOpen, $hasWorkspace], (open, hasWorkspace) => open && hasWorkspace)
 
-// A session receiving its first backend CWD only makes Files available; it
-// must not reopen the user's collapsed right side.
-bindPaneVisibility('files', $hasWorkspace, { revealOnShow: false })
+bindPaneVisibility('files', $filesVisible, { revealOnShow: false })
 // ⌘G — the review sidebar appears/disappears (and comes to the front).
 bindPaneVisibility(
   'review',
@@ -601,6 +600,14 @@ $filePreviewTarget.listen(target => target && revealPreview())
 
 export function ContribController() {
   const sidebarOpen = useStore($sidebarOpen)
+
+  useLayoutEffect(() => {
+    // Startup must never restore supporting panes over a new draft. They remain
+    // available through their explicit controls for the rest of this launch.
+    setFileBrowserOpen(false)
+    setTerminalTakeover(false)
+    $logsOpen.set(false)
+  }, [])
 
   return (
     <SidebarProvider
