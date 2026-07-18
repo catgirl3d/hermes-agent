@@ -145,6 +145,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       // must never inherit the currently selected session after the user moves
       // to another chat.
       const targetStoredSessionId = options?.storedSessionId ?? selectedStoredSessionIdRef.current
+      let sessionStateStoredSessionId = targetStoredSessionId
 
       const targetStartedInCurrentView =
         !targetStoredSessionId || targetStoredSessionId === selectedStoredSessionIdRef.current
@@ -239,7 +240,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             // (what made drained-after-interrupt sends go silent).
             interrupted: false
           }),
-          targetStoredSessionId
+          sessionStateStoredSessionId
         )
 
       // After sync rewrites refs, refresh the optimistic message in place so the
@@ -251,7 +252,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             ...state,
             messages: state.messages.map(message => (message.id === optimisticId ? buildUserMessage() : message))
           }),
-          targetStoredSessionId
+          sessionStateStoredSessionId
         )
 
       const dropOptimistic = (sid: null | string) => {
@@ -272,7 +273,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             awaitingResponse: false,
             pendingBranchGroup: null
           }),
-          targetStoredSessionId
+          sessionStateStoredSessionId
         )
       }
 
@@ -430,6 +431,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         // pipeline; the closures (seedOptimistic et al) see the new value.
         startingStoredSessionId = selectedStoredSessionIdRef.current
         startingRouteToken = getRouteToken()
+        sessionStateStoredSessionId = startingStoredSessionId
 
         seedOptimistic(sessionId)
       }
