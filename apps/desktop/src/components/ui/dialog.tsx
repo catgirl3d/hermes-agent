@@ -101,6 +101,7 @@ function DialogContent({
           aria-label={t.common.close}
           className="absolute right-2.5 top-2.5 z-20 text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground"
           size="icon-xs"
+          type="button"
           variant="ghost"
         >
           <X className="size-4" />
