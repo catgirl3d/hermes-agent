@@ -430,14 +430,21 @@ registerLayoutResetHandler(stackSessionTilesIntoMain)
 // toggle mirrors the root row.
 // ---------------------------------------------------------------------------
 
+interface PaneVisibilityBindingOptions {
+  close?: () => void
+  open?: () => void
+  revealOnShow?: boolean
+}
+
 function bindPaneVisibility(
   paneId: string,
   $open: { get(): boolean; listen(fn: (open: boolean) => void): void },
-  close?: () => void,
-  open?: () => void
+  { close, open, revealOnShow = true }: PaneVisibilityBindingOptions = {}
 ) {
-  setTreePaneHidden(paneId, !$open.get())
-  $open.listen(isOpen => setTreePaneHidden(paneId, !isOpen))
+  const syncVisibility = (isOpen: boolean) => setTreePaneHidden(paneId, !isOpen, revealOnShow)
+
+  syncVisibility($open.get())
+  $open.listen(syncVisibility)
 
   // The tab menu's Close routes through the owning store (never dismissal),
   // so the pane's toggle buttons stay truthful.
@@ -517,12 +524,14 @@ bindTreeSideVisibility('right', $fileBrowserOpen, setFileBrowserOpen)
 // rode the rail's row and vanished with it), its zone stands on its own.
 const $hasWorkspace = computed($currentCwd, cwd => Boolean(cwd.trim()))
 
-bindPaneVisibility('files', $hasWorkspace)
+// A session receiving its first backend CWD only makes Files available; it
+// must not reopen the user's collapsed right side.
+bindPaneVisibility('files', $hasWorkspace, { revealOnShow: false })
 // ⌘G — the review sidebar appears/disappears (and comes to the front).
 bindPaneVisibility(
   'review',
   computed([$reviewOpen, $hasWorkspace], (open, workspace) => open && workspace),
-  closeReview
+  { close: closeReview }
 )
 // ⌃` / statusbar toggle — the terminal COLLAPSES to a rail (tab stays), not
 // hides; PTYs stay alive while collapsed (see PersistentTerminal).
@@ -541,7 +550,7 @@ const $previewVisible = computed([$previewTarget, $filePreviewTarget], (target, 
   Boolean(target || fileTarget)
 )
 
-bindPaneVisibility('preview', $previewVisible, closeRightRail)
+bindPaneVisibility('preview', $previewVisible, { close: closeRightRail })
 
 // Logs are optional chrome: off by default, toggled from ⌘K, persisted.
 const $logsOpen = persistentAtom('hermes.desktop.logsOpen', false, Codecs.bool)
