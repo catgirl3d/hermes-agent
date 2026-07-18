@@ -83,9 +83,9 @@ describe('reactive pane unhide', () => {
     expect(layout.$fileBrowserOpen.get()).toBe(false)
     expect(tree.$collapsedTreeSides.get().has('right')).toBe(true)
 
-    // Workspace flips: `bindPaneVisibility('files', $hasWorkspace)` calls
-    // `setTreePaneHidden('files', false)` — model it directly.
-    tree.setTreePaneHidden('files', false)
+    // Workspace flips: controller.tsx calls
+    // `setTreePaneHidden('files', false, false)` — model it directly.
+    tree.setTreePaneHidden('files', false, false)
 
     // The pane unhides…
     expect(tree.$hiddenTreePanes.get().has('files')).toBe(false)
@@ -143,8 +143,9 @@ describe('reactive pane unhide', () => {
 
     openerSpy.mockClear()
 
-    // Reactive unhide fires via the same primitive the workspace wiring uses.
-    tree.setTreePaneHidden('files', false)
+    // Reactive unhide calls `setTreePaneHidden('files', false, false)`, as the
+    // workspace wiring does.
+    tree.setTreePaneHidden('files', false, false)
 
     // The opener MUST NOT be called — before the fix, the auto-reveal would
     // call `setFileBrowserOpen(true)` via this opener.

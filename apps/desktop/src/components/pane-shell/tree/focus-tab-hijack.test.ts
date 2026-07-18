@@ -51,8 +51,9 @@ describe('reactive unhide in a shared (Focus) group', () => {
     tree.setTreePaneHidden('files', true)
     expect(activeOf('workspace')).toBe('workspace')
 
-    // First reply adopts a cwd → the workspace wiring unhides files.
-    tree.setTreePaneHidden('files', false)
+    // First reply adopts a cwd → workspace wiring calls
+    // `setTreePaneHidden('files', false, false)`.
+    tree.setTreePaneHidden('files', false, false)
 
     expect(tree.$hiddenTreePanes.get().has('files')).toBe(false)
     // The user stays on the new session; files must not hijack the tab.
@@ -66,7 +67,8 @@ describe('reactive unhide in a shared (Focus) group', () => {
     tree.setTreePaneHidden('workspace', true)
     tree.setTreePaneHidden('files', true)
 
-    tree.setTreePaneHidden('files', false)
+    // Reactive unhide calls `setTreePaneHidden('files', false, false)`.
+    tree.setTreePaneHidden('files', false, false)
 
     // With no showable active pane, the reactive unhide picks files so the
     // group fronts a valid tab (preserves the #65375 "visible next time" intent).

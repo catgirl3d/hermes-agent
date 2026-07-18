@@ -117,7 +117,7 @@ function toggledSet<T>(set: ReadonlySet<T>, item: T, present: boolean): Set<T> |
   return next
 }
 
-export function setTreePaneHidden(paneId: string, hidden: boolean) {
+export function setTreePaneHidden(paneId: string, hidden: boolean, revealOnShow = true) {
   const next = toggledSet($hiddenTreePanes.get(), paneId, hidden)
 
   if (!next) {
@@ -127,13 +127,14 @@ export function setTreePaneHidden(paneId: string, hidden: boolean) {
   $hiddenTreePanes.set(next)
 
   // Reactive unhides (e.g. `bindPaneVisibility('files', $hasWorkspace)`) are
-  // state-driven, not user intent — opening the side or fronting the tab in
-  // response to an environmental flag change would clobber an explicit user
-  // collapse (Cmd+J) and silently re-open the rail after every session create.
-  // Callers that want user-intent semantics (open the side, front the tab)
-  // must call `revealTreePane` explicitly. We still front the pane in its
-  // group so it's visible the next time the column is shown.
-  if (!hidden) {
+  // state-driven, not user intent — opening the side in response to an
+  // environmental flag change would clobber an explicit user collapse (Cmd+J)
+  // and silently re-open the rail after every session create. Availability
+  // changes may unhide a pane without overriding the user's collapsed side;
+  // explicit reveal actions keep the default behavior.
+  if (!hidden && revealOnShow) {
+    revealTreePane(paneId)
+  } else if (!hidden) {
     frontPaneInGroup(paneId)
   }
 }
