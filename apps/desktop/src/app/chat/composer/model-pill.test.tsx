@@ -1,8 +1,16 @@
-import { cleanup, render, screen } from '@testing-library/react'
-import { afterEach, describe, expect, it } from 'vitest'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { ChatBarState } from '@/app/chat/composer/types'
-import { $activeSessionId, $currentModel, setCurrentModel, setCurrentModelSource } from '@/store/session'
+import { ModelMenuPanel } from '@/app/shell/model-menu-panel'
+import {
+  $activeSessionId,
+  $currentModel,
+  $currentProvider,
+  setCurrentModel,
+  setCurrentModelSource
+} from '@/store/session'
 
 import { ModelPill } from './model-pill'
 
@@ -17,6 +25,7 @@ afterEach(() => {
   cleanup()
   $activeSessionId.set(null)
   setCurrentModel('')
+  $currentProvider.set('')
   setCurrentModelSource('')
 })
 
@@ -67,5 +76,39 @@ describe('ModelPill pinned-override badge', () => {
     render(<ModelPill disabled={false} model={modelState({ modelMenuContent: <div /> })} />)
     expect(screen.getByTestId('model-pinned-dot')).toBeTruthy()
     expect($currentModel.get()).toBe('deepseek/deepseek-v4-flash')
+  })
+})
+
+describe('ModelPill model-options query lifecycle', () => {
+  it('does not query on mount or an A-to-B session switch until the compact picker opens', async () => {
+    const gateway = { request: vi.fn(() => Promise.resolve({ providers: [] })) }
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const menu = <ModelMenuPanel gateway={gateway as never} onSelectModel={vi.fn()} requestGateway={vi.fn() as never} />
+
+    $activeSessionId.set('runtime-a')
+    setCurrentModel('model-a')
+    $currentProvider.set('provider-a')
+
+    const { container } = render(
+      <QueryClientProvider client={queryClient}>
+        <ModelPill disabled={false} model={modelState({ modelMenuContent: menu })} />
+      </QueryClientProvider>
+    )
+
+    expect(gateway.request).not.toHaveBeenCalled()
+
+    act(() => $activeSessionId.set('runtime-b'))
+
+    expect(gateway.request).not.toHaveBeenCalled()
+
+    fireEvent.pointerDown(container.querySelector('button')!, { button: 0, ctrlKey: false })
+
+    await waitFor(() => {
+      expect(gateway.request).toHaveBeenCalledTimes(1)
+    })
+    expect(gateway.request).toHaveBeenCalledWith('model.options', {
+      explicit_only: true,
+      session_id: 'runtime-b'
+    })
   })
 })
