@@ -139,6 +139,34 @@ describe('renameSessionPreferringRpc', () => {
 })
 
 describe('SessionActionsMenu tool-result pruning', () => {
+  it('closes the preview with the cross without applying the cleanup', async () => {
+    const preview = prunePreview()
+    const onPreview = vi.fn(async () => preview)
+    const onApply = vi.fn(async () => ({ ...preview, applied: true, status: 'pruned' as const }))
+
+    render(
+      createElement(SessionActionsMenu, {
+        children: createElement('button', { type: 'button' }, 'Session actions'),
+        onApplyToolResultPrune: onApply,
+        onPreviewToolResultPrune: onPreview,
+        sessionId: STORED_ID,
+        title: 'Target session'
+      })
+    )
+
+    fireEvent.pointerDown(screen.getByRole('button', { name: 'Session actions' }), {
+      button: 0,
+      ctrlKey: false
+    })
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Clean tool outputs' }))
+    await screen.findByText('Clean tool outputs?')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }))
+
+    await waitFor(() => expect(screen.queryByText('Clean tool outputs?')).toBeNull())
+    expect(onApply).not.toHaveBeenCalled()
+  })
+
   it('shows the backend preview and only applies after confirmation', async () => {
     const preview = {
       after_bytes: 400,
