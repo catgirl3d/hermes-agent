@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest'
 
-import { buildGroups, firstVisibleGroupIndex, type MessageGroup, shouldAutoRevealEarlier } from './list'
+import {
+  buildGroups,
+  firstVisibleGroupIndex,
+  type MessageGroup,
+  nextScrollSettleState,
+  restoreScrollTopFromBottom,
+  shouldAutoRevealEarlier,
+  shouldContinueScrollSettling
+} from './list'
 
 // Signature rows are `${index}:${id}:${role}:${weight}` (see the useAuiState
 // selector in list.tsx).
@@ -81,10 +89,10 @@ describe('firstVisibleGroupIndex', () => {
     expect(firstVisibleGroupIndex([], 1, 300)).toBe(0)
   })
 
-  it('limits the automatic window to the newest complete turn', () => {
+  it('limits the automatic window to the newest two complete turns', () => {
     const groups = Array.from({ length: 9 }, (_, index) => turn(`turn-${index}`))
 
-    expect(firstVisibleGroupIndex(groups, 1, 300)).toBe(8)
+    expect(firstVisibleGroupIndex(groups, 2, 300)).toBe(7)
   })
 
   it('keeps adjacent standalone messages with the selected turn', () => {
@@ -97,6 +105,34 @@ describe('firstVisibleGroupIndex', () => {
     const groups = [turn('old'), turn('middle'), turn('new')]
 
     expect(firstVisibleGroupIndex(groups, 2, 600)).toBe(1)
+  })
+})
+
+describe('scroll settling', () => {
+  it('returns control after two stable scrollHeight frames', () => {
+    const afterFirstStableFrame = nextScrollSettleState({ frame: 0, lastHeight: 100, stableFrames: 0 }, 100)
+    const afterSecondStableFrame = nextScrollSettleState(afterFirstStableFrame, 100)
+
+    expect(shouldContinueScrollSettling(afterFirstStableFrame)).toBe(true)
+    expect(shouldContinueScrollSettling(afterSecondStableFrame)).toBe(false)
+  })
+
+  it('stops at the fifteenth changing frame rather than scheduling a sixteenth frame', () => {
+    let state = { frame: 0, lastHeight: 0, stableFrames: 0 }
+
+    for (let height = 1; height <= 15; height += 1) {
+      state = nextScrollSettleState(state, height)
+    }
+
+    expect(state).toEqual({ frame: 15, lastHeight: 15, stableFrames: 0 })
+    expect(shouldContinueScrollSettling(state)).toBe(false)
+  })
+})
+
+describe('earlier-history viewport continuity', () => {
+  it('restores the same distance from the viewport bottom after each expansion', () => {
+    expect(restoreScrollTopFromBottom(900, 240)).toBe(660)
+    expect(restoreScrollTopFromBottom(1_500, 240)).toBe(1_260)
   })
 })
 
