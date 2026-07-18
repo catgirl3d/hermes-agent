@@ -52,6 +52,30 @@ export type MessageGroup = { id: string; weight: number } & (
 // older turns only through the explicit "Show earlier" action below.
 const TURN_RENDER_BATCH = 2
 const PART_RENDER_BUDGET = 300
+const SCROLL_SETTLE_STABLE_FRAME_LIMIT = 2
+const SCROLL_SETTLE_FRAME_LIMIT = 15
+
+interface ScrollSettleState {
+  frame: number
+  lastHeight: number
+  stableFrames: number
+}
+
+export function nextScrollSettleState(state: ScrollSettleState, height: number): ScrollSettleState {
+  return {
+    frame: state.frame + 1,
+    lastHeight: height,
+    stableFrames: height === state.lastHeight ? state.stableFrames + 1 : 0
+  }
+}
+
+export function shouldContinueScrollSettling(state: ScrollSettleState): boolean {
+  return state.stableFrames < SCROLL_SETTLE_STABLE_FRAME_LIMIT && state.frame < SCROLL_SETTLE_FRAME_LIMIT
+}
+
+export function restoreScrollTopFromBottom(scrollHeight: number, distanceFromBottom: number): number {
+  return scrollHeight - distanceFromBottom
+}
 
 interface ThreadMessageListProps {
   clampToComposer: boolean
@@ -335,9 +359,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
     stopScroll()
     el.scrollTop = el.scrollHeight
 
-    let frame = 0
-    let stableFrames = 0
-    let lastHeight = el.scrollHeight
+    let settleState: ScrollSettleState = { frame: 0, lastHeight: el.scrollHeight, stableFrames: 0 }
 
     const settle = () => {
       const node = scrollRef.current
@@ -348,14 +370,13 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
 
       const height = node.scrollHeight
 
-      stableFrames = height === lastHeight ? stableFrames + 1 : 0
-      lastHeight = height
+      settleState = nextScrollSettleState(settleState, height)
       node.scrollTop = height
 
       // Most session switches are synchronous and stabilize within 2 frames;
       // the old 90-frame ceiling was for slow async image loads. Cap at 15
       // frames to minimize the settle-loop racing markdown paint on every switch.
-      if (stableFrames >= 2 || ++frame > 15) {
+      if (!shouldContinueScrollSettling(settleState)) {
         void scrollToBottom('instant')
 
         return
@@ -463,7 +484,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
     const el = scrollRef.current
 
     if (el && restoreFromBottomRef.current != null) {
-      el.scrollTop = el.scrollHeight - restoreFromBottomRef.current
+      el.scrollTop = restoreScrollTopFromBottom(el.scrollHeight, restoreFromBottomRef.current)
       restoreFromBottomRef.current = null
     }
   }, [renderWindow.partBudget, renderWindow.turnLimit, scrollRef])
