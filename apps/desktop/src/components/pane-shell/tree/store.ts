@@ -117,7 +117,7 @@ function toggledSet<T>(set: ReadonlySet<T>, item: T, present: boolean): Set<T> |
   return next
 }
 
-export function setTreePaneHidden(paneId: string, hidden: boolean) {
+export function setTreePaneHidden(paneId: string, hidden: boolean, revealOnShow = true) {
   const next = toggledSet($hiddenTreePanes.get(), paneId, hidden)
 
   if (!next) {
@@ -126,8 +126,9 @@ export function setTreePaneHidden(paneId: string, hidden: boolean) {
 
   $hiddenTreePanes.set(next)
 
-  // Unhiding is an intent to SEE the pane — front it in its group.
-  if (!hidden) {
+  // Availability changes may unhide a pane without overriding the user's
+  // collapsed side. Explicit reveal actions keep the default behavior.
+  if (!hidden && revealOnShow) {
     revealTreePane(paneId)
   }
 }
