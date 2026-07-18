@@ -12,7 +12,8 @@ import {
   useInsertionEffect,
   useLayoutEffect,
   useRef,
-  useState
+  useState,
+  type WheelEvent
 } from 'react'
 import { useStickToBottom } from 'use-stick-to-bottom'
 
@@ -131,6 +132,18 @@ export function firstVisibleGroupIndex(
   return firstVisible
 }
 
+export function shouldAutoRevealEarlier({
+  buttonIntersecting,
+  expansionPending,
+  userScrollIntent
+}: {
+  buttonIntersecting: boolean
+  expansionPending: boolean
+  userScrollIntent: boolean
+}): boolean {
+  return buttonIntersecting && userScrollIntent && !expansionPending
+}
+
 const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   clampToComposer,
   components,
@@ -175,6 +188,10 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
     sessionKey,
     turnLimit: TURN_RENDER_BATCH
   })
+
+  const earlierButtonRef = useRef<HTMLButtonElement | null>(null)
+  const expansionPendingRef = useRef(false)
+  const userScrollIntentRef = useRef(false)
 
   const sessionWindowChanged = renderWindow.sessionKey !== sessionKey
 
@@ -226,7 +243,15 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
         visibleGroupCount: visibleGroups.length
       })
     },
-    [effectiveRenderBudget, effectiveTurnLimit, groups.length, hiddenCount, renderEmpty, traceSessionId, visibleGroups.length]
+    [
+      effectiveRenderBudget,
+      effectiveTurnLimit,
+      groups.length,
+      hiddenCount,
+      renderEmpty,
+      traceSessionId,
+      visibleGroups.length
+    ]
   )
 
   useEffect(() => setThreadAtBottom(isAtBottom), [isAtBottom])
@@ -346,9 +371,16 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
 
   // Prepend an older page while preserving the on-screen position. The user is
   // scrolled up (reading history) so the stick-to-bottom lock is escaped and
-  // won't fight this manual restore. This is intentionally the only path that
-  // expands the transcript window; never add an automatic post-paint backfill.
+  // won't fight this manual restore. Automatic loading below calls this same
+  // path only after the user reaches the visible boundary.
   const showEarlier = useCallback(() => {
+    if (expansionPendingRef.current) {
+      return
+    }
+
+    expansionPendingRef.current = true
+    userScrollIntentRef.current = false
+
     const el = scrollRef.current
 
     restoreFromBottomRef.current = el ? el.scrollHeight - el.scrollTop : null
@@ -359,7 +391,75 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
     }))
   }, [scrollRef, sessionKey])
 
+  const tryAutoRevealEarlier = useCallback(() => {
+    const viewport = scrollRef.current
+    const button = earlierButtonRef.current
+
+    if (!viewport || !button) {
+      return
+    }
+
+    const viewportRect = viewport.getBoundingClientRect()
+    const buttonRect = button.getBoundingClientRect()
+
+    if (
+      !shouldAutoRevealEarlier({
+        buttonIntersecting: buttonRect.bottom >= viewportRect.top && buttonRect.top <= viewportRect.bottom,
+        expansionPending: expansionPendingRef.current,
+        userScrollIntent: userScrollIntentRef.current
+      })
+    ) {
+      return
+    }
+
+    showEarlier()
+  }, [scrollRef, showEarlier])
+
+  const handleViewportWheel = useCallback(
+    (event: WheelEvent<HTMLDivElement>) => {
+      userScrollIntentRef.current = event.deltaY < 0
+
+      if (event.deltaY < 0) {
+        tryAutoRevealEarlier()
+      }
+    },
+    [tryAutoRevealEarlier]
+  )
+
+  useEffect(() => {
+    const viewport = scrollRef.current
+    const button = earlierButtonRef.current
+
+    if (!viewport || !button || typeof IntersectionObserver === 'undefined') {
+      return
+    }
+
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (
+          !entry ||
+          !shouldAutoRevealEarlier({
+            buttonIntersecting: entry.isIntersecting,
+            expansionPending: expansionPendingRef.current,
+            userScrollIntent: userScrollIntentRef.current
+          })
+        ) {
+          return
+        }
+
+        showEarlier()
+      },
+      { root: viewport, threshold: 0 }
+    )
+
+    observer.observe(button)
+
+    return () => observer.disconnect()
+  }, [hiddenCount, scrollRef, showEarlier])
+
   useLayoutEffect(() => {
+    expansionPendingRef.current = false
+
     const el = scrollRef.current
 
     if (el && restoreFromBottomRef.current != null) {
@@ -395,6 +495,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
         className="size-full overflow-x-hidden overflow-y-auto overscroll-contain"
         data-following={isAtBottom ? 'true' : 'false'}
         data-slot="aui_thread-viewport"
+        onWheel={handleViewportWheel}
         ref={scrollRef as React.RefCallback<HTMLDivElement>}
       >
         <Profiler id="thread-message-list" onRender={onMessageListRender}>
@@ -415,6 +516,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
                 <button
                   className="mx-auto mb-(--conversation-turn-gap) rounded-full border border-border/65 bg-(--composer-fill) px-3 py-1 text-xs text-muted-foreground hover:text-foreground"
                   onClick={showEarlier}
+                  ref={earlierButtonRef}
                   type="button"
                 >
                   {t.assistant.thread.showEarlier}
