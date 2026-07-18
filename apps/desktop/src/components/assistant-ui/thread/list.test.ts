@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { buildGroups, firstVisibleGroupIndex, type MessageGroup } from './list'
+import { buildGroups, firstVisibleGroupIndex, type MessageGroup, shouldAutoRevealEarlier } from './list'
 
 // Signature rows are `${index}:${id}:${role}:${weight}` (see the useAuiState
 // selector in list.tsx).
@@ -97,5 +97,25 @@ describe('firstVisibleGroupIndex', () => {
     const groups = [turn('old'), turn('middle'), turn('new')]
 
     expect(firstVisibleGroupIndex(groups, 2, 600)).toBe(1)
+  })
+})
+
+describe('shouldAutoRevealEarlier', () => {
+  it('reveals only when the user reaches the button while scrolling upward', () => {
+    expect(shouldAutoRevealEarlier({ buttonIntersecting: true, expansionPending: false, userScrollIntent: true })).toBe(
+      true
+    )
+  })
+
+  it('does not reveal on initial visibility without user scroll intent', () => {
+    expect(
+      shouldAutoRevealEarlier({ buttonIntersecting: true, expansionPending: false, userScrollIntent: false })
+    ).toBe(false)
+  })
+
+  it('does not queue another page while the current expansion is pending', () => {
+    expect(shouldAutoRevealEarlier({ buttonIntersecting: true, expansionPending: true, userScrollIntent: true })).toBe(
+      false
+    )
   })
 })
