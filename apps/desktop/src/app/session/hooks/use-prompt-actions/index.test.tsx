@@ -1997,6 +1997,7 @@ describe('usePromptActions submit session-context isolation (#54527)', () => {
     // persisted, and the desktop stranded on a route whose REST reads 404
     // ("Session not found").
     const calls: { method: string; params?: Record<string, unknown> }[] = []
+    const stateUpdates: Array<{ sessionId: string; storedSessionId: null | string | undefined }> = []
     const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: null }
     const activeSessionIdRef: MutableRefObject<string | null> = { current: null }
     let routeToken = '/'
@@ -2025,6 +2026,7 @@ describe('usePromptActions submit session-context isolation (#54527)', () => {
         createBackendSessionForSend={createBackendSessionForSend}
         getRouteToken={() => routeToken}
         onReady={h => (handle = h)}
+        onUpdateState={(sessionId, storedSessionId) => stateUpdates.push({ sessionId, storedSessionId })}
         refreshSessions={async () => undefined}
         requestGateway={requestGateway}
         selectedStoredSessionIdRef={selectedStoredSessionIdRef}
@@ -2035,6 +2037,7 @@ describe('usePromptActions submit session-context isolation (#54527)', () => {
 
     expect(await handle!.submitText('first message of a brand-new chat')).toBe(true)
     expect(createBackendSessionForSend).toHaveBeenCalledTimes(1)
+    expect(stateUpdates).toContainEqual({ sessionId: 'rt-new-chat', storedSessionId: 'stored-new-chat' })
     expect(calls.find(c => c.method === 'prompt.submit')?.params).toMatchObject({
       session_id: 'rt-new-chat'
     })
