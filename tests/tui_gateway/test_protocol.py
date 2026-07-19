@@ -482,7 +482,7 @@ def test_session_resume_defaults_to_deferred_build(server, monkeypatch):
     # can't drop the provider ("No LLM provider configured").
     assert session["resume_runtime_overrides"]["model_override"]["model"] == "vendor/cool-model"
     assert server._find_live_session_by_key(target) == (sid, session)
-    assert cap_sweeps == [None]
+    assert cap_sweeps == []
 
 
 def test_session_resume_deferred_reuses_live_session_and_releases_loser_lease(
@@ -574,7 +574,7 @@ def test_session_resume_deferred_reuses_live_session_and_releases_loser_lease(
     assert len(server._sessions) == 1
     assert sorted([lease1.released, lease2.released]) == [0, 1]
     assert claim_calls == 2
-    assert cap_sweeps == [None]
+    assert cap_sweeps == []
 
 
 def test_deferred_agent_build_failure_allows_a_single_explicit_retry(server, monkeypatch):
@@ -2557,6 +2557,38 @@ def test_dispatch_offloads_long_handlers_and_emits_via_stdout(capture):
 
     written = json.loads(buf.getvalue())
     assert written == {"jsonrpc": "2.0", "id": "r2", "result": {"output": "hi"}}
+
+
+def test_dispatch_schedules_normal_resume_cap_after_successful_write(server, monkeypatch):
+    class _ImmediatePool:
+        def submit(self, fn):
+            fn()
+
+    cap_sweeps: list[None] = []
+    writes: list[dict] = []
+
+    class _Recorder:
+        def write(self, response):
+            # The response is visible before post-write cap enforcement runs.
+            assert cap_sweeps == []
+            writes.append(response)
+            return True
+
+    monkeypatch.setattr(server, "_pool", _ImmediatePool())
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: cap_sweeps.append(None))
+    monkeypatch.setitem(
+        server._methods,
+        "session.resume",
+        lambda rid, _params: server._ok(rid, {"resumed": "stored-session"}),
+    )
+
+    assert server.dispatch(
+        {"id": "resume", "method": "session.resume", "params": {}},
+        transport=_Recorder(),
+    ) is None
+
+    assert writes == [{"jsonrpc": "2.0", "id": "resume", "result": {"resumed": "stored-session"}}]
+    assert cap_sweeps == [None]
 
 
 def test_dispatch_long_handler_does_not_block_fast_handler(server):
