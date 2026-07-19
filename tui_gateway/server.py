@@ -1496,14 +1496,7 @@ def handle_request(req: dict) -> dict | None:
     fn = _methods.get(method)
     if not fn:
         return _err(rid, -32601, f"unknown method: {method}")
-    response = fn(rid, params)
-    if (
-        method == "session.resume"
-        and not is_truthy_value(params.get("lazy", False))
-        and not is_truthy_value(params.get("eager_build", False))
-    ):
-        _handle_resume_response_after_write(response)
-    return response
+    return fn(rid, params)
 
 
 def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
@@ -1555,7 +1548,12 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
                             2,
                         )
                 written = t.write(resp)
-                if written and method == "session.resume":
+                if (
+                    written
+                    and method == "session.resume"
+                    and not is_truthy_value(_params.get("lazy", False))
+                    and not is_truthy_value(_params.get("eager_build", False))
+                ):
                     _handle_resume_response_after_write(resp)
 
         _pool.submit(lambda: ctx.run(run))
@@ -6711,8 +6709,6 @@ def _(rid, params: dict) -> dict:
             _mark_resume_stage("live_register")
             return _ok_resume(_reuse_live_payload(*live))
         _mark_resume_stage("live_register")
-        _schedule_session_cap_enforcement()  # deferred resume also creates a live session
-
         messages = _history_to_messages(display_history)
         _mark_resume_stage("message_transport")
         resume_info = _lazy_resume_info(
