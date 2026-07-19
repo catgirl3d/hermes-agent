@@ -2,6 +2,7 @@ import { cleanup, renderHook } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { ClientSessionState, ToolResultPruneResponse } from '@/app/types'
+import { $currentUsage, setCurrentUsage } from '@/store/session'
 import { sessionTileDelegate } from '@/store/session-states'
 
 import type { GatewayRequester } from '../types'
@@ -62,16 +63,28 @@ function prunePreview(overrides: Partial<ToolResultPruneResponse> = {}): ToolRes
   }
 }
 
-function createDelegate(requestGateway: GatewayRequester) {
+function createDelegate(
+  requestGateway: GatewayRequester,
+  {
+    activeRuntimeId = RUNTIME_SESSION_ID,
+    selectedStoredSessionId = STORED_SESSION_ID
+  }: { activeRuntimeId?: string; selectedStoredSessionId?: string } = {}
+) {
+  const activeSessionIdRef = { current: activeRuntimeId }
   const runtimeIdByStoredSessionIdRef = { current: new Map([[STORED_SESSION_ID, RUNTIME_SESSION_ID]]) }
+  const selectedStoredSessionIdRef = { current: selectedStoredSessionId }
   const sessionStateByRuntimeIdRef = { current: new Map([[RUNTIME_SESSION_ID, sessionState()]]) }
 
-  const updateSessionState = vi.fn((runtimeId: string, updater: (state: ClientSessionState) => ClientSessionState) =>
-    updater(sessionStateByRuntimeIdRef.current.get(runtimeId)!)
-  )
+  const updateSessionState = vi.fn((runtimeId: string, updater: (state: ClientSessionState) => ClientSessionState) => {
+    const next = updater(sessionStateByRuntimeIdRef.current.get(runtimeId)!)
+    sessionStateByRuntimeIdRef.current.set(runtimeId, next)
+
+    return next
+  })
 
   renderHook(() =>
     useSessionTileDelegate({
+      activeSessionIdRef,
       archiveSession: vi.fn(async () => undefined),
       branchStoredSession: vi.fn(async () => undefined),
       executeSlashCommand: vi.fn() as never,
@@ -79,19 +92,25 @@ function createDelegate(requestGateway: GatewayRequester) {
       requestGateway,
       runtimeIdByStoredSessionIdRef,
       sessionStateByRuntimeIdRef,
+      selectedStoredSessionIdRef,
       updateSessionState
     })
   )
 
   return {
+    activeSessionIdRef,
     delegate: sessionTileDelegate()!,
     runtimeIdByStoredSessionIdRef,
+    selectedStoredSessionIdRef,
     sessionStateByRuntimeIdRef,
     updateSessionState
   }
 }
 
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  setCurrentUsage({ calls: 0, input: 0, output: 0, total: 0 })
+})
 
 describe('useSessionTileDelegate tool-result pruning', () => {
   it('previews the stored session through its validated runtime binding', async () => {
@@ -99,7 +118,10 @@ describe('useSessionTileDelegate tool-result pruning', () => {
     const requestGateway = vi.fn(async () => preview) as unknown as GatewayRequester
     const { delegate } = createDelegate(requestGateway)
 
-    await expect(delegate.previewToolResultPrune(STORED_SESSION_ID, ['terminal'])).resolves.toBe(preview)
+    await expect(delegate.previewToolResultPrune(STORED_SESSION_ID, ['terminal'])).resolves.toEqual({
+      ...preview,
+      origin_stored_session_id: STORED_SESSION_ID
+    })
 
     expect(requestGateway).toHaveBeenCalledWith('session.prune_tool_results', {
       session_id: RUNTIME_SESSION_ID,
@@ -110,14 +132,31 @@ describe('useSessionTileDelegate tool-result pruning', () => {
   it('applies the preview to the same bound runtime and stored cache entry', async () => {
     const preview = prunePreview()
 
+    const contextEstimate = {
+      context_max: 1_000_000,
+      context_percent: 2,
+      context_used: 18_000
+    }
+
+    setCurrentUsage({
+      calls: 3,
+      context_max: 1_000_000,
+      context_percent: 4,
+      context_used: 39_200,
+      input: 1_000,
+      output: 500,
+      total: 1_500
+    })
+
     const requestGateway = vi.fn(async () => ({
       ...preview,
       applied: true,
+      context_estimate: contextEstimate,
       messages: [{ content: 'pruned result', role: 'assistant' as const }],
       status: 'pruned' as const
     })) as unknown as GatewayRequester
 
-    const { delegate, updateSessionState } = createDelegate(requestGateway)
+    const { delegate, sessionStateByRuntimeIdRef, updateSessionState } = createDelegate(requestGateway)
 
     await delegate.applyToolResultPrune(STORED_SESSION_ID, preview)
 
@@ -129,6 +168,52 @@ describe('useSessionTileDelegate tool-result pruning', () => {
       tool_names: preview.selected_tool_names
     })
     expect(updateSessionState).toHaveBeenCalledWith(RUNTIME_SESSION_ID, expect.any(Function), STORED_SESSION_ID)
+    expect(sessionStateByRuntimeIdRef.current.get(RUNTIME_SESSION_ID)?.usage).toMatchObject(contextEstimate)
+    expect($currentUsage.get()).toMatchObject({
+      ...contextEstimate,
+      calls: 3,
+      input: 1_000,
+      output: 500,
+      total: 1_500
+    })
+  })
+
+  it('does not overwrite primary context when a background tile is cleaned', async () => {
+    const preview = prunePreview()
+
+    const contextEstimate = {
+      context_max: 1_000_000,
+      context_percent: 2,
+      context_used: 18_000
+    }
+
+    setCurrentUsage({
+      calls: 1,
+      context_max: 1_000_000,
+      context_percent: 4,
+      context_used: 39_200,
+      input: 100,
+      output: 50,
+      total: 150
+    })
+
+    const requestGateway = vi.fn(async () => ({
+      ...preview,
+      applied: true,
+      context_estimate: contextEstimate,
+      messages: [{ content: 'pruned result', role: 'assistant' as const }],
+      status: 'pruned' as const
+    })) as unknown as GatewayRequester
+
+    const { delegate, sessionStateByRuntimeIdRef } = createDelegate(requestGateway, {
+      activeRuntimeId: 'runtime-primary',
+      selectedStoredSessionId: 'stored-primary'
+    })
+
+    await delegate.applyToolResultPrune(STORED_SESSION_ID, preview)
+
+    expect(sessionStateByRuntimeIdRef.current.get(RUNTIME_SESSION_ID)?.usage).toMatchObject(contextEstimate)
+    expect($currentUsage.get().context_used).toBe(39_200)
   })
 
   it('does not publish a completed prune after the stored session rebinds', async () => {

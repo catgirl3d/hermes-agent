@@ -534,6 +534,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // Session-tile delegate (resume/submit/interrupt/slash + the session verbs
   // the tile TAB menu needs, without touching the primary view).
   useSessionTileDelegate({
+    activeSessionIdRef,
     archiveSession,
     branchStoredSession,
     executeSlashCommand,
@@ -541,6 +542,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     requestGateway,
     runtimeIdByStoredSessionIdRef,
     sessionStateByRuntimeIdRef,
+    selectedStoredSessionIdRef,
     updateSessionState
   })
 

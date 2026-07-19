@@ -1,8 +1,10 @@
-import { useEffect } from 'react'
+import { type MutableRefObject, useEffect } from 'react'
 
 import type { ToolResultPruneResponse } from '@/app/types'
 import { getSessionMessages, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS } from '@/hermes'
 import { reconcilePrunedChatMessages, toChatMessages } from '@/lib/chat-messages'
+import { mergeContextUsage } from '@/lib/context-usage'
+import { setCurrentUsage } from '@/store/session'
 import { publishSessionState, setSessionTileDelegate } from '@/store/session-states'
 import type { SessionResumeResponse } from '@/types/hermes'
 
@@ -13,6 +15,7 @@ import type { GatewayRequester } from '../types'
 type SessionStateCache = ReturnType<typeof useSessionStateCache>
 
 interface SessionTileDelegateParams {
+  activeSessionIdRef: MutableRefObject<string | null>
   archiveSession: (storedSessionId: string) => Promise<unknown>
   branchStoredSession: (storedSessionId: string) => Promise<unknown>
   executeSlashCommand: ReturnType<typeof usePromptActions>['executeSlashCommand']
@@ -20,6 +23,7 @@ interface SessionTileDelegateParams {
   requestGateway: GatewayRequester
   runtimeIdByStoredSessionIdRef: SessionStateCache['runtimeIdByStoredSessionIdRef']
   sessionStateByRuntimeIdRef: SessionStateCache['sessionStateByRuntimeIdRef']
+  selectedStoredSessionIdRef: MutableRefObject<string | null>
   updateSessionState: SessionStateCache['updateSessionState']
 }
 
@@ -31,6 +35,7 @@ interface SessionTileDelegateParams {
  * hydrates the cache, which publishSessionState mirrors to the tile.
  */
 export function useSessionTileDelegate({
+  activeSessionIdRef,
   archiveSession,
   branchStoredSession,
   executeSlashCommand,
@@ -38,6 +43,7 @@ export function useSessionTileDelegate({
   requestGateway,
   runtimeIdByStoredSessionIdRef,
   sessionStateByRuntimeIdRef,
+  selectedStoredSessionIdRef,
   updateSessionState
 }: SessionTileDelegateParams): void {
   useEffect(() => {
@@ -69,6 +75,13 @@ export function useSessionTileDelegate({
           throw new Error('Session is no longer active')
         }
 
+        if (
+          Object.hasOwn(preview, 'origin_stored_session_id') &&
+          preview.origin_stored_session_id !== storedSessionId
+        ) {
+          throw new Error('Session is no longer active')
+        }
+
         const result = await requestGateway<ToolResultPruneResponse>('session.prune_tool_results', {
           session_id: preview.session_id,
           confirm: true,
@@ -83,21 +96,31 @@ export function useSessionTileDelegate({
           return result
         }
 
-        if (result.applied && Array.isArray(result.messages)) {
-          const backendMessages = toChatMessages(result.messages)
+        if (result.applied && (Array.isArray(result.messages) || result.context_estimate)) {
+          const backendMessages = Array.isArray(result.messages) ? toChatMessages(result.messages) : null
 
           updateSessionState(
             runtimeId,
-            state => ({
-              ...state,
-              messages: reconcilePrunedChatMessages(
-                backendMessages,
-                state.messages,
-                new Set(result.selected_tool_names)
-              )
-            }),
+            state => {
+              const messages = backendMessages
+                ? reconcilePrunedChatMessages(backendMessages, state.messages, new Set(result.selected_tool_names))
+                : state.messages
+
+              const usage = mergeContextUsage(state.usage, result.context_estimate)
+
+              return messages === state.messages && usage === state.usage ? state : { ...state, messages, usage }
+            },
             storedSessionId
           )
+        }
+
+        if (
+          result.applied &&
+          result.context_estimate &&
+          activeSessionIdRef.current === runtimeId &&
+          selectedStoredSessionIdRef.current === storedSessionId
+        ) {
+          setCurrentUsage(current => mergeContextUsage(current, result.context_estimate) ?? current)
         }
 
         return result
@@ -117,10 +140,12 @@ export function useSessionTileDelegate({
       previewToolResultPrune: async (storedSessionId, toolNames) => {
         const runtimeId = requireRuntimeForStoredSession(storedSessionId)
 
-        return requestGateway<ToolResultPruneResponse>('session.prune_tool_results', {
+        const preview = await requestGateway<ToolResultPruneResponse>('session.prune_tool_results', {
           session_id: runtimeId,
           ...(toolNames !== undefined ? { tool_names: toolNames } : {})
         })
+
+        return { ...preview, origin_stored_session_id: storedSessionId }
       },
       resumeTile: async storedSessionId => {
         const existing = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
@@ -162,6 +187,7 @@ export function useSessionTileDelegate({
       updateSession: (runtimeId, updater) => updateSessionState(runtimeId, updater)
     })
   }, [
+    activeSessionIdRef,
     archiveSession,
     branchStoredSession,
     executeSlashCommand,
@@ -169,6 +195,7 @@ export function useSessionTileDelegate({
     requestGateway,
     runtimeIdByStoredSessionIdRef,
     sessionStateByRuntimeIdRef,
+    selectedStoredSessionIdRef,
     updateSessionState
   ])
 }

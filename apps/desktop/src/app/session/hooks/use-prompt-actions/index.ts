@@ -15,6 +15,7 @@ import {
 } from '@/lib/chat-messages'
 import { pathLabel, SLASH_COMMAND_RE } from '@/lib/chat-runtime'
 import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
+import { mergeContextUsage } from '@/lib/context-usage'
 import { triggerHaptic } from '@/lib/haptics'
 import { setMutableRef } from '@/lib/mutable-ref'
 import { normalize } from '@/lib/text'
@@ -35,6 +36,7 @@ import {
   $messages,
   setAwaitingResponse,
   setBusy,
+  setCurrentUsage,
   setMessages,
   setTurnStartedAt
 } from '@/store/session'
@@ -736,22 +738,36 @@ export function usePromptActions({
     [activeSessionId, activeSessionIdRef, busyRef, submitRewindPrompt, updateSessionState]
   )
 
-  const previewToolResultPrune = useCallback(async (toolNames?: string[]) => {
-    const sessionId = activeSessionIdRef.current || activeSessionId
+  const previewToolResultPrune = useCallback(
+    async (toolNames?: string[]) => {
+      const sessionId = activeSessionIdRef.current || activeSessionId
+      const originStoredSessionId = selectedStoredSessionIdRef.current
 
-    if (!sessionId) {
-      throw new Error(copy.sessionUnavailable)
-    }
+      if (!sessionId) {
+        throw new Error(copy.sessionUnavailable)
+      }
 
-    return requestGateway<ToolResultPruneResponse>('session.prune_tool_results', {
-      session_id: sessionId,
-      ...(toolNames !== undefined ? { tool_names: toolNames } : {})
-    })
-  }, [activeSessionId, activeSessionIdRef, copy.sessionUnavailable, requestGateway])
+      const preview = await requestGateway<ToolResultPruneResponse>('session.prune_tool_results', {
+        session_id: sessionId,
+        ...(toolNames !== undefined ? { tool_names: toolNames } : {})
+      })
+
+      return { ...preview, origin_stored_session_id: originStoredSessionId }
+    },
+    [activeSessionId, activeSessionIdRef, copy.sessionUnavailable, requestGateway, selectedStoredSessionIdRef]
+  )
 
   const applyToolResultPrune = useCallback(
     async (preview: ToolResultPruneResponse) => {
       if (!preview.session_id || activeSessionIdRef.current !== preview.session_id) {
+        throw new Error(copy.sessionUnavailable)
+      }
+
+      const targetStoredSessionId = Object.hasOwn(preview, 'origin_stored_session_id')
+        ? preview.origin_stored_session_id
+        : selectedStoredSessionIdRef.current
+
+      if (selectedStoredSessionIdRef.current !== targetStoredSessionId) {
         throw new Error(copy.sessionUnavailable)
       }
 
@@ -766,24 +782,33 @@ export function usePromptActions({
       // The mutation belongs to the original runtime. If the user switched
       // while it was in flight, a later resume will hydrate backend truth;
       // never publish it into the new foreground session or rebind identities.
-      if (activeSessionIdRef.current !== preview.session_id) {
+      if (
+        activeSessionIdRef.current !== preview.session_id ||
+        selectedStoredSessionIdRef.current !== targetStoredSessionId
+      ) {
         return result
       }
 
-      if (result.applied && Array.isArray(result.messages)) {
-        const backendMessages = toChatMessages(result.messages)
+      if (result.applied && (Array.isArray(result.messages) || result.context_estimate)) {
+        const backendMessages = Array.isArray(result.messages) ? toChatMessages(result.messages) : null
+
         updateSessionState(
           preview.session_id,
-          state => ({
-            ...state,
-            messages: reconcilePrunedChatMessages(
-              backendMessages,
-              state.messages,
-              new Set(result.selected_tool_names)
-            )
-          }),
-          selectedStoredSessionIdRef.current
+          state => {
+            const messages = backendMessages
+              ? reconcilePrunedChatMessages(backendMessages, state.messages, new Set(result.selected_tool_names))
+              : state.messages
+
+            const usage = mergeContextUsage(state.usage, result.context_estimate)
+
+            return messages === state.messages && usage === state.usage ? state : { ...state, messages, usage }
+          },
+          targetStoredSessionId
         )
+      }
+
+      if (result.applied && result.context_estimate) {
+        setCurrentUsage(current => mergeContextUsage(current, result.context_estimate) ?? current)
       }
 
       return result
