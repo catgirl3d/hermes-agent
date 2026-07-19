@@ -3791,6 +3791,30 @@ def _preview_tool_result_prune(
     return result
 
 
+def _tool_result_prune_context_estimate(agent, history: list) -> dict | None:
+    """Estimate current context occupancy after a successful targeted prune."""
+    if agent is None:
+        return None
+
+    try:
+        from agent.context_breakdown import compute_session_context_breakdown
+
+        breakdown = compute_session_context_breakdown(agent, history)
+        context_max = int(breakdown.get("context_max", 0) or 0)
+        context_used = int(breakdown.get("estimated_total", 0) or 0)
+    except Exception:
+        return None
+
+    if not context_max:
+        return None
+
+    return {
+        "context_max": context_max,
+        "context_percent": max(0, min(100, round(context_used / context_max * 100))),
+        "context_used": context_used,
+    }
+
+
 def _sync_session_key_after_compress(
     sid: str,
     session: dict,
@@ -9462,6 +9486,8 @@ def _(rid, params: dict) -> dict:
             if hasattr(agent, "_flushed_db_message_session_id"):
                 agent._flushed_db_message_session_id = session_key
 
+    context_estimate = _tool_result_prune_context_estimate(agent, pruned)
+
     return _ok(
         rid,
         {
@@ -9470,6 +9496,7 @@ def _(rid, params: dict) -> dict:
             "applied": True,
             "history_version": next_version,
             "messages": pruned,
+            **({"context_estimate": context_estimate} if context_estimate else {}),
             **{key: value for key, value in preview.items() if key != "history_version"},
         },
     )

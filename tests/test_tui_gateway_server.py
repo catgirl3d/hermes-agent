@@ -6312,6 +6312,15 @@ def test_tool_result_prune_requires_preview_then_persists_in_place(monkeypatch):
     db = _Db()
     monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
     monkeypatch.setattr(server, "_session_db", lambda _session: _DbContext(db))
+    monkeypatch.setattr(
+        server,
+        "_tool_result_prune_context_estimate",
+        lambda _agent, _history: {
+            "context_max": 1_000,
+            "context_percent": 12,
+            "context_used": 123,
+        },
+    )
 
     try:
         preview = server.handle_request(
@@ -6361,6 +6370,11 @@ def test_tool_result_prune_requires_preview_then_persists_in_place(monkeypatch):
         )["result"]
 
         assert applied["applied"] is True
+        assert applied["context_estimate"] == {
+            "context_max": 1_000,
+            "context_percent": 12,
+            "context_used": 123,
+        }
         assert applied["history_version"] == 8
         assert session["session_key"] == "session-key"
         assert session["history"][1]["content"] == "[terminal] old output"
