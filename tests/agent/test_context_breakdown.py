@@ -58,3 +58,17 @@ def test_breakdown_uses_measured_context_when_available():
 
     assert data["context_used"] == 42_000
     assert data["context_percent"] == 21
+
+
+def test_breakdown_estimate_tracks_history_when_measured_context_is_stale():
+    agent, parts = _make_agent(last_prompt_tokens=42_000)
+    short_history = [{"role": "tool", "content": "short output"}]
+    long_history = [{"role": "tool", "content": "long output " * 500}]
+
+    with patch("agent.system_prompt.build_system_prompt_parts", return_value=parts):
+        short = compute_session_context_breakdown(agent, short_history)
+        long = compute_session_context_breakdown(agent, long_history)
+
+    assert short["context_used"] == long["context_used"] == 42_000
+    assert long["estimated_total"] > short["estimated_total"]
+    assert agent.context_compressor.last_prompt_tokens == 42_000

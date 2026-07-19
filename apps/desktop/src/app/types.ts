@@ -1,7 +1,7 @@
 import type * as React from 'react'
 
 import type { ChatMessage } from '@/lib/chat-messages'
-import type { SessionMessage, UsageStats } from '@/types/hermes'
+import type { ContextUsageEstimate, SessionMessage, UsageStats } from '@/types/hermes'
 
 export interface ImageAttachResponse {
   attached?: boolean
@@ -69,6 +69,7 @@ export interface ToolResultPruneResponse {
   before_bytes: number
   before_tokens: number
   changed: boolean
+  context_estimate?: ContextUsageEstimate
   duplicate_results: number
   excerpted_results: number
   history_version: number
@@ -81,6 +82,8 @@ export interface ToolResultPruneResponse {
   selected_tool_names: string[]
   selection_hash: string
   session_id: string
+  /** Renderer-only durable identity captured when this preview was requested. */
+  origin_stored_session_id?: string | null
   status: 'preview' | 'pruned' | 'unchanged'
   tools: ToolResultPruneTool[]
   truncated_tool_calls: number

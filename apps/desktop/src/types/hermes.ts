@@ -486,6 +486,12 @@ export interface UsageStats {
   total: number
 }
 
+export interface ContextUsageEstimate {
+  context_max: number
+  context_percent: number
+  context_used: number
+}
+
 /** One graph node in the star map (learned skill or memory chunk). */
 export interface StarmapNode {
   id: string
