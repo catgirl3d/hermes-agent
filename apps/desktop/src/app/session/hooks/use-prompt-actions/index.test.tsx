@@ -5,8 +5,19 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { textPart } from '@/lib/chat-messages'
 import { $composerAttachments, $composerDraft, type ComposerAttachment, setComposerDraft } from '@/store/composer'
-import { $busy, $connection, $messages, $sessions, $turnStartedAt, setSessions } from '@/store/session'
+import {
+  $busy,
+  $connection,
+  $currentUsage,
+  $messages,
+  $sessions,
+  $turnStartedAt,
+  setCurrentUsage,
+  setSessions
+} from '@/store/session'
 import type { SessionInfo } from '@/types/hermes'
+
+import type { ToolResultPruneResponse } from '../../../types'
 
 import type { SubmitTextOptions } from './utils'
 
@@ -287,6 +298,7 @@ describe('usePromptActions /title', () => {
 describe('usePromptActions targeted tool-result pruning', () => {
   afterEach(() => {
     cleanup()
+    setCurrentUsage({ calls: 0, input: 0, output: 0, total: 0 })
     vi.restoreAllMocks()
   })
 
@@ -327,6 +339,11 @@ describe('usePromptActions targeted tool-result pruning', () => {
     const applied = {
       ...preview,
       applied: true,
+      context_estimate: {
+        context_max: 1_000_000,
+        context_percent: 2,
+        context_used: 18_000
+      },
       history_version: 8,
       messages: [
         { role: 'user' as const, content: 'keep this instruction' },
@@ -335,11 +352,22 @@ describe('usePromptActions targeted tool-result pruning', () => {
       status: 'pruned' as const
     }
 
-    const requestGateway = vi.fn(async (_method: string, params?: Record<string, unknown>) =>
-      (params?.confirm ? applied : preview) as never
+    const requestGateway = vi.fn(
+      async (_method: string, params?: Record<string, unknown>) => (params?.confirm ? applied : preview) as never
     )
 
+    setCurrentUsage({
+      calls: 3,
+      context_max: 1_000_000,
+      context_percent: 4,
+      context_used: 39_200,
+      input: 1_000,
+      output: 500,
+      total: 1_500
+    })
+
     let latestMessages: unknown[] = []
+    let latestUsage: unknown
     let handle: HarnessHandle | null = null
 
     render(
@@ -347,6 +375,7 @@ describe('usePromptActions targeted tool-result pruning', () => {
         onReady={value => (handle = value)}
         onSeedState={state => {
           latestMessages = (state.messages as unknown[]) ?? []
+          latestUsage = state.usage
         }}
         refreshSessions={vi.fn(async () => undefined)}
         requestGateway={requestGateway}
@@ -355,6 +384,8 @@ describe('usePromptActions targeted tool-result pruning', () => {
     )
 
     const previewResult = await handle!.previewToolResultPrune()
+    expect(previewResult.origin_stored_session_id).toBe('stored-1')
+
     await handle!.applyToolResultPrune(previewResult)
 
     expect(requestGateway).toHaveBeenNthCalledWith(1, 'session.prune_tool_results', {
@@ -368,6 +399,14 @@ describe('usePromptActions targeted tool-result pruning', () => {
       tool_names: ['terminal']
     })
     expect(latestMessages).toHaveLength(2)
+    expect(latestUsage).toMatchObject(applied.context_estimate)
+    expect($currentUsage.get()).toMatchObject({
+      ...applied.context_estimate,
+      calls: 3,
+      input: 1_000,
+      output: 500,
+      total: 1_500
+    })
   })
 
   it('does not publish an old prune result after the user switches sessions', async () => {
@@ -389,6 +428,7 @@ describe('usePromptActions targeted tool-result pruning', () => {
       selected_tool_names: ['terminal'],
       selection_hash: 'terminal-hash',
       session_id: RUNTIME_SESSION_ID,
+      origin_stored_session_id: 'stored-a',
       status: 'preview' as const,
       tools: [],
       truncated_tool_calls: 0
@@ -406,6 +446,15 @@ describe('usePromptActions targeted tool-result pruning', () => {
     const activeSessionIdRef: MutableRefObject<string | null> = { current: RUNTIME_SESSION_ID }
     const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: 'stored-a' }
     const onSeedState = vi.fn()
+    setCurrentUsage({
+      calls: 1,
+      context_max: 1_000_000,
+      context_percent: 4,
+      context_used: 39_200,
+      input: 100,
+      output: 50,
+      total: 150
+    })
     let handle: HarnessHandle | null = null
 
     render(
@@ -420,17 +469,45 @@ describe('usePromptActions targeted tool-result pruning', () => {
     )
 
     const applying = handle!.applyToolResultPrune(preview)
-    activeSessionIdRef.current = 'runtime-b'
     selectedStoredSessionIdRef.current = 'stored-b'
     resolveRequest({
       ...preview,
       applied: true,
+      context_estimate: {
+        context_max: 1_000_000,
+        context_percent: 2,
+        context_used: 18_000
+      },
       messages: [{ role: 'assistant', content: 'pruned old session' }],
       status: 'pruned'
     })
     await applying
 
     expect(onSeedState).not.toHaveBeenCalled()
+    expect($currentUsage.get().context_used).toBe(39_200)
+  })
+
+  it('rejects a preview whose originating session is no longer selected', async () => {
+    const requestGateway = vi.fn(async () => ({}) as never)
+    const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: 'stored-b' }
+    let handle: HarnessHandle | null = null
+
+    render(
+      <Harness
+        onReady={value => (handle = value)}
+        refreshSessions={vi.fn(async () => undefined)}
+        requestGateway={requestGateway}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+      />
+    )
+
+    await expect(
+      handle!.applyToolResultPrune({
+        origin_stored_session_id: 'stored-a',
+        session_id: RUNTIME_SESSION_ID
+      } as ToolResultPruneResponse)
+    ).rejects.toThrow()
+    expect(requestGateway).not.toHaveBeenCalled()
   })
 })
 
