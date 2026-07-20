@@ -20,6 +20,7 @@ function sessionState(storedSessionId = STORED_SESSION_ID): ClientSessionState {
     cwd: '',
     fast: false,
     interrupted: false,
+    interimBoundaryPending: false,
     messages: [],
     model: '',
     needsInput: false,

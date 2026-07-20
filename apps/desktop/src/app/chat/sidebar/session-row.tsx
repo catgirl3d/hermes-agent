@@ -1,5 +1,5 @@
-import { useStore } from '@nanostores/react'
 import type * as React from 'react'
+import { memo, useCallback, useSyncExternalStore } from 'react'
 
 import { ProfileTag } from '@/app/chat/profile-tag'
 import { startSessionDrag } from '@/app/chat/session-drag'
@@ -17,7 +17,13 @@ import { cn } from '@/lib/utils'
 import { $backgroundRunningSessionIds } from '@/store/composer-status'
 import { $unreadFinishedSessionIds } from '@/store/session'
 import { $sessionColorById } from '@/store/session-color'
-import { $attentionSessionIds, $stalledSessionIds, openSessionTile } from '@/store/session-states'
+import {
+  $attentionSessionIds,
+  $focusedStoredSessionId,
+  $stalledSessionIds,
+  $workingSessionIds,
+  openSessionTile
+} from '@/store/session-states'
 import { canOpenSessionWindow, openSessionInNewWindow } from '@/store/windows'
 
 import { SidebarRowBody, SidebarRowGrab, SidebarRowLabel, SidebarRowLead, SidebarRowShell } from './chrome'
@@ -30,8 +36,6 @@ interface SidebarSessionRowProps extends React.ComponentProps<'div'> {
   /** TUI-style tree stem for branched sessions (`└─ ` / `├─ `). */
   branchStem?: string
   isPinned: boolean
-  isSelected: boolean
-  isWorking: boolean
   onArchive: () => void
   onBranch?: () => void
   onDelete: () => void
@@ -40,10 +44,42 @@ interface SidebarSessionRowProps extends React.ComponentProps<'div'> {
   reorderable?: boolean
   dragging?: boolean
   dragHandleProps?: React.HTMLAttributes<HTMLElement>
+  showSelection?: boolean
   /** Tag the row with its owning profile (initial chip + tooltip). Used by
    *  flat cross-profile lists — Pinned and search results in the All-profiles
    *  view — where no group header communicates ownership (#66003). */
   showProfile?: boolean
+}
+
+interface SidebarSessionRowViewProps extends Omit<SidebarSessionRowProps, 'showSelection'> {
+  hasBackground: boolean
+  isSelected: boolean
+  isStalled: boolean
+  isUnread: boolean
+  isWorking: boolean
+  needsInput: boolean
+  projectColor: null | string
+}
+
+interface ReadableStore<Value> {
+  get(): Value
+  listen(listener: () => void): () => void
+}
+
+function useStoreSelector<Value, Selection>(
+  store: ReadableStore<Value>,
+  select: (value: Value) => Selection
+): Selection {
+  const subscribe = useCallback((listener: () => void) => store.listen(listener), [store])
+  const getSnapshot = useCallback(() => select(store.get()), [select, store])
+
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
+}
+
+function useSessionMembership(store: ReadableStore<readonly string[]>, sessionId: string): boolean {
+  const select = useCallback((sessionIds: readonly string[]) => sessionIds.includes(sessionId), [sessionId])
+
+  return useStoreSelector(store, select)
 }
 
 const AGE_KEY = { day: 'ageDay', hour: 'ageHour', minute: 'ageMin' } as const
@@ -55,17 +91,60 @@ function formatAge(seconds: number, r: Translations['sidebar']['row']): string {
   return unit === 'second' ? r.ageNow : `${value}${r[AGE_KEY[unit]]}`
 }
 
-export function SidebarSessionRow({
+export const SidebarSessionRow = memo(function SidebarSessionRow({
+  session,
+  isPinned,
+  showSelection = true,
+  ...props
+}: SidebarSessionRowProps) {
+  const isSelected = useStoreSelector(
+    $focusedStoredSessionId,
+    useCallback(focusedStoredSessionId => showSelection && focusedStoredSessionId === session.id, [session.id, showSelection])
+  )
+
+  const isWorking = useSessionMembership($workingSessionIds, session.id)
+  const needsInput = useSessionMembership($attentionSessionIds, session.id)
+  const isUnread = useSessionMembership($unreadFinishedSessionIds, session.id)
+  const isStalled = useSessionMembership($stalledSessionIds, session.id)
+  const hasBackground = useSessionMembership($backgroundRunningSessionIds, session.id)
+
+  const projectColor = useStoreSelector(
+    $sessionColorById,
+    useCallback(sessionColors => sessionColors[session.id] ?? null, [session.id])
+  )
+
+  return (
+    <SidebarSessionRowView
+      {...props}
+      hasBackground={hasBackground}
+      isPinned={isPinned}
+      isSelected={isSelected}
+      isStalled={isStalled}
+      isUnread={isUnread}
+      isWorking={isWorking}
+      needsInput={needsInput}
+      projectColor={projectColor}
+      session={session}
+    />
+  )
+})
+
+function SidebarSessionRowView({
   session,
   branchStem,
+  hasBackground,
   isPinned,
   isSelected,
+  isStalled,
+  isUnread,
   isWorking,
+  needsInput,
   onArchive,
   onBranch,
   onDelete,
   onPin,
   onResume,
+  projectColor,
   reorderable = false,
   dragging = false,
   dragHandleProps,
@@ -74,7 +153,7 @@ export function SidebarSessionRow({
   style,
   ref,
   ...rest
-}: SidebarSessionRowProps) {
+}: SidebarSessionRowViewProps) {
   const { t } = useI18n()
   const r = t.sidebar.row
   const { cancelPrewarm, startPrewarm } = useProfilePrewarm(session.profile)
@@ -86,19 +165,6 @@ export function SidebarSessionRow({
   // Telegram thread continued here still reads as Telegram.
   const handoffSource = handoffOriginSource(session.handoff_state, session.handoff_platform)
   const handoffLabel = handoffSource ? (sessionSourceLabel(handoffSource) ?? handoffSource) : null
-  // True when a clarify prompt in this session is waiting on the user.
-  const needsInput = useStore($attentionSessionIds).includes(session.id)
-  // True when the session's most recent turn finished in the background (while
-  // the user was viewing a different session) and hasn't been opened since.
-  const isUnread = useStore($unreadFinishedSessionIds).includes(session.id)
-  // True when the turn is still running but the stream has been quiet long
-  // enough to soften the animation. This must never look like an idle row.
-  const isStalled = useStore($stalledSessionIds).includes(session.id)
-  // True when a terminal(background=true) process is alive in this session.
-  const hasBackground = useStore($backgroundRunningSessionIds).includes(session.id)
-  // The session's resolved color (idle dot tint), read from the ONE shared map
-  // the pane tabs also read — an O(1) lookup, never re-derived per render.
-  const projectColor = useStore($sessionColorById)[session.id] ?? null
 
   // Resolve the dot's display state once — the four signals are mutually
   // exclusive by priority, so threading them as booleans through wrappers just

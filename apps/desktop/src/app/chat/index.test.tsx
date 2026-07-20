@@ -106,18 +106,22 @@ describe('ChatView session transition', () => {
   const messagesEmpty = atom(false)
   const lastVisibleIsUser = atom(true)
   const cwd = atom('/workspace/a')
+  const fast = atom(false)
   const model = atom('model-a')
   const provider = atom('provider-a')
+  const reasoningEffort = atom('')
 
   const view: SessionView = {
     $awaitingResponse: awaitingResponse,
     $busy: busy,
     $cwd: cwd,
+    $fast: fast,
     $lastVisibleIsUser: lastVisibleIsUser,
     $messages: messages,
     $messagesEmpty: messagesEmpty,
     $model: model,
     $provider: provider,
+    $reasoningEffort: reasoningEffort,
     $runtimeId: runtimeId,
     $storedId: storedId,
     kind: 'primary'

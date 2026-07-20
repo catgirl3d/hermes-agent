@@ -337,6 +337,7 @@ export const $sessionViewSnapshot = atom<SessionViewSnapshot>(
     sawAssistantPayload: false,
     pendingBranchGroup: null,
     interrupted: false,
+    interimBoundaryPending: false,
     needsInput: false,
     turnStartedAt: null,
     usage: null

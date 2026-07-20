@@ -20,6 +20,7 @@ function sessionState(busy: boolean, storedSessionId = STORED_SESSION_ID): Clien
     cwd: '',
     fast: false,
     interrupted: false,
+    interimBoundaryPending: false,
     messages: [],
     model: '',
     needsInput: false,

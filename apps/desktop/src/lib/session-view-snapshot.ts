@@ -33,6 +33,7 @@ export function prepareSessionSnapshot(
     sawAssistantPayload: state.sawAssistantPayload ?? false,
     pendingBranchGroup: state.pendingBranchGroup ?? null,
     interrupted: state.interrupted ?? false,
+    interimBoundaryPending: state.interimBoundaryPending ?? false,
     needsInput: state.needsInput ?? false,
     turnStartedAt: state.turnStartedAt ?? null,
     usage: state.usage ?? null,
