@@ -4,10 +4,11 @@ import { createElement } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { $activeSessionId, $selectedStoredSessionId } from '@/store/session'
+import { $sessionTiles } from '@/store/session-states'
 
 import type { ToolResultPruneResponse } from '../../types'
 
-import { renameSessionPreferringRpc, SessionActionsMenu } from './session-actions-menu'
+import { renameSessionPreferringRpc, SessionActionsMenu, SessionContextMenu } from './session-actions-menu'
 
 // The branched-session rename bug: a freshly branched session lives only in the
 // gateway's runtime _sessions map (no state.db row yet), so REST PATCH
@@ -80,6 +81,7 @@ afterEach(() => {
   activeGateway.mockReturnValue({ request })
   $activeSessionId.set(null)
   $selectedStoredSessionId.set(null)
+  $sessionTiles.set([])
 })
 
 describe('renameSessionPreferringRpc', () => {
@@ -408,5 +410,26 @@ describe('SessionActionsMenu tool-result pruning', () => {
     })
 
     expect(screen.queryByText('Clean tool outputs?')).toBeNull()
+  })
+})
+
+describe('SessionContextMenu tab state', () => {
+  it('removes Open in new tab when the session becomes a tile while the menu is open', async () => {
+    render(
+      createElement(SessionContextMenu, {
+        children: createElement('button', { type: 'button' }, 'Session row'),
+        sessionId: STORED_ID,
+        title: 'Target session'
+      })
+    )
+
+    fireEvent.contextMenu(screen.getByRole('button', { name: 'Session row' }))
+    expect(await screen.findByRole('menuitem', { name: 'Open in new tab' })).toBeTruthy()
+
+    act(() => {
+      $sessionTiles.set([{ storedSessionId: STORED_ID }])
+    })
+
+    await waitFor(() => expect(screen.queryByRole('menuitem', { name: 'Open in new tab' })).toBeNull())
   })
 })

@@ -1,7 +1,7 @@
 import { useStore } from '@nanostores/react'
 import { isJsonRpcGatewayError } from '@hermes/shared'
 import type * as React from 'react'
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 
 import {
   closeAllTreeTabs,
@@ -164,6 +164,34 @@ const CONTEXT_KIT: MenuKit = {
 }
 const PRUNE_PREVIEW_DEBOUNCE_MS = 200
 
+function useOpenMenuTabState(sessionId: string, open: boolean): boolean {
+  const subscribe = useCallback(
+    (listener: () => void) => {
+      if (!open) {
+        return () => {}
+      }
+
+      const unlistenSelected = $selectedStoredSessionId.listen(listener)
+      const unlistenTiles = $sessionTiles.listen(listener)
+
+      return () => {
+        unlistenSelected()
+        unlistenTiles()
+      }
+    },
+    [open]
+  )
+  const getSnapshot = useCallback(
+    () =>
+      open &&
+      (sessionId === $selectedStoredSessionId.get() ||
+        $sessionTiles.get().some(tile => tile.storedSessionId === sessionId)),
+    [open, sessionId]
+  )
+
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
+}
+
 interface ItemSpec {
   className?: string
   disabled: boolean
@@ -208,8 +236,9 @@ function useSessionActions({
   surface = 'row',
   tabPaneId,
   onApplyToolResultPrune,
-  onPreviewToolResultPrune
-}: SessionActions) {
+  onPreviewToolResultPrune,
+  menuOpen = false
+}: SessionActions & { menuOpen?: boolean }) {
   const { t } = useI18n()
   const r = t.sidebar.row
   const [renameOpen, setRenameOpen] = useState(false)
@@ -244,8 +273,7 @@ function useSessionActions({
 
   // Already showing as a tab somewhere (a tile, or loaded in main — main IS
   // a tab): offering "Open in new tab" again is noise.
-  const alreadyTabbed =
-    sessionId === $selectedStoredSessionId.get() || $sessionTiles.get().some(tile => tile.storedSessionId === sessionId)
+  const alreadyTabbed = useOpenMenuTabState(sessionId, surface === 'row' && menuOpen)
 
   const spec = (partial: Omit<ItemSpec, 'onSelect'> & { onSelect: () => void }): ItemSpec => partial
 
@@ -684,8 +712,8 @@ interface SessionActionsMenuProps
 
 export function SessionActionsMenu({ children, align = 'end', sideOffset = 6, ...actions }: SessionActionsMenuProps) {
   const { t } = useI18n()
-  const { pruneDialog, renameDialog, renderItems } = useSessionActions(actions)
   const [open, setOpen] = useState(false)
+  const { pruneDialog, renameDialog, renderItems } = useSessionActions({ ...actions, menuOpen: open })
 
   return (
     <>
@@ -712,11 +740,12 @@ interface SessionContextMenuProps extends SessionActions {
 
 export function SessionContextMenu({ children, ...actions }: SessionContextMenuProps) {
   const { t } = useI18n()
-  const { pruneDialog, renameDialog, renderItems } = useSessionActions(actions)
+  const [open, setOpen] = useState(false)
+  const { pruneDialog, renameDialog, renderItems } = useSessionActions({ ...actions, menuOpen: open })
 
   return (
     <>
-      <ContextMenu>
+      <ContextMenu onOpenChange={setOpen}>
         <ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
         <ContextMenuContent aria-label={t.sidebar.row.actionsFor(actions.title)} className="w-40">
           {renderItems(CONTEXT_KIT)}

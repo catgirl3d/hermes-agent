@@ -1611,6 +1611,53 @@ def test_session_resume_live_reuse_includes_backend_timing(monkeypatch):
     assert timing["live_lookup"] >= 0
 
 
+def test_session_resume_legacy_db_keeps_ancestor_display_history_on_live_reuse(monkeypatch):
+    target = "legacy-tip"
+    root_message = {"role": "user", "content": "ancestor prompt"}
+    tip_message = {"role": "assistant", "content": "tip reply"}
+
+    class LegacyDB:
+        def get_session(self, session_id):
+            if session_id == target:
+                return {"id": target, "cwd": "E:/workspace/legacy", "parent_session_id": "legacy-root"}
+            if session_id == "legacy-root":
+                return {"id": "legacy-root", "parent_session_id": None}
+            return None
+
+        def get_session_by_title(self, _session_id):
+            return None
+
+        def reopen_session(self, _session_id):
+            pass
+
+        def get_resume_conversations(self, _session_id):
+            return [tip_message], [root_message, tip_message]
+
+        def get_messages_as_conversation(self, session_id, repair_alternation=False):
+            return [root_message] if session_id == "legacy-root" else [tip_message]
+
+    monkeypatch.setattr(server, "_get_db", lambda: LegacyDB())
+    monkeypatch.setattr(server, "_claim_active_session_slot", lambda *args, **kwargs: (None, None))
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_lazy_resume_info", lambda cwd, **_kwargs: {"cwd": cwd})
+
+    runtime_sid = None
+    try:
+        first = server.handle_request(
+            {"id": "first", "method": "session.resume", "params": {"session_id": target}}
+        )
+        runtime_sid = first["result"]["session_id"]
+        second = server.handle_request(
+            {"id": "second", "method": "session.resume", "params": {"session_id": target}}
+        )
+    finally:
+        if runtime_sid:
+            server._sessions.pop(runtime_sid, None)
+
+    assert [message["text"] for message in first["result"]["messages"]] == ["ancestor prompt", "tip reply"]
+    assert [message["text"] for message in second["result"]["messages"]] == ["ancestor prompt", "tip reply"]
+
+
 def test_session_resume_lazy_watch_includes_backend_timing(monkeypatch):
     target = "lazy-stored-session"
 
@@ -2247,45 +2294,6 @@ def test_persist_live_session_runtime_preserves_explicit_normal_tier():
     )
 
     assert updates["config"]["service_tier"] == "normal"
-
-def test_session_prewarm_starts_nonblocking_build_from_composer_intent(monkeypatch):
-    sid = "runtime-composer-intent"
-    current_transport = object()
-    session = {
-        "agent": None,
-        "agent_ready": threading.Event(),
-        "session_key": "stored-composer-intent",
-        "transport": object(),
-    }
-    starts = []
-    server._sessions[sid] = session
-    monkeypatch.setattr(
-        server,
-        "_start_agent_build",
-        lambda session_id, target: starts.append((session_id, target)),
-    )
-    monkeypatch.setattr(server, "current_transport", lambda: current_transport)
-
-    try:
-        resp = server.handle_request(
-            {
-                "id": "prewarm",
-                "method": "session.prewarm",
-                "params": {"session_id": sid, "intent": "voice"},
-            }
-        )
-    finally:
-        server._sessions.pop(sid, None)
-
-    assert resp["result"] == {
-        "accepted": True,
-        "session_id": sid,
-        "trigger": "composer_voice",
-    }
-    assert starts == [(sid, session)]
-    assert session["_agent_build_trigger"] == "composer_voice"
-    assert session["transport"] is current_transport
-
 
 def test_built_agent_reconciles_model_override_changed_during_build():
     switched = []

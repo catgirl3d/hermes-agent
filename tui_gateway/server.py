@@ -6499,10 +6499,74 @@ def _resume_histories(db, session_id: str) -> tuple[list, list]:
     )
 
 
-def _ancestor_display_prefix(db, session_id: str) -> list:
-    """Read the precise ancestor prefix when the SessionDB version supports it."""
+def _ancestor_display_prefix(
+    db,
+    session_id: str,
+    *,
+    model_history: list,
+    display_history: list,
+) -> list:
+    """Read the precise ancestor prefix, including legacy SessionDBs.
+
+    Modern databases identify ancestor rows directly. Older databases expose only
+    model/display projections, so rebuild the lineage one session at a time and
+    keep it only when it is an exact prefix of the display projection. That
+    avoids the old length-based heuristic, which could duplicate repaired tip
+    messages, while retaining ancestors for live-session reuse.
+    """
     get_prefix = getattr(db, "get_ancestor_display_prefix", None)
-    return get_prefix(session_id) if callable(get_prefix) else []
+    if callable(get_prefix):
+        return get_prefix(session_id)
+
+    get_session = getattr(db, "get_session", None)
+    get_messages = getattr(db, "get_messages_as_conversation", None)
+    if not callable(get_messages):
+        return []
+
+    prefix: list = []
+    if callable(get_session):
+        try:
+            ancestor_ids: list[str] = []
+            seen = {session_id}
+            current_id = session_id
+            while True:
+                row = get_session(current_id) or {}
+                parent_id = str(row.get("parent_session_id") or "").strip()
+                if not parent_id or parent_id in seen:
+                    break
+                ancestor_ids.append(parent_id)
+                seen.add(parent_id)
+                current_id = parent_id
+
+            for ancestor_id in reversed(ancestor_ids):
+                try:
+                    messages = get_messages(ancestor_id, repair_alternation=False)
+                except TypeError:
+                    messages = get_messages(ancestor_id)
+                if not isinstance(messages, list):
+                    prefix = []
+                    break
+                prefix.extend(messages)
+
+            if prefix and display_history[: len(prefix)] == prefix:
+                return prefix
+        except Exception:
+            logger.debug("Could not rebuild legacy ancestor display prefix", exc_info=True)
+
+    # Some legacy adapters expose the tip projection but not parent ids. Use a
+    # structural suffix only when it exactly matches the display transcript.
+    try:
+        tip_history = get_messages(session_id, repair_alternation=False)
+    except TypeError:
+        tip_history = get_messages(session_id)
+    except Exception:
+        tip_history = []
+
+    for candidate in (tip_history, model_history):
+        if isinstance(candidate, list) and candidate and display_history[-len(candidate) :] == candidate:
+            return display_history[: -len(candidate)]
+
+    return []
 
 
 @method("session.resume")
@@ -6747,7 +6811,12 @@ def _(rid, params: dict) -> dict:
         # Display keeps the full transcript; the model-fed history drops a
         # dangling/interrupted tool-call tail so a session killed mid-loop does
         # not replay the unanswered call forever (#29086).
-        prefix = _ancestor_display_prefix(db, target)
+        prefix = _ancestor_display_prefix(
+            db,
+            target,
+            model_history=raw_history,
+            display_history=display_history,
+        )
         history = sanitize_replay_history(raw_history)
         # Restore the model/provider/reasoning/tier this chat last used so the
         # deferred build (and the info below) match the eager path — without them
@@ -6826,7 +6895,12 @@ def _(rid, params: dict) -> dict:
         # re-issue the unanswered call forever — the permanent-"thinking" stuck
         # session in #29086.  The messaging gateway already strips this; this is
         # the WebUI/TUI resume path picking up the same cleanup.
-        display_history_prefix = _ancestor_display_prefix(db, target)
+        display_history_prefix = _ancestor_display_prefix(
+            db,
+            target,
+            model_history=raw_history,
+            display_history=display_history,
+        )
         history = sanitize_replay_history(raw_history)
         messages = _history_to_messages(display_history)
         _mark_resume_stage("message_transport")
