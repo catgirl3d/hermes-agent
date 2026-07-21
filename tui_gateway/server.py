@@ -7058,6 +7058,7 @@ def _fallback_session_info(session: dict) -> dict:
         "model": _resolve_model(),
         "skills": {},
         "tools": {},
+        "desktop_contract": DESKTOP_BACKEND_CONTRACT,
     }
 
 

@@ -8307,6 +8307,24 @@ def test_session_create_lazy_info_reports_desktop_contract(monkeypatch):
     server._sessions.pop(resp["result"]["session_id"], None)
 
 
+def test_session_activate_agentless_info_reports_desktop_contract(monkeypatch):
+    """Deferred live sessions must not look like an outdated backend on activate."""
+    sid = "deferred-live"
+    session = _session(agent=object())
+    session["agent"] = None
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    try:
+        resp = server.handle_request(
+            {"id": "1", "method": "session.activate", "params": {"session_id": sid}}
+        )
+
+        assert resp["result"]["info"]["desktop_contract"] == server.DESKTOP_BACKEND_CONTRACT
+    finally:
+        server._sessions.pop(sid, None)
+
+
 def test_session_list_returns_clean_error_when_state_db_is_unavailable(monkeypatch):
     monkeypatch.setattr(server, "_get_db", lambda: None)
     monkeypatch.setattr(server, "_db_error", "locking protocol")
